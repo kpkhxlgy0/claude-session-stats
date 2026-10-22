@@ -1,0 +1,21 @@
+{
+  "name": "claude-session-stats",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local session statistics for Claude++",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kpkhxlgy0/claude-session-stats.git"
+  },
+  "type": "commonjs",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "test": "node --test test/*.test.cjs",
+    "validate": "node scripts/validate.cjs",
+    "inject": "pwsh -NoProfile -File Inject-ClaudePlusPlus.ps1",
+    "uninject": "pwsh -NoProfile -File Uninject-ClaudePlusPlus.ps1"
+  },
+  "devDependencies": { "jsdom": "26.1.0" }
+}
