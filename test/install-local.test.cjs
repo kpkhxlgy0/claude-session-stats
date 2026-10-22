@@ -62,7 +62,7 @@ test("Inject links and enables only this tweak, is idempotent, and Uninject pres
     const f = fixture(t);
     succeeds(f.run("Inject"));
     assert.equal(fs.lstatSync(f.link).isSymbolicLink(), true);
-    assert.equal(fs.realpathSync(f.link).toLowerCase(), f.tweakSource.toLowerCase());
+    assert.equal(fs.realpathSync.native(f.link).toLowerCase(), fs.realpathSync.native(f.tweakSource).toLowerCase());
     const expected = structuredClone(f.config);
     expected.tweaks[id].enabled = true;
     assert.deepEqual(f.readConfig(), expected);
