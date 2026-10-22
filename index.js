@@ -6,10 +6,12 @@ const renderer = (() => { const module = { exports: {} };
 function parseSessionId(rawUrl) {
     try {
         const url = new URL(rawUrl);
-        if (!(url.protocol === 'app:' && url.hostname === 'localhost') && url.origin !== 'https://claude.ai')
+        if (url.username || url.password) return null;
+        if (!(url.protocol === 'app:' && url.hostname === 'localhost' && !url.port)
+            && url.origin !== 'https://claude.ai')
             return null;
         const match = /^\/epitaxy\/(local_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i
-            .exec(url.pathname);
+            .exec(url.pathname) ?? /^\/(?:epitaxy|code)\/(session_[A-Za-z0-9_-]{1,128})\/?$/.exec(url.pathname);
         return match ? match[1] : null;
     } catch { return null; }
 }
@@ -80,7 +82,7 @@ function footerBounds(root, win) {
     return { left: center - halfWidth, top: (top + bottom - 14) / 2, width: halfWidth * 2 };
 }
 
-function makeBar(doc) {
+function makeBar(doc, remote) {
     const bar = doc.createElement('div');
     bar.dataset.sessionStats = '';
     bar.setAttribute('role', 'group');
@@ -96,9 +98,11 @@ function makeBar(doc) {
         }
         bar.append(group);
     }
-    fields.turns.title = '当前主会话的用户轮次，按 promptId/uuid 去重，排除工具返回和系统注入消息';
-    fields.steps.title = '当前主会话的模型响应次数，按消息 ID 去重；不等于工具调用次数';
-    fields.tps.title = '估算：最近响应的输出 tokens ÷ 从上一条用户消息或工具返回到该响应的日志时间差；包含请求等待和网络耗时，数据不足时显示 —';
+    const scope = remote ? '当前 Remote Control 会话' : '当前主会话';
+    fields.turns.title = `${scope}的用户轮次，按 promptId/uuid 去重，排除工具返回和系统注入消息`;
+    fields.steps.title = `${scope}的模型响应次数，按消息 ID 去重；不等于工具调用次数`;
+    fields.tps.title = '估算：最近响应的输出 tokens ÷ 从上一条用户消息或工具返回到该响应的'
+        + `${remote ? '同步历史' : '日志'}时间差；包含请求等待和网络耗时，数据不足时显示 —`;
     return { bar, fields };
 }
 
@@ -116,7 +120,8 @@ function render(entry, stats) {
         : '等待当前会话的本地统计数据';
     entry.bar.title = stats?.status === 'ok' ? '' : pending;
     entry.fields.tokens.title = stats?.status === 'ok'
-        ? `累计输入 ${compact(s.inputTokens)}，输出 ${compact(s.outputTokens)}；输入包含缓存读取和写入` : pending;
+        ? `累计输入 ${compact(s.inputTokens)}，输出 ${compact(s.outputTokens)}；输入包含缓存读取和写入`
+            + (entry.remote ? '；累计仅包含 Remote Control 同步历史' : '') : pending;
     entry.fields.cache.title = stats?.status === 'ok'
         ? `缓存读取 ${compact(s.cachedInputTokens)} ÷ 总输入 ${compact(s.inputTokens)}` : pending;
 }
@@ -125,6 +130,7 @@ function startRenderer(api, options = {}) {
     const win = options.window ?? window;
     const doc = win.document;
     let entry = null;
+    const remoteRequests = new WeakMap();
     let stopped = false;
     let scheduled = null;
     const style = doc.createElement('style');
@@ -148,17 +154,43 @@ function startRenderer(api, options = {}) {
         current.bar.style.top = `${Math.round(bounds.top)}px`;
         current.bar.style.width = `${Math.round(bounds.width)}px`;
     }
+    function isCurrent(current) {
+        return !stopped && entry === current && doc.visibilityState !== 'hidden'
+            && parseSessionId(win.location.href) === current.sessionId && findComposer(win) === current.root;
+    }
     async function refresh(current) {
         if (current.inflight) return;
+        let pending;
+        if (current.remote) {
+            pending = remoteRequests.get(current.root);
+            if (pending?.has(current.sessionId)) return;
+            if (!pending) remoteRequests.set(current.root, pending = new Set());
+            pending.add(current.sessionId);
+        }
         current.inflight = true;
         try {
-            const stats = await api.ipc.invoke('stats', current.sessionId);
-            if (stopped || entry !== current || parseSessionId(win.location.href) !== current.sessionId
-                || findComposer(win) !== current.root) return;
-            render(current, stats?.threadId === current.sessionId ? stats : null);
+            const stats = await (current.remote ? api.ipc.invoke('remote-stats')
+                : api.ipc.invoke('stats', current.sessionId));
+            if (!isCurrent(current)) return;
+            if (current.remote) {
+                if (stats?.threadId !== current.sessionId || stats.source !== 'remote_control' || stats.status !== 'ok') {
+                    current.bar.remove(); return;
+                }
+                render(current, stats); position(current);
+                if (!current.bar.isConnected) doc.body.append(current.bar);
+            } else render(current, stats?.threadId === current.sessionId ? stats : null);
         } catch {
-            if (!stopped && entry === current) render(current, null);
-        } finally { current.inflight = false; }
+            if (isCurrent(current)) {
+                if (current.remote) current.bar.remove();
+                else render(current, null);
+            }
+        } finally {
+            current.inflight = false;
+            if (pending) {
+                pending.delete(current.sessionId);
+                if (!pending.size) remoteRequests.delete(current.root);
+            }
+        }
     }
     function reconcile() {
         scheduled = null;
@@ -167,8 +199,9 @@ function startRenderer(api, options = {}) {
         const root = sessionId && doc.visibilityState !== 'hidden' ? findComposer(win) : null;
         if (!sessionId || !root) { remove(); return; }
         if (!entry || entry.sessionId !== sessionId || entry.root !== root) {
-            remove(); entry = { ...makeBar(doc), root, sessionId, inflight: false };
-            render(entry, null); doc.body.append(entry.bar);
+            const remote = sessionId.startsWith('session_');
+            remove(); entry = { ...makeBar(doc, remote), root, sessionId, remote, inflight: false };
+            if (!remote) { render(entry, null); doc.body.append(entry.bar); }
         }
         position(entry); void refresh(entry);
     }

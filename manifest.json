@@ -1,8 +1,8 @@
 {
   "id": "com.kpk.session-stats",
   "name": "Session Stats",
-  "version": "0.1.0",
-  "description": "Conversation turns, model steps, estimated TPS, token usage and cache hit below the Claude Code composer.",
+  "version": "0.2.0",
+  "description": "Turns, model steps, estimated TPS, token usage and cache hit for local Claude Code and Remote Control sessions.",
   "author": "KPK",
   "githubRepo": "kpkhxlgy0/claude-session-stats",
   "homepage": "https://github.com/kpkhxlgy0/claude-session-stats",
@@ -11,5 +11,5 @@
   "minRuntime": "0.3.6",
   "scope": "both",
   "main": "index.js",
-  "permissions": ["ipc", "filesystem"]
+  "permissions": ["ipc", "filesystem", "network"]
 }

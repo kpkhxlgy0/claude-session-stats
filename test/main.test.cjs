@@ -7,8 +7,9 @@ const CLI = '22222222-2222-4222-8222-222222222222';
 function fixture(extra = {}) {
     let handler, disposed = false;
     const calls = [];
-    const api = { ipc: { handle(name, fn) { assert.equal(name, 'stats'); handler = fn; } }, log: { info() {} } };
-    const options = { claudeData: 'unused', claudeHome: 'unused',
+    const api = { manifest: { id: 'com.kpk.session-stats' },
+        ipc: { handle(name, fn) { assert.equal(name, 'stats'); handler = fn; } }, log: { info() {} } };
+    const options = { claudeData: 'unused', claudeHome: 'unused', ipcMain: { handle() {}, removeHandler() {} },
         resolveSession: async (_, id) => id === LOCAL ? CLI : null,
         store: { getStats: async id => { calls.push(id); return { status: 'ok', threadId: id, turns: 3, tps: null }; },
             dispose() { disposed = true; } }, ...extra };
@@ -19,6 +20,14 @@ test('maps explicit Desktop key to UUID and correlates response with requested r
     const f = fixture();
     assert.deepEqual(await f.read(LOCAL), { status: 'ok', threadId: LOCAL, turns: 3, tps: null });
     assert.deepEqual(f.calls, [CLI]); f.controller.stop();
+});
+
+test('main registers the Remote Control bridge and removes it on stop', () => {
+    const channels = new Map();
+    const f = fixture({ ipcMain: { handle(name, handler) { channels.set(name, handler); },
+        removeHandler(name) { channels.delete(name); } } });
+    assert.equal(channels.has('claudepp:com.kpk.session-stats:remote-stats'), true);
+    f.controller.stop(); assert.equal(channels.size, 0);
 });
 test('unknown mappings cannot fall back to most recent log', async () => {
     const f = fixture({ resolveSession: async () => null });
