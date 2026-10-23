@@ -14,7 +14,7 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-版本：[v0.2.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.2.0)。
+版本：[v0.2.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.2.1)。
 
 也可以使用 PowerShell 7 运行仓库根目录的脚本：
 
@@ -60,6 +60,9 @@ TPS 使用现有日志或原始同步时间戳，无需 OpenTelemetry、代理�
 分母包含请求等待、思考和网络耗时；工具返回后重新计时，因此不把返回之前的工具执行间隔算给下一次响应。
 多条内容块取同一响应的最晚日志时间。缺少起止时间或输出用量、时间倒序或不足 100ms 时显示 `—`；
 新用户消息或工具结果到来时先清空旧速度。该值是响应平均速度估算，不代表服务端纯生成速度。
+续接或重连重放同一 `promptId` 时，即使记录 UUID 改变，也不重新开始 TPS 计时，
+不丢弃正在接收的响应流；真正的新输入和工具返回仍分别开始新的计时间隔。
+工具返回优先按 `tool_use_id` 去重，缺失时使用记录 UUID；两者都缺失时不推算该次响应的 TPS。
 
 ## 数据和会话范围
 
@@ -68,6 +71,10 @@ TPS 使用现有日志或原始同步时间戳，无需 OpenTelemetry、代理�
 - 检查记录的 sessionId 与请求一致，cliSessionId 有效，且不存在其他账户中的同名记录。缺失或歧义时显示 `—`。
 - 增量读取 `$env:CLAUDE_CONFIG_DIR\projects\<项目>\<cliSessionId>.jsonl`；环境变量未设置时使用用户目录下的 `.claude`。
 - 日志索引最长缓存 15 秒，新日志可能需要等待下一次索引刷新。文件追加、截断、替换会重新计算或增量更新。
+- 本地迁移日志有匹配当前会话的 `relocated` 标记、且当前记录通过完整 `parentUuid` 链连接到已复制历史时，
+  将同一文件内的这些旧会话记录纳入统计，继续按模型响应 ID 去重，不另外读取源日志叠加。
+  无关记录和子代理分支不计入；父链缺失、循环、身份冲突或消息顺序不明确时显示 `—`。
+  父链索引仅保存标识和关系，最多 65,536 条；超过限制的迁移历史不显示部分累计值。
 - 会话日志、认证信息和 Claude 设置均不写入；IPC 只返回数值统计与关联标识，不传输会话正文。
 - 普通 Chat、Cowork、云端 Code、SSH 和子代理独立统计不在本版本范围内。
 
@@ -97,7 +104,8 @@ Remote Control 的组织绑定读取 React Context，Claude 前端更新可能�
 自动化界面测试使用模拟 DOM；真实 Claude 界面的输入框识别、底部留白和最终显示位置仍需安装后验收。
 Remote Control 路由、请求头、详情类型和事件分页协议已对照本机缓存的官方前端代码；
 已通过真实 Remote Control 运行日志确认组织绑定、认证读取、完整历史加载、完整 usage、可用估算 TPS 和后续增量更新。
-自动化测试共 122 项；统计条挂载已获运行状态确认，最终数值仍可与远端日志人工对照。
+自动化测试共 140 项，包含续接重放、迁移父链及重复累计回归；统计条挂载已获运行状态确认，
+最终数值仍可与远端日志人工对照。
 
 ## 开发
 
@@ -110,6 +118,7 @@ npm run validate
 
 修改 `src/renderer.cjs` 后运行 build 更新 `index.js`。Claude++ 的 renderer 环境没有 Node require，发布入口因此内嵌 renderer；main 仍加载 `src/main.cjs`。
 `src/session-map.cjs` 负责 Desktop 到日志的映射，`src/session-store.cjs` 负责只读增量加载，`src/metrics.cjs` 负责统计。
+`src/session-history.cjs` 负责核对本地迁移日志的父子关系，确认可以计入的已复制历史。
 `src/remote-reader.cjs` 在当前页面读取远控历史并复用统计器，`src/remote-bridge.cjs` 负责主 frame 校验与 IPC 清理。
 
 本项目沿用 [Codex++ Session Stats](https://github.com/kpkhxlgy0/session-stats) 的五项显示、增量读取和安装脚本设计，

@@ -54,6 +54,39 @@ test('incremental reads merge duplicate snapshots and wait for complete UTF-8 li
     assert.equal((await store.getStats(ID)).totalTokens, 115);
     assert.equal((await store.getStats(ID)).steps, 1);
 });
+test('incremental continuation replay preserves prompt timing and cumulative usage', async t => {
+    const { store, write } = await setup(t);
+    const prompt = { type: 'user', sessionId: ID, uuid: 'u1', promptId: 'p1',
+        timestamp: '2026-10-22T00:00:00Z', message: { role: 'user', content: 'test prompt' } };
+    const file = await write(ID, JSON.stringify(prompt) + '\n'
+        + line('m1', 40, { timestamp: '2026-10-22T00:00:10Z' }));
+    assert.equal((await store.getStats(ID)).tps, 4);
+
+    await fs.appendFile(file, JSON.stringify({ ...prompt, uuid: 'u2', timestamp: '2026-10-22T00:00:15Z' }) + '\n'
+        + line('m1', 80, { timestamp: '2026-10-22T00:00:20Z' }));
+    const continued = await store.getStats(ID);
+    assert.equal(continued.status, 'ok'); assert.equal(continued.turns, 1); assert.equal(continued.steps, 1);
+    assert.equal(continued.inputTokens, 100); assert.equal(continued.outputTokens, 80);
+    assert.equal(continued.totalTokens, 180); assert.equal(continued.tps, 4);
+    assert.deepEqual(await store.getStats(ID), continued);
+
+    await fs.appendFile(file, JSON.stringify({ ...prompt, uuid: 'u3', promptId: 'p2',
+        timestamp: '2026-10-22T00:00:30Z' }) + '\n');
+    assert.equal((await store.getStats(ID)).tps, null);
+    await fs.appendFile(file, line('m2', 30, { timestamp: '2026-10-22T00:00:36Z' }));
+    assert.equal((await store.getStats(ID)).tps, 5);
+
+    await fs.appendFile(file, JSON.stringify({ ...prompt, uuid: 'tool-result', promptId: 'p2',
+        timestamp: '2026-10-22T00:02:00Z', message: { role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'test result' }] } }) + '\n');
+    assert.equal((await store.getStats(ID)).tps, null);
+    await fs.appendFile(file, line('m3', 60, { timestamp: '2026-10-22T00:02:10Z' }));
+    const following = await store.getStats(ID);
+    assert.equal(following.turns, 2); assert.equal(following.steps, 3);
+    assert.equal(following.inputTokens, 300); assert.equal(following.outputTokens, 170);
+    assert.equal(following.totalTokens, 470); assert.equal(following.tps, 6);
+    assert.deepEqual(await store.getStats(ID), following);
+});
 test('resets after truncation and same-size rewrite', async t => {
     const { store, write } = await setup(t);
     const file = await write(ID, line('a', 5) + line('b', 8));

@@ -68,7 +68,7 @@ function createMetrics({ sessionId } = {})
     const userAliases = new Map();
     const responses = new Map();
     const requestAliases = new Map();
-    const inputRows = new Set();
+    const toolInputs = new Set();
     let currentSessionId = identifier(sessionId);
     let lastInputAt = null;
     let lastResponse = null;
@@ -84,11 +84,13 @@ function createMetrics({ sessionId } = {})
     function ingestTurn(promptId, uuid)
     {
         const previous = uuid ? userAliases.get(uuid) : null;
-        if (previous && (!promptId || previous.promptId)) return;
+        if (previous && (!promptId || previous.promptId)) return false;
         const key = promptId ? `prompt:${promptId}` : `uuid:${uuid}`;
+        const isNew = !previous && !turns.has(key);
         if (previous) turns.delete(previous.key);
         turns.add(key);
         if (uuid) userAliases.set(uuid, { key, promptId });
+        return isNew;
     }
 
     function responseKey(messageId, requestId)
@@ -122,6 +124,7 @@ function createMetrics({ sessionId } = {})
         return messageKey;
     }
 
+    // 返回 true 表示新输入，供远程读取器同步结束上一段响应流。
     function ingest(row)
     {
         if (!isRecord(row) || !isRecord(row.message) || row.isMeta || row.isSidechain
@@ -135,15 +138,30 @@ function createMetrics({ sessionId } = {})
             const isToolResult = Array.isArray(message.content)
                 && message.content.some(block => isRecord(block) && block.type === 'tool_result');
             if ((!isPrompt && !isToolResult) || !acceptsSession(row)) return;
-            if (!promptId && !uuid) { lastInputAt = null; lastResponse = null; return; }
-            const inputKey = uuid ? `uuid:${uuid}` : `prompt:${promptId}`;
-            if (!inputRows.has(inputKey))
+            if (!promptId && !uuid) { lastInputAt = null; lastResponse = null; return true; }
+            const isNewPrompt = isPrompt && ingestTurn(promptId, uuid);
+            let isNewToolResult = false;
+            if (isToolResult)
             {
-                inputRows.add(inputKey);
+                const ids = message.content.filter(block => isRecord(block) && block.type === 'tool_result')
+                    .map(block => identifier(block.tool_use_id));
+                if (ids.some(id => id === null) && !uuid)
+                {
+                    lastInputAt = null;
+                    lastResponse = null;
+                    return true;
+                }
+                const keys = ids.every(id => id !== null) ? ids.map(id => `tool:${id}`) : [`uuid:${uuid}`];
+                isNewToolResult = keys.some(key => !toolInputs.has(key));
+                for (const key of keys) toolInputs.add(key);
+            }
+            // 输入和工具返回分别去重，重放记录不重新开始计时。
+            if (isNewPrompt || isNewToolResult)
+            {
                 lastInputAt = timestamp(row.timestamp);
                 lastResponse = null;
+                return true;
             }
-            if (isPrompt) ingestTurn(promptId, uuid);
         }
         else if (row.type === 'assistant' && message.role === 'assistant' && message.model !== '<synthetic>')
         {

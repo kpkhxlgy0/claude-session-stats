@@ -47,6 +47,46 @@ test('paginates in ascending sequence and resumes without double counting', asyn
     assert.match(f.requests[2].url, /sort_order=asc&cursor=1/);
     assert.match(f.requests.at(-1).url, /cursor=2/);
 });
+test('new event sequences replay a continuation without resetting prompt timing or usage', async t => {
+    const prompt = { ...user, promptId: 'p1' };
+    const first = { ...assistant, timestamp: '2026-10-22T00:00:10Z' };
+    const replay = { ...prompt, uuid: 'u2', timestamp: '2026-10-22T00:00:15Z' };
+    const cumulative = { ...first, uuid: 'a2', timestamp: '2026-10-22T00:00:20Z',
+        message: { ...first.message, usage: { ...usage, output_tokens: 80 } } };
+    const nextPrompt = { ...prompt, uuid: 'u3', promptId: 'p2', timestamp: '2026-10-22T00:00:30Z' };
+    const nextResponse = { ...assistant, uuid: 'a3', timestamp: '2026-10-22T00:00:36Z',
+        message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 30 } } };
+    const toolResult = { ...nextPrompt, uuid: 'tool-result', timestamp: '2026-10-22T00:02:00Z',
+        message: { role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'test result' }] } };
+    const toolResponse = { ...assistant, uuid: 'a4', timestamp: '2026-10-22T00:02:10Z',
+        message: { ...assistant.message, id: 'm3', usage: { ...usage, output_tokens: 60 } } };
+    const f = fixture(t, [{ data: [event(prompt, 1)], next_cursor: '1' },
+        { data: [event(first, 2)], resume_cursor: '2' },
+        { data: [event(replay, 3)], next_cursor: '3' },
+        { data: [event(cumulative, 4)], resume_cursor: '4' },
+        { data: [], resume_cursor: '4' },
+        { data: [event(nextPrompt, 5)], resume_cursor: '5' },
+        { data: [event(nextResponse, 6)], resume_cursor: '6' },
+        { data: [event(toolResult, 7)], resume_cursor: '7' },
+        { data: [event(toolResponse, 8)], resume_cursor: '8' }]);
+    assert.equal((await f.reader.read()).tps, 4);
+
+    const continued = await f.reader.read();
+    assert.equal(continued.turns, 1); assert.equal(continued.steps, 1);
+    assert.equal(continued.inputTokens, 100); assert.equal(continued.outputTokens, 80);
+    assert.equal(continued.totalTokens, 180); assert.equal(continued.tps, 4);
+    assert.deepEqual(await f.reader.read(), continued);
+
+    assert.equal((await f.reader.read()).tps, null);
+    assert.equal((await f.reader.read()).tps, 5);
+    assert.equal((await f.reader.read()).tps, null);
+    const following = await f.reader.read();
+    assert.equal(following.turns, 2); assert.equal(following.steps, 3);
+    assert.equal(following.inputTokens, 300); assert.equal(following.outputTokens, 170);
+    assert.equal(following.totalTokens, 470); assert.equal(following.tps, 6);
+    assert.deepEqual(await f.reader.read(), following);
+});
 test('missing usage and timestamps are not synthesized from envelope time', async t => {
     const missing = { ...assistant, timestamp: undefined, message: { ...assistant.message, usage: { output_tokens: 40 } } };
     const f = fixture(t, [{ data: [event(user, 1), { ...event(missing, 2), created_at: '2026-10-22T00:00:02Z' }] }]);
@@ -145,6 +185,57 @@ test('assistant content-block snapshots do not discard a still-running usage str
         event({ type: 'stream_event', timestamp: assistant.timestamp, event: { type: 'message_stop' } }, 5)] }]);
     const result = await f.reader.read();
     assert.equal(result.outputTokens, 40); assert.equal(result.totalTokens, 140); assert.equal(result.tps, 20);
+});
+
+test('replayed prompt carriers keep an incomplete usage stream until its final snapshot', async t => {
+    const prompt = { ...user, promptId: 'p1' };
+    const partial = { ...assistant, timestamp: '2026-10-22T00:00:10Z' };
+    const final = { ...assistant, uuid: 'a2', timestamp: '2026-10-22T00:00:20Z',
+        message: { ...assistant.message, usage: { ...usage, output_tokens: 80 } } };
+    const f = fixture(t, [{ data: [event(prompt, 1),
+        event({ type: 'stream_event', event: { type: 'message_start',
+            message: { id: 'm1', role: 'assistant', model: 'test', usage: { ...usage, output_tokens: 1 } } } }, 2),
+        event(partial, 3)], resume_cursor: '3' },
+        { data: [event({ ...prompt, uuid: 'u2', timestamp: '2026-10-22T00:00:15Z' }, 4)], resume_cursor: '4' },
+        { data: [event({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 80 } } }, 5),
+            event({ type: 'stream_event', timestamp: final.timestamp, event: { type: 'message_stop' } }, 6)],
+            resume_cursor: '6' },
+        { data: [event(final, 7)], resume_cursor: '7' }]);
+    const streaming = await f.reader.read();
+    assert.equal(streaming.outputTokens, 40); assert.equal(streaming.tps, null);
+    const replayed = await f.reader.read();
+    assert.equal(replayed.outputTokens, 40); assert.equal(replayed.tps, null);
+    const completed = await f.reader.read();
+    assert.equal(completed.turns, 1); assert.equal(completed.steps, 1);
+    assert.equal(completed.inputTokens, 100); assert.equal(completed.outputTokens, 80);
+    assert.equal(completed.totalTokens, 180); assert.equal(completed.tps, 4);
+    assert.deepEqual(await f.reader.read(), completed);
+    assert.deepEqual(await f.reader.read(), completed);
+});
+
+test('genuine prompts and tool results discard an older incomplete usage stream', async t => {
+    for (const [tool, withUuid] of [[false, true], [true, true], [false, false], [true, false]]) {
+        const prompt = { ...user, uuid: withUuid ? user.uuid : undefined, promptId: 'p1' };
+        const nextInput = { ...user, uuid: withUuid ? 'u2' : undefined, promptId: tool ? 'p1' : 'p2',
+            timestamp: '2026-10-22T00:00:30Z', message: { role: 'user', content: tool
+                ? [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'test result' }] : 'test next prompt' } };
+        const f = fixture(t, [{ data: [event(prompt, 1),
+            event({ type: 'stream_event', event: { type: 'message_start',
+                message: { id: 'm1', usage: { ...usage, output_tokens: 1 } } } }, 2),
+            event({ ...assistant, timestamp: '2026-10-22T00:00:10Z' }, 3)], resume_cursor: '3' },
+            { data: [event(nextInput, 4)], resume_cursor: '4' },
+            { data: [event({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 80 } } }, 5),
+                event({ type: 'stream_event', timestamp: '2026-10-22T00:00:32Z',
+                    event: { type: 'message_stop' } }, 6),
+                event({ ...assistant, uuid: 'a2', timestamp: '2026-10-22T00:00:36Z',
+                    message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 30 } } }, 7)],
+                resume_cursor: '7' }]);
+        assert.equal((await f.reader.read()).tps, null);
+        assert.equal((await f.reader.read()).tps, null);
+        const result = await f.reader.read();
+        assert.equal(result.turns, tool ? 1 : 2); assert.equal(result.steps, 2);
+        assert.equal(result.outputTokens, 70); assert.equal(result.totalTokens, 270); assert.equal(result.tps, 5);
+    }
 });
 
 test('requestId-only assistant records retain the existing identity fallback', async t => {

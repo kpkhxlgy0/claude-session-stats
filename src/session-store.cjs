@@ -2,6 +2,7 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { createSessionHistory } = require('./session-history.cjs');
 
 const UuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SessionPattern = /^([0-9a-f-]{36})\.jsonl$/i;
@@ -56,11 +57,19 @@ function createSessionStore({ claudeHome, createMetrics } = {})
     function reset(entry)
     {
         entry.metrics = makeMetrics(entry.id);
+        entry.history = createSessionHistory(entry.id);
+        entry.historyUuids = new Set();
+        entry.historyIncomplete = false;
         entry.corrupt = false;
+        entry.identity = null;
+        rewind(entry);
+    }
+
+    function rewind(entry)
+    {
         entry.offset = 0;
         entry.pending = Buffer.alloc(0);
         entry.skippingLine = false;
-        entry.identity = null;
         entry.head = Buffer.alloc(0);
         entry.tail = Buffer.alloc(0);
     }
@@ -148,7 +157,7 @@ function createSessionStore({ claudeHome, createMetrics } = {})
         return index.get(threadId) || null;
     }
 
-    function consume(entry, chunk)
+    function consume(entry, chunk, trackHistory)
     {
         let start = 0;
         while (start < chunk.length)
@@ -181,7 +190,12 @@ function createSessionStore({ claudeHome, createMetrics } = {})
                         record = undefined;
                         entry.corrupt = true;
                     }
-                    if (record !== undefined) entry.metrics.ingest(record);
+                    if (record !== undefined)
+                    {
+                        if (trackHistory) entry.history.ingest(record);
+                        entry.metrics.ingest(entry.historyUuids.has(record && record.uuid)
+                            ? { ...record, sessionId: entry.id } : record);
+                    }
                 }
             }
             if (newline === -1) break;
@@ -196,6 +210,27 @@ function createSessionStore({ claudeHome, createMetrics } = {})
         const actual = Buffer.alloc(expected.length);
         const { bytesRead } = await handle.read(actual, 0, actual.length, position);
         return bytesRead === expected.length && actual.equals(expected);
+    }
+
+    async function readContents(entry, handle, size, trackHistory)
+    {
+        const buffer = Buffer.alloc(ChunkBytes);
+        let chunks = 0;
+        while (entry.offset < size && !disposed)
+        {
+            const length = Math.min(buffer.length, size - entry.offset);
+            const { bytesRead } = await handle.read(buffer, 0, length, entry.offset);
+            if (!bytesRead) break;
+            const chunk = buffer.subarray(0, bytesRead);
+            if (entry.head.length < GuardBytes)
+            {
+                entry.head = Buffer.concat([entry.head, chunk]).subarray(0, GuardBytes);
+            }
+            entry.tail = Buffer.from(Buffer.concat([entry.tail, chunk]).subarray(-GuardBytes));
+            entry.offset += bytesRead;
+            consume(entry, chunk, trackHistory);
+            if (++chunks % 8 === 0) await new Promise(setImmediate);
+        }
     }
 
     async function read(entry)
@@ -213,22 +248,16 @@ function createSessionStore({ claudeHome, createMetrics } = {})
                 reset(entry);
             }
             entry.identity = identity;
-            const buffer = Buffer.alloc(ChunkBytes);
-            let chunks = 0;
-            while (entry.offset < stat.size && !disposed)
+            await readContents(entry, handle, stat.size, true);
+            const history = entry.history.resolve();
+            entry.historyIncomplete = history.incomplete;
+            if (entry.historyUuids.size !== history.allowed.size
+                || [...history.allowed].some(uuid => !entry.historyUuids.has(uuid)))
             {
-                const size = Math.min(buffer.length, stat.size - entry.offset);
-                const { bytesRead } = await handle.read(buffer, 0, size, entry.offset);
-                if (!bytesRead) break;
-                const chunk = buffer.subarray(0, bytesRead);
-                if (entry.head.length < GuardBytes)
-                {
-                    entry.head = Buffer.concat([entry.head, chunk]).subarray(0, GuardBytes);
-                }
-                entry.tail = Buffer.from(Buffer.concat([entry.tail, chunk]).subarray(-GuardBytes));
-                entry.offset += bytesRead;
-                consume(entry, chunk);
-                if (++chunks % 8 === 0) await new Promise(setImmediate);
+                entry.historyUuids = history.allowed;
+                entry.metrics = makeMetrics(entry.id);
+                rewind(entry);
+                await readContents(entry, handle, stat.size, false);
             }
         }
         finally
@@ -259,6 +288,7 @@ function createSessionStore({ claudeHome, createMetrics } = {})
             if (!entry.path) return result(entry.id, 'not-found');
             await read(entry);
         }
+        if (entry.historyIncomplete) return result(entry.id, 'incomplete');
         return result(entry.id, entry.corrupt ? 'incomplete' : 'ok', entry);
     }
 

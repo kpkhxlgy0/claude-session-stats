@@ -328,6 +328,79 @@ test('cumulative response blocks and replay keep one output count and the origin
     assert.equal(metrics.snapshot().tps, 10);
 });
 
+test('replayed prompt aliases preserve TPS and cumulative usage when the carrier UUID changes', () =>
+{
+    for (const firstUuid of ['original', undefined])
+    {
+        const metrics = createMetrics();
+        metrics.ingest(user(firstUuid, 'prompt', { promptId: 'same-prompt', timestamp: '2026-01-01T00:00:00Z' }));
+        metrics.ingest(assistant('response', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
+        assert.equal(metrics.snapshot().tps, 4);
+        metrics.ingest(user('replayed', 'prompt', { promptId: 'same-prompt', timestamp: '2026-01-01T00:00:15Z' }));
+        assert.equal(metrics.snapshot().tps, 4);
+        metrics.ingest(assistant('response', completeUsage({ output_tokens: 80 }),
+            { timestamp: '2026-01-01T00:00:20Z' }));
+        const stats = metrics.snapshot();
+        assert.equal(stats.turns, 1);
+        assert.equal(stats.steps, 1);
+        assert.equal(stats.totalTokens, 180);
+        assert.equal(stats.outputTokens, 80);
+        assert.equal(stats.tps, 4);
+    }
+});
+
+test('replaying an older prompt under another UUID cannot clear the newer response speed', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('original', 'first', { promptId: 'first', timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
+    metrics.ingest(user('next', 'second', { promptId: 'second', timestamp: '2026-01-01T00:00:20Z' }));
+    assert.equal(metrics.snapshot().tps, null);
+    metrics.ingest(assistant('second', completeUsage(), { timestamp: '2026-01-01T00:00:22Z' }));
+    metrics.ingest(user('old-replay', 'first', { promptId: 'first', timestamp: '2026-01-01T00:00:00Z' }));
+    const stats = metrics.snapshot();
+    assert.equal(stats.turns, 2);
+    assert.equal(stats.steps, 2);
+    assert.equal(stats.totalTokens, 280);
+    assert.equal(stats.tps, 20);
+});
+
+test('tool results without UUIDs use tool identities independently of the prompt and replay carriers', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user(undefined, 'prompt', { promptId: 'prompt', timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
+    const result = user(undefined, [{ type: 'tool_result', tool_use_id: 'tool-1' }],
+        { promptId: 'prompt', timestamp: '2026-01-01T00:00:20Z' });
+    metrics.ingest(result);
+    assert.equal(metrics.snapshot().tps, null);
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: 60 }),
+        { timestamp: '2026-01-01T00:00:30Z' }));
+    assert.equal(metrics.snapshot().tps, 6);
+    metrics.ingest({ ...result, uuid: 'replayed-tool', timestamp: '2026-01-01T00:00:40Z' });
+    assert.equal(metrics.snapshot().tps, 6);
+    metrics.ingest(user(undefined, [{ type: 'tool_result', tool_use_id: 'tool-2' }],
+        { promptId: 'prompt', timestamp: '2026-01-01T00:00:50Z' }));
+    assert.equal(metrics.snapshot().tps, null);
+    metrics.ingest(assistant('third', completeUsage({ output_tokens: 100 }),
+        { timestamp: '2026-01-01T00:01:00Z' }));
+    const stats = metrics.snapshot();
+    assert.equal(stats.turns, 1); assert.equal(stats.steps, 3);
+    assert.equal(stats.totalTokens, 500); assert.equal(stats.tps, 10);
+});
+
+test('a tool result without a row or tool identity cannot lend the previous input time to TPS', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user(undefined, 'prompt', { promptId: 'prompt', timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
+    metrics.ingest(user(undefined, [{ type: 'tool_result' }],
+        { promptId: 'prompt', timestamp: '2026-01-01T00:00:20Z' }));
+    metrics.ingest(assistant('second', completeUsage(), { timestamp: '2026-01-01T00:00:30Z' }));
+    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().totalTokens, 280);
+});
+
 test('TPS stays unknown for missing, reversed or too short timing and missing output', () =>
 {
     for (const [start, end, output] of [

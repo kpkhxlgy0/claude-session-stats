@@ -87,9 +87,9 @@ function createRemoteReader(win, createMetrics, options = {}) {
         if (row.type === 'user' && !row.uuid && !row.promptId
             || row.type === 'assistant' && !row.message.id && !row.requestId) throw new Error('Missing message identity');
         // session_id/JSONL sessionId 是远端 CLI ID，统计边界使用已确认的 bridge ID。
-        current.metrics.ingest({ ...row, sessionId: undefined });
-        if (row.type === 'user') current.stream = null;
-        else if (current.stream && row.message.id === current.stream.id) {
+        const newInput = current.metrics.ingest({ ...row, sessionId: undefined });
+        if (row.type === 'user' && newInput) current.stream = null;
+        else if (row.type === 'assistant' && current.stream && row.message.id === current.stream.id) {
             // 内容块的 assistant 快照可能先于最终 message_delta，必须继续合并后续用量。
             for (const field of fields) {
                 const count = row.message.usage?.[field];
