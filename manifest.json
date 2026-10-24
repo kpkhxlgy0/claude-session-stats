@@ -1,8 +1,8 @@
 {
   "id": "com.kpk.session-stats",
   "name": "Session Stats",
-  "version": "0.3.0",
-  "description": "Turns, model steps, estimated TPS, token usage and cache hit for local Claude Code and Remote Control sessions.",
+  "version": "0.4.0",
+  "description": "Turns, model steps, estimated TPS, token usage and cache hit, synchronized through runner snapshots for Remote Control sessions.",
   "author": "KPK",
   "githubRepo": "kpkhxlgy0/claude-session-stats",
   "homepage": "https://github.com/kpkhxlgy0/claude-session-stats",

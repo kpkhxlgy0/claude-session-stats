@@ -143,7 +143,7 @@ test('Remote Control candidates wait for confirmed stats without overlapping req
     const bar = f.doc.querySelector('[data-session-stats]');
     assert.match(bar.textContent, /2 turns.*33 steps.*≈ 42 tok\/s.*11\.7M tok.*Cache hit 96%/);
     assert.doesNotMatch(bar.textContent, /context|上下文/i);
-    assert.match(f.doc.querySelector('[data-stat="tokens"]').title, /累计仅.*Remote Control.*同步历史/);
+    assert.match(f.doc.querySelector('[data-stat="tokens"]').title, /运行端.*会话日志/);
     assert.doesNotMatch(bar.title, /本地/);
     assert.equal(f.doc.querySelector('form').outerHTML, before);
     assert.equal(parseFloat(bar.style.left) + parseFloat(bar.style.width) / 2, 320);
@@ -157,6 +157,32 @@ test('Remote Control can show valid metrics when TPS is unavailable', async t =>
     };
     f.run(); await tick();
     assert.match(f.doc.querySelector('[data-session-stats]').textContent, /2 turns.*33 steps.*— tok\/s/);
+});
+
+test('remote missing or expired snapshots show an explanation without stale numbers', async t => {
+    const f = fixture(t, `https://claude.ai/code/${REMOTE}`);
+    let result = { ...stats, threadId: REMOTE, source: 'remote_control', tps: 42 };
+    f.api.ipc.invoke = async () => result;
+    f.run(); await tick();
+    assert.match(f.doc.querySelector('[data-session-stats]').textContent, /42 tok\/s/);
+    result = { ...result, status: 'unavailable', unavailableReason: 'snapshot-expired' };
+    await tick();
+    const bar = f.doc.querySelector('[data-session-stats]');
+    assert.ok(bar);
+    assert.match(bar.textContent, /— tok\/s/);
+    assert.doesNotMatch(bar.textContent, /42 tok\/s|33 steps/);
+    assert.match(bar.title, /快照.*过期/);
+    result = { ...result, unavailableReason: 'snapshot-missing' };
+    await tick();
+    assert.match(bar.title, /运行端.*Session Stats/);
+});
+
+test('remote TPS tooltip describes the runner log rather than synchronized event timing', async t => {
+    const f = fixture(t, `https://claude.ai/code/${REMOTE}`);
+    f.api.ipc.invoke = async () => ({ ...stats, threadId: REMOTE, source: 'remote_control' });
+    f.run(); await tick();
+    assert.match(f.doc.querySelector('[data-stat="tps"]').title, /运行端.*快照/);
+    assert.doesNotMatch(f.doc.querySelector('[data-stat="tokens"]').title, /仅包含 Remote Control 同步历史/);
 });
 
 test('unconfirmed cloud, stale identity, and incomplete remote results stay hidden while polling', async t => {

@@ -17,9 +17,22 @@ function count(value) {
 function projectStats(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     const { threadId, source, status, turns, steps, totalTokens, inputTokens, outputTokens,
-        cachedInputTokens, cacheHit, tps, usageComplete } = value;
+        cachedInputTokens, cacheHit, tps, usageComplete, snapshotGeneratedAt,
+        snapshotRevision, snapshotPublisherId, unavailableReason } = value;
     if (typeof threadId !== 'string' || !/^session_[A-Za-z0-9_-]{1,128}$/.test(threadId)
-        || source !== 'remote_control' || status !== 'ok' || typeof usageComplete !== 'boolean') return null;
+        || source !== 'remote_control') return null;
+    if (status === 'unavailable') {
+        if (!['pending', 'offline', 'timeout', 'transport', 'snapshot-missing', 'snapshot-denied',
+            'snapshot-unsupported', 'snapshot-invalid', 'snapshot-identity', 'snapshot-expired',
+            'snapshot-future', 'snapshot-replay', 'source-unavailable'].includes(unavailableReason)) return null;
+        return { threadId, source, status, unavailableReason, turns: null, steps: null,
+            totalTokens: null, inputTokens: null, outputTokens: null, cachedInputTokens: null,
+            cacheHit: null, tps: null, usageComplete: false };
+    }
+    if (status !== 'ok' || typeof usageComplete !== 'boolean'
+        || count(snapshotGeneratedAt) === null || !(count(snapshotRevision) > 0)
+        || typeof snapshotPublisherId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(snapshotPublisherId)) return null;
     return {
         threadId, source: 'remote_control', status: 'ok',
         turns: count(turns), steps: count(steps), totalTokens: count(totalTokens),
@@ -28,6 +41,7 @@ function projectStats(value) {
         cacheHit: Number.isFinite(cacheHit) && cacheHit >= 0 && cacheHit <= 1 ? cacheHit : null,
         tps: Number.isFinite(tps) && tps > 0 ? tps : null,
         usageComplete,
+        snapshotGeneratedAt, snapshotRevision, snapshotPublisherId,
     };
 }
 

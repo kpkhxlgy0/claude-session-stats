@@ -82,6 +82,22 @@ function footerBounds(root, win) {
     return { left: center - halfWidth, top: (top + bottom - 14) / 2, width: halfWidth * 2 };
 }
 
+const SnapshotUnavailable = {
+    pending: '等待运行端统计快照',
+    offline: '运行端离线，等待重新连接',
+    timeout: '统计快照读取超时，稍后重试',
+    transport: '统计快照连接暂不可用',
+    'snapshot-missing': '运行端尚未生成统计快照，请在运行端安装或更新 Session Stats',
+    'snapshot-denied': '运行端拒绝读取统计快照，请检查运行端 Session Stats 和目录读取权限',
+    'snapshot-unsupported': '运行端当前版本不支持读取统计快照',
+    'snapshot-invalid': '运行端统计快照数据无效',
+    'snapshot-identity': '统计快照与当前会话或组织不匹配',
+    'snapshot-expired': '统计快照已过期，等待运行端更新',
+    'snapshot-future': '设备时间不一致，无法确认统计快照时效',
+    'snapshot-replay': '统计快照版本早于已接收版本，等待新快照',
+    'source-unavailable': '运行端会话日志暂不可用或不完整',
+};
+
 function makeBar(doc, remote) {
     const bar = doc.createElement('div');
     bar.dataset.sessionStats = '';
@@ -102,7 +118,8 @@ function makeBar(doc, remote) {
     fields.turns.title = `${scope}的用户轮次，按 promptId/uuid 去重，排除工具返回和系统注入消息`;
     fields.steps.title = `${scope}的模型响应次数，按消息 ID 去重；不等于工具调用次数`;
     fields.tps.title = '整个会话平均 TPS（估算）：有效响应样本的输出 tokens 总和 ÷ 对应耗时总和；'
-        + `以${remote ? '已同步历史' : '已确认日志'}为范围，耗时从用户输入或工具返回计至响应记录，包含首 Token 等待和网络耗时。`
+        + (remote ? '由运行端原始会话日志计算，通过 RC 读取同一统计快照；同步可能有数秒延迟。' : '以已确认日志为范围。')
+        + '耗时从用户输入或工具返回计至响应记录，包含首 Token 等待和网络耗时。'
         + '新输入、工具执行和后续生成期间保留已有平均值；缺少有效样本时显示 —。';
     return { bar, fields };
 }
@@ -117,12 +134,15 @@ function render(entry, stats) {
     };
     for (const [name, value] of Object.entries(text))
         if (entry.fields[name].textContent !== value) entry.fields[name].textContent = value;
-    const pending = stats?.status === 'incomplete' ? '日志包含不完整记录，等待可验证的用量数据'
+    const pending = entry.remote ? SnapshotUnavailable[stats?.unavailableReason] ?? SnapshotUnavailable.pending
+        : stats?.status === 'incomplete' ? '日志包含不完整记录，等待可验证的用量数据'
         : '等待当前会话的本地统计数据';
-    entry.bar.title = stats?.status === 'ok' ? '' : pending;
+    entry.bar.title = stats?.status === 'ok'
+        ? (Number.isSafeInteger(stats.snapshotGeneratedAt)
+            ? `共享统计快照，更新于 ${new Date(stats.snapshotGeneratedAt).toLocaleTimeString()}` : '') : pending;
     entry.fields.tokens.title = stats?.status === 'ok'
         ? `累计输入 ${compact(s.inputTokens)}，输出 ${compact(s.outputTokens)}；输入包含缓存读取和写入`
-            + (entry.remote ? '；累计仅包含 Remote Control 同步历史' : '') : pending;
+            + (entry.remote ? '；来自运行端已确认的会话日志' : '') : pending;
     entry.fields.cache.title = stats?.status === 'ok'
         ? `缓存读取 ${compact(s.cachedInputTokens)} ÷ 总输入 ${compact(s.inputTokens)}` : pending;
 }
@@ -174,7 +194,8 @@ function startRenderer(api, options = {}) {
                 : api.ipc.invoke('stats', current.sessionId));
             if (!isCurrent(current)) return;
             if (current.remote) {
-                if (stats?.threadId !== current.sessionId || stats.source !== 'remote_control' || stats.status !== 'ok') {
+                if (stats?.threadId !== current.sessionId || stats.source !== 'remote_control'
+                    || !(stats.status === 'ok' || stats.status === 'unavailable' && Object.hasOwn(SnapshotUnavailable, stats.unavailableReason))) {
                     current.bar.remove(); return;
                 }
                 render(current, stats); position(current);
@@ -232,12 +253,12 @@ function startRenderer(api, options = {}) {
 module.exports = { parseSessionId, findComposer, startRenderer };
 
 return module.exports; })();
-let controller;
+let controller, cleanup;
 module.exports = {
-    start(api) {
-        module.exports.stop();
+    async start(api) {
+        await module.exports.stop();
         if (api.process === "main") controller = require("./src/main.cjs").startMain(api);
         else if (api.process === "renderer") controller = renderer.startRenderer(api);
     },
-    stop() { controller?.stop(); controller = undefined; },
+    stop() { if (controller) { cleanup = controller.stop(); controller = undefined; } return cleanup; },
 };

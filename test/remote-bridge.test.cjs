@@ -10,6 +10,8 @@ const STATS = {
     threadId: 'session_example-123', source: 'remote_control', status: 'ok',
     turns: 3, steps: 2, totalTokens: 150, inputTokens: 100, outputTokens: 50,
     cachedInputTokens: 25, cacheHit: 0.25, tps: 12.5, usageComplete: true,
+    snapshotGeneratedAt: 100000, snapshotRevision: 1,
+    snapshotPublisherId: '11111111-1111-4111-8111-111111111111',
 };
 
 function fixture(t, { url = URL, execute = () => STATS, timeoutMs, cleanupScript } = {}) {
@@ -38,6 +40,27 @@ function deferred() {
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     return { promise, resolve, reject };
 }
+
+test('bound unavailable snapshot clears every metric and exposes only an allowed reason', async t => {
+    const f = fixture(t, { execute: () => ({ ...STATS, status: 'unavailable',
+        unavailableReason: 'snapshot-expired', path: 'private path' }) });
+    const result = await f.read();
+    assert.equal(result?.threadId, STATS.threadId);
+    assert.equal(result?.unavailableReason, 'snapshot-expired');
+    assert.equal(result?.tps, null);
+    assert.equal(result?.totalTokens, null);
+    assert.equal(result?.usageComplete, false);
+    assert.equal(result?.snapshotGeneratedAt, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /private path/);
+});
+
+test('successful remote results require valid snapshot provenance', async t => {
+    for (const change of [{ snapshotGeneratedAt: undefined }, { snapshotRevision: 0 },
+        { snapshotPublisherId: 'untrusted-id' }]) {
+        const f = fixture(t, { execute: () => ({ ...STATS, ...change }) });
+        assert.equal(await f.read(), null);
+    }
+});
 
 test('runs only the fixed script and projects statistics without page extras', async t => {
     const f = fixture(t, { execute: () => ({ ...STATS,
@@ -120,6 +143,7 @@ test('preserves valid zero and maximum safe counts with incomplete usage', async
         totalTokens: Number.MAX_SAFE_INTEGER, inputTokens: null, outputTokens: 0,
         cachedInputTokens: null, cacheHit: 0, tps: null, usageComplete: false }) });
     assert.deepEqual(await f.read(), {
+        ...STATS,
         threadId: 'session_' + 'x'.repeat(128), source: 'remote_control', status: 'ok',
         turns: 0, steps: null, totalTokens: Number.MAX_SAFE_INTEGER, inputTokens: null,
         outputTokens: 0, cachedInputTokens: null, cacheHit: 0, tps: null, usageComplete: false,

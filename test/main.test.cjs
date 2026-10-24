@@ -10,6 +10,7 @@ function fixture(extra = {}) {
     const api = { manifest: { id: 'com.kpk.session-stats' },
         ipc: { handle(name, fn) { assert.equal(name, 'stats'); handler = fn; } }, log: { info() {} } };
     const options = { claudeData: 'unused', claudeHome: 'unused', ipcMain: { handle() {}, removeHandler() {} },
+        publisher: { start() {}, readLocal: async () => null, stop() {} },
         resolveSession: async (_, id) => id === LOCAL ? CLI : null,
         store: { getStats: async id => { calls.push(id); return { status: 'ok', threadId: id, turns: 3, tps: null }; },
             dispose() { disposed = true; } }, ...extra };
@@ -20,6 +21,36 @@ test('maps explicit Desktop key to UUID and correlates response with requested r
     const f = fixture();
     assert.deepEqual(await f.read(LOCAL), { status: 'ok', threadId: LOCAL, turns: 3, tps: null });
     assert.deepEqual(f.calls, [CLI]); f.controller.stop();
+});
+
+test('bound local route returns the exact published sample without a second statistics read', async () => {
+    const sample = { status: 'ok', turns: 4, tps: 35.125, snapshotRevision: 7,
+        snapshotGeneratedAt: 100000, snapshotPublisherId: CLI };
+    let started = 0, stopped = 0;
+    const f = fixture({ publisher: { start() { started++; },
+        async readLocal(id) { assert.equal(id, LOCAL); return sample; }, stop() { stopped++; } } });
+    assert.deepEqual(await f.read(LOCAL), { ...sample, threadId: LOCAL });
+    assert.deepEqual(f.calls, []);
+    assert.equal(started, 1);
+    f.controller.stop(); f.controller.stop();
+    assert.equal(stopped, 1);
+});
+
+test('failed publication cannot fall back to a differently calculated local sample', async () => {
+    const f = fixture({ publisher: { start() {}, async readLocal() { return { status: 'unavailable', tps: null }; }, stop() {} } });
+    assert.equal((await f.read(LOCAL)).status, 'unavailable');
+    assert.deepEqual(f.calls, []);
+    f.controller.stop();
+});
+
+test('stop during a snapshot read invalidates its late local reply', async () => {
+    let finish;
+    const f = fixture({ publisher: { start() {}, readLocal: () => new Promise(resolve => { finish = resolve; }), stop() {} } });
+    const pending = f.read(LOCAL);
+    f.controller.stop();
+    if (finish) finish({ status: 'ok', turns: 1, tps: 99 });
+    assert.equal((await pending).status, 'unavailable');
+    assert.deepEqual(f.calls, []);
 });
 
 test('main registers the Remote Control bridge and removes it on stop', () => {
@@ -41,7 +72,9 @@ test('mapping changes during I/O cannot return statistics for the old session', 
 test('dispose is idempotent and pending work cannot publish afterwards', async () => {
     let resolve;
     const f = fixture({ resolveSession: async () => new Promise(r => { resolve = r; }) });
-    const result = f.read(LOCAL); f.controller.stop(); f.controller.stop(); resolve(CLI);
+    const result = f.read(LOCAL);
+    while (!resolve) await new Promise(done => setImmediate(done));
+    f.controller.stop(); f.controller.stop(); resolve(CLI);
     assert.equal((await result).status, 'unavailable'); assert.deepEqual(f.calls, []);
     assert.equal(f.disposed(), true);
     assert.equal((await f.read(LOCAL)).status, 'unavailable');
