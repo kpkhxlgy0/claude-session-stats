@@ -10,6 +10,7 @@ const usage = { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_in
 const user = { type: 'user', uuid: 'u1', timestamp: '2026-10-22T00:00:00Z', message: { role: 'user', content: 'private text' } };
 const assistant = { type: 'assistant', uuid: 'a1', timestamp: '2026-10-22T00:00:02Z', message: { role: 'assistant', id: 'm1', usage } };
 function event(payload, sequence_num) { return { event_id: `event-${sequence_num}`, sequence_num, payload }; }
+function stream(type, extra = {}, timestamp) { return { type: 'stream_event', event: { type, ...extra }, timestamp }; }
 function fixture(t, pages = [{ data: [event(user, 1), event(assistant, 2)], resume_cursor: '2' }], options = {}) {
     const dom = new JSDOM('<div class="ProseMirror" contenteditable="true"></div>', { url: `https://claude.ai/epitaxy/${ID}` });
     t.after(() => dom.window.close());
@@ -78,13 +79,13 @@ test('new event sequences replay a continuation without resetting prompt timing 
     assert.equal(continued.totalTokens, 180); assert.equal(continued.tps, 4);
     assert.deepEqual(await f.reader.read(), continued);
 
-    assert.equal((await f.reader.read()).tps, null);
-    assert.equal((await f.reader.read()).tps, 5);
-    assert.equal((await f.reader.read()).tps, null);
+    assert.equal((await f.reader.read()).tps, 4);
+    assert.equal((await f.reader.read()).tps, 110 / (20 + 6));
+    assert.equal((await f.reader.read()).tps, 110 / (20 + 6));
     const following = await f.reader.read();
     assert.equal(following.turns, 2); assert.equal(following.steps, 3);
     assert.equal(following.inputTokens, 300); assert.equal(following.outputTokens, 170);
-    assert.equal(following.totalTokens, 470); assert.equal(following.tps, 6);
+    assert.equal(following.totalTokens, 470); assert.equal(following.tps, 170 / (20 + 6 + 10));
     assert.deepEqual(await f.reader.read(), following);
 });
 test('missing usage and timestamps are not synthesized from envelope time', async t => {
@@ -144,6 +145,69 @@ test('raw streaming usage and final snapshots count the response once', async t 
         event({ type: 'result', usage: { ...usage, output_tokens: 99999 } }, 6)] }]);
     const result = await f.reader.read();
     assert.equal(result.steps, 1); assert.equal(result.totalTokens, 140); assert.equal(result.tps, 20);
+});
+
+test('session average survives new turns and active streams before reweighting completed samples', async t => {
+    const next = { ...user, uuid: 'u2', promptId: 'p2', timestamp: '2026-10-22T00:00:10Z' };
+    const partial = { ...assistant, uuid: 'a2', timestamp: '2026-10-22T00:00:12Z',
+        message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 20 } } };
+    const final = { ...partial, uuid: 'a3', timestamp: '2026-10-22T00:00:18Z',
+        message: { ...partial.message, usage: { ...usage, output_tokens: 80 } } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(assistant, 2)], resume_cursor: '2' },
+        { data: [event(next, 3), event({ type: 'stream_event', event: { type: 'message_start',
+            message: { id: 'm2', usage: { ...usage, output_tokens: 1 } } } }, 4)], resume_cursor: '4' },
+        { data: [event(partial, 5), event({ type: 'stream_event', event: { type: 'message_delta',
+            usage: { output_tokens: 80 } } }, 6)], resume_cursor: '6' },
+        { data: [event({ type: 'stream_event', timestamp: final.timestamp,
+            event: { type: 'message_stop' } }, 7), event(final, 8)], resume_cursor: '8' },
+        { data: [event({ ...next, uuid: 'u3', promptId: 'p3', timestamp: '2026-10-22T00:00:30Z' }, 9)],
+            resume_cursor: '9' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    const streaming = await f.reader.read();
+    assert.equal(streaming.outputTokens, 60);
+    assert.equal(streaming.tps, 20);
+    const completed = await f.reader.read();
+    assert.equal(completed.steps, 2); assert.equal(completed.outputTokens, 120);
+    assert.equal(completed.tps, 120 / (2 + 8));
+    assert.equal((await f.reader.read()).tps, completed.tps);
+});
+
+test('abandoned partial streams never become session average samples', async t => {
+    const next = { ...user, uuid: 'u2', promptId: 'p2', timestamp: '2026-10-22T00:00:10Z' };
+    const third = { ...next, uuid: 'u3', promptId: 'p3', timestamp: '2026-10-22T00:00:20Z' };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(assistant, 2)], resume_cursor: '2' },
+        { data: [event(next, 3), event({ type: 'stream_event', event: { type: 'message_start',
+            message: { id: 'm2', usage } } }, 4), event({ ...assistant, uuid: 'a2',
+            timestamp: '2026-10-22T00:00:11Z', message: { ...assistant.message, id: 'm2',
+                usage: { ...usage, output_tokens: 1000 } } }, 5)], resume_cursor: '5' },
+        { data: [event(third, 6)], resume_cursor: '6' },
+        { data: [event({ ...assistant, uuid: 'a3', timestamp: '2026-10-22T00:00:24Z',
+            message: { ...assistant.message, id: 'm3' } }, 7)], resume_cursor: '7' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    const completed = await f.reader.read();
+    assert.equal(completed.outputTokens, 1080);
+    assert.equal(completed.tps, 80 / (2 + 4));
+});
+
+test('replayed starts of completed streams cannot hide their confirmed TPS', async t => {
+    const start = { type: 'stream_event', event: { type: 'message_start', message: { id: 'm1', usage } } };
+    const stop = { type: 'stream_event', timestamp: assistant.timestamp, event: { type: 'message_stop' } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(start, 2), event(stop, 3)], resume_cursor: '3' },
+        { data: [event(start, 4)], resume_cursor: '4' },
+        { data: [event(stop, 5)], resume_cursor: '5' },
+    ]);
+    const completed = await f.reader.read();
+    assert.equal(completed.tps, 20);
+    assert.deepEqual(await f.reader.read(), completed);
+    assert.deepEqual(await f.reader.read(), completed);
 });
 test('organization switches reset state and a missing provider never fetches', async t => {
     const f = fixture(t);
@@ -243,6 +307,289 @@ test('requestId-only assistant records retain the existing identity fallback', a
         event({ ...assistant, requestId: 'request-1', message: { ...assistant.message, id: undefined } }, 2)] }]);
     const result = await f.reader.read();
     assert.equal(result?.steps, 1); assert.equal(result?.totalTokens, 140);
+    assert.equal(result?.tps, 20);
+});
+
+test('active request-only snapshots remain pending through alias upgrades and complete once', async t => {
+    const next = { ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' };
+    const fallback = { ...assistant, requestId: 'r2', timestamp: '2026-10-22T00:00:12Z',
+        message: { ...assistant.message, id: undefined, usage: { ...usage, output_tokens: 1000 } } };
+    const linked = { ...fallback, timestamp: '2026-10-22T00:00:14Z', message: { ...fallback.message, id: 'm2' } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(assistant, 2)], resume_cursor: '2' },
+        { data: [event(next, 3), event(stream('message_start', { message: { id: 'm2', usage } }), 4),
+            event(fallback, 5)], resume_cursor: '5' },
+        { data: [event(linked, 6)], resume_cursor: '6' },
+        { data: [event(stream('message_delta', { usage: { output_tokens: 2000 } }), 7),
+            event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 8)], resume_cursor: '8' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    const pending = await f.reader.read();
+    assert.equal(pending.outputTokens, 1040); assert.equal(pending.tps, 20);
+    const upgraded = await f.reader.read();
+    assert.equal(upgraded.steps, 2); assert.equal(upgraded.outputTokens, 1040); assert.equal(upgraded.tps, 20);
+    const completed = await f.reader.read();
+    assert.equal(completed.steps, 2); assert.equal(completed.outputTokens, 2040); assert.equal(completed.tps, 204);
+});
+
+test('unassociated request fallbacks remain excluded after stream stop until explicitly linked', async t => {
+    const fallback = { ...assistant, requestId: 'r2', timestamp: '2026-10-22T00:00:12Z',
+        message: { ...assistant.message, id: undefined, usage: { ...usage, output_tokens: 1000 } } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(assistant, 2)], resume_cursor: '2' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 3),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 4), event(fallback, 5)], resume_cursor: '5' },
+        { data: [event(stream('message_delta', { usage: { output_tokens: 2000 } }), 6),
+            event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 7)], resume_cursor: '7' },
+        { data: [event({ ...fallback, timestamp: '2026-10-22T00:00:18Z',
+            message: { ...fallback.message, id: 'm2', usage: { ...usage, output_tokens: 2000 } } }, 8)], resume_cursor: '8' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    const unlinked = await f.reader.read();
+    assert.equal(unlinked.steps, 3); assert.equal(unlinked.outputTokens, 3040); assert.equal(unlinked.tps, 204);
+    const linked = await f.reader.read();
+    assert.equal(linked.steps, 2); assert.equal(linked.outputTokens, 2040); assert.equal(linked.tps, 204);
+});
+
+test('request fallbacks from abandoned streams stay pending through a later explicit identity', async t => {
+    const fallback = { ...assistant, requestId: 'r2', timestamp: '2026-10-22T00:00:12Z',
+        message: { ...assistant.message, id: undefined, usage: { ...usage, output_tokens: 1000 } } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(assistant, 2)], resume_cursor: '2' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 3),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 4), event(fallback, 5)], resume_cursor: '5' },
+        { data: [event({ ...user, uuid: 'u3', timestamp: '2026-10-22T00:00:20Z' }, 6)], resume_cursor: '6' },
+        { data: [event({ ...fallback, timestamp: '2026-10-22T00:00:24Z',
+            message: { ...fallback.message, usage: { ...usage, output_tokens: 2000 } } }, 7)], resume_cursor: '7' },
+        { data: [event({ ...assistant, timestamp: '2026-10-22T00:00:24Z',
+            message: { ...assistant.message, id: 'm3' } }, 8)], resume_cursor: '8' },
+        { data: [event({ ...fallback, timestamp: '2026-10-22T00:00:14Z',
+            message: { ...fallback.message, id: 'm2' } }, 9)], resume_cursor: '9' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    for (let poll = 0; poll < 3; poll++) assert.equal((await f.reader.read()).tps, 20);
+    const later = await f.reader.read();
+    assert.equal(later.outputTokens, 2080); assert.equal(later.tps, 80 / 6);
+    assert.deepEqual(await f.reader.read(), later);
+});
+
+test('replaying a request-only sample confirmed before an active stream preserves its average', async t => {
+    const confirmed = { ...assistant, requestId: 'r1', message: { ...assistant.message, id: undefined } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(confirmed, 2)], resume_cursor: '2' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 3),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 4),
+            event(confirmed, 5)], resume_cursor: '5' },
+    ]);
+    const completed = await f.reader.read();
+    assert.equal(completed.tps, 20);
+    const pending = await f.reader.read();
+    assert.equal(pending.tps, 20); assert.equal(pending.steps, 1); assert.equal(pending.outputTokens, 40);
+});
+
+test('a completed stream replay cannot mutate or finish a different active stream', async t => {
+    const start = stream('message_start', { message: { id: 'm1', usage } });
+    const stop = stream('message_stop', {}, assistant.timestamp);
+    const partial = { ...assistant, timestamp: '2026-10-22T00:00:12Z',
+        message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 1 } } };
+    const f = fixture(t, [
+        { data: [event(user, 1), event(start, 2), event(stop, 3)], resume_cursor: '3' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 4),
+            event(stream('message_start', { message: { id: 'm2', usage: { ...usage, output_tokens: 1 } } }), 5),
+            event(partial, 6)], resume_cursor: '6' },
+        { data: [event(start, 7), event(stream('message_delta', { usage: { output_tokens: 40 } }), 8),
+            event(stop, 9)], resume_cursor: '9' },
+        { data: [event({ ...partial, timestamp: '2026-10-22T00:00:14Z',
+            message: { ...partial.message, usage: { ...usage, output_tokens: 1000 } } }, 10)], resume_cursor: '10' },
+        { data: [event(stream('message_delta', { usage: { output_tokens: 2000 } }), 11),
+            event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 12)], resume_cursor: '12' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    const pending = await f.reader.read();
+    assert.equal(pending.tps, 20); assert.equal(pending.outputTokens, 41);
+    assert.deepEqual(await f.reader.read(), pending);
+    const continued = await f.reader.read();
+    assert.equal(continued.tps, 20); assert.equal(continued.outputTokens, 1040);
+    const completed = await f.reader.read();
+    assert.equal(completed.tps, 204); assert.equal(completed.outputTokens, 2040);
+});
+
+test('an unclosed completed-stream replay cannot consume or complete an active response', async t => {
+    const start = stream('message_start', { message: { id: 'm1', usage } });
+    const f = fixture(t, [
+        { data: [event(user, 1), event(start, 2), event(stream('message_stop', {}, assistant.timestamp), 3)], resume_cursor: '3' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 4),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 5), event(start, 6)], resume_cursor: '6' },
+        { data: [event({ ...assistant, timestamp: '2026-10-22T00:00:14Z',
+            message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 1000 } } }, 7),
+            event(stream('message_delta', { usage: { output_tokens: 2000 } }), 8),
+            event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 9)], resume_cursor: '9' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    const pending = await f.reader.read();
+    assert.equal(pending.tps, 20); assert.equal(pending.outputTokens, 1040);
+});
+
+test('an active stream can stop after a complete replay without repeating its final usage', async t => {
+    const start = stream('message_start', { message: { id: 'm1', usage } });
+    const stop = stream('message_stop', {}, assistant.timestamp);
+    const f = fixture(t, [
+        { data: [event(user, 1), event(start, 2), event(stop, 3)], resume_cursor: '3' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 4),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 5),
+            event(stream('message_delta', { usage: { output_tokens: 2000 } }), 6)], resume_cursor: '6' },
+        { data: [event(start, 7), event(stream('message_delta', { usage: { output_tokens: 40 } }), 8),
+            event(stop, 9)], resume_cursor: '9' },
+        { data: [event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 10)], resume_cursor: '10' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    const completed = await f.reader.read();
+    assert.equal(completed.tps, 204); assert.equal(completed.outputTokens, 2040);
+});
+
+test('a new stream interleaved with an unclosed replay stays pending without guessing ownership', async t => {
+    const start = stream('message_start', { message: { id: 'm1', usage } });
+    const f = fixture(t, [
+        { data: [event(user, 1), event(start, 2), event(stream('message_stop', {}, assistant.timestamp), 3)], resume_cursor: '3' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 4),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 5), event(start, 6),
+            event(stream('message_start', { message: { id: 'm3', usage } }), 7),
+            event(stream('message_stop', {}, assistant.timestamp), 8)], resume_cursor: '8' },
+        { data: [event({ ...assistant, timestamp: '2026-10-22T00:00:14Z',
+            message: { ...assistant.message, id: 'm3', usage: { ...usage, output_tokens: 1000 } } }, 9),
+            event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 10)], resume_cursor: '10' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+});
+
+test('genuine prompts and tool results recover new streams after an unclosed replay', async t => {
+    for (const tool of [false, true]) {
+        const start = stream('message_start', { message: { id: 'm1', usage } });
+        const next = { ...user, uuid: 'u2', promptId: 'p2', timestamp: '2026-10-22T00:00:10Z' };
+        const recovery = { ...next, uuid: 'u3', promptId: tool ? 'p2' : 'p3', timestamp: '2026-10-22T00:00:20Z',
+            message: { role: 'user', content: tool ? [{ type: 'tool_result', tool_use_id: 'tool-1' }] : 'next prompt' } };
+        const f = fixture(t, [
+            { data: [event(user, 1), event(start, 2), event(stream('message_stop', {}, assistant.timestamp), 3)], resume_cursor: '3' },
+            { data: [event(next, 4), event(stream('message_start', { message: { id: 'm2', usage } }), 5),
+                event({ ...assistant, timestamp: '2026-10-22T00:00:12Z',
+                    message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 1000 } } }, 6),
+                event(start, 7)], resume_cursor: '7' },
+            { data: [event(recovery, 8), event(stream('message_start', { message: { id: 'm3', usage } }), 9),
+                event(stream('message_delta', { usage: { output_tokens: 1000 } }), 10),
+                event(stream('message_stop', {}, '2026-10-22T00:00:24Z'), 11)], resume_cursor: '11' },
+            { data: [event({ ...next, uuid: 'u4', promptId: 'p4', timestamp: '2026-10-22T00:00:30Z' }, 12),
+                event(stream('message_start', { message: { id: 'm4', usage } }), 13),
+                event(stream('message_delta', { usage: { output_tokens: 2000 } }), 14),
+                event(stream('message_stop', {}, '2026-10-22T00:00:38Z'), 15)], resume_cursor: '15' },
+        ]);
+        assert.equal((await f.reader.read()).tps, 20);
+        const pending = await f.reader.read();
+        assert.equal(pending.tps, 20); assert.equal(pending.steps, 2); assert.equal(pending.outputTokens, 1040);
+        const recovered = await f.reader.read();
+        assert.equal(recovered.steps, 3); assert.equal(recovered.outputTokens, 2040);
+        assert.equal(recovered.tps, 1040 / 6); // The abandoned m2 output remains excluded.
+        const continued = await f.reader.read();
+        assert.equal(continued.steps, 4); assert.equal(continued.outputTokens, 4040);
+        assert.equal(continued.tps, 3040 / 14); // m1 / 2s, m3 / 4s and m4 / 8s.
+    }
+});
+
+test('replayed prompts and tool results cannot reset an unfinished replay boundary', async t => {
+    for (const tool of [false, true]) {
+        const start = stream('message_start', { message: { id: 'm1', usage } });
+        const next = { ...user, uuid: 'u2', promptId: tool ? 'p1' : 'p2', timestamp: '2026-10-22T00:00:10Z',
+            message: { role: 'user', content: tool ? [{ type: 'tool_result', tool_use_id: 'tool-1' }] : 'next prompt' } };
+        const f = fixture(t, [
+            { data: [event({ ...user, promptId: 'p1' }, 1), event(start, 2),
+                event(stream('message_stop', {}, assistant.timestamp), 3)], resume_cursor: '3' },
+            { data: [event(next, 4), event(stream('message_start', { message: { id: 'm2', usage } }), 5),
+                event({ ...assistant, timestamp: '2026-10-22T00:00:12Z',
+                    message: { ...assistant.message, id: 'm2', usage: { ...usage, output_tokens: 1000 } } }, 6),
+                event(start, 7)], resume_cursor: '7' },
+            { data: [event({ ...next, uuid: 'replayed-input', timestamp: '2026-10-22T00:00:20Z' }, 8),
+                event(stream('message_delta', { usage: { output_tokens: 9999 } }), 9),
+                event(stream('message_stop', {}, assistant.timestamp), 10)], resume_cursor: '10' },
+            { data: [event(stream('message_delta', { usage: { output_tokens: 2000 } }), 11),
+                event(stream('message_stop', {}, '2026-10-22T00:00:18Z'), 12)], resume_cursor: '12' },
+        ]);
+        assert.equal((await f.reader.read()).tps, 20);
+        const pending = await f.reader.read();
+        assert.equal(pending.tps, 20); assert.equal(pending.outputTokens, 1040);
+        assert.deepEqual(await f.reader.read(), pending);
+        const completed = await f.reader.read();
+        assert.equal(completed.steps, 2); assert.equal(completed.outputTokens, 2040); assert.equal(completed.tps, 204);
+    }
+});
+
+test('a delayed replay tail cannot finish or pollute a stream after a genuine input', async t => {
+    for (const [oldOutput, oldStop, startedAt, confirmedSnapshot] of [
+        [40, '02', undefined, false], [2000, '02', undefined, false],
+        [2000, '21', '22', false], [2000, '02', '22', true],
+    ]) {
+        const start = stream('message_start', { message: { id: 'm1', usage } });
+        const confirmed = { ...assistant, timestamp: '2026-10-22T00:00:23Z',
+            message: { ...assistant.message, id: 'm3', usage: { ...usage, output_tokens: 100 } } };
+        const finalUsage = { output_tokens: 1000 };
+        const final = confirmedSnapshot ? { ...confirmed, timestamp: '2026-10-22T00:00:24Z',
+            message: { ...confirmed.message, usage: { ...usage, ...finalUsage } } }
+            : stream('message_delta', { usage: finalUsage });
+        const f = fixture(t, [
+            { data: [event(user, 1), event(start, 2), event(stream('message_stop', {}, assistant.timestamp), 3)], resume_cursor: '3' },
+            { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 4),
+                event(stream('message_start', { message: { id: 'm2', usage } }), 5), event(start, 6)], resume_cursor: '6' },
+            { data: [event({ ...user, uuid: 'u3', timestamp: '2026-10-22T00:00:20Z' }, 7),
+                event(stream('message_start', { message: { id: 'm3', usage: confirmedSnapshot
+                    ? { output_tokens: 1 } : { ...usage, output_tokens: 1 } } },
+                startedAt ? `2026-10-22T00:00:${startedAt}Z` : undefined), 8),
+                ...(confirmedSnapshot ? [event(confirmed, 9)] : [])], resume_cursor: '9' },
+            { data: [event(stream('message_delta', { usage: { input_tokens: 9999,
+                cache_creation_input_tokens: 9999, cache_read_input_tokens: 9999, output_tokens: oldOutput } }), 10),
+                event(stream('message_stop', {}, `2026-10-22T00:00:${oldStop}Z`), 11)], resume_cursor: '11' },
+            { data: [event(final, 12), event(stream('message_stop', {}, '2026-10-22T00:00:24Z'), 13)], resume_cursor: '13' },
+        ]);
+        assert.equal((await f.reader.read()).tps, 20);
+        assert.equal((await f.reader.read()).tps, 20);
+        const pending = await f.reader.read();
+        assert.equal(pending.tps, 20); assert.equal(pending.outputTokens, confirmedSnapshot ? 140 : 40);
+        assert.deepEqual(await f.reader.read(), pending);
+        const completed = await f.reader.read();
+        assert.equal(completed.steps, 2); assert.equal(completed.inputTokens, 200);
+        assert.equal(completed.outputTokens, 1040); assert.equal(completed.totalTokens, 1240);
+        assert.equal(completed.tps, 1040 / 6); // m1 / 2s and m3 / 4s, excluding the old replay tail.
+    }
+});
+
+test('a conflicting stop without later trustworthy usage keeps the sample pending and permits later streams', async t => {
+    const start = stream('message_start', { message: { id: 'm1', usage } });
+    const f = fixture(t, [
+        { data: [event(user, 1), event(start, 2), event(stream('message_stop', {}, assistant.timestamp), 3)], resume_cursor: '3' },
+        { data: [event({ ...user, uuid: 'u2', timestamp: '2026-10-22T00:00:10Z' }, 4),
+            event(stream('message_start', { message: { id: 'm2', usage } }), 5), event(start, 6)], resume_cursor: '6' },
+        { data: [event({ ...user, uuid: 'u3', timestamp: '2026-10-22T00:00:20Z' }, 7),
+            event(stream('message_start', { message: { id: 'm3', usage: { output_tokens: 1 } } }), 8),
+            event({ ...assistant, timestamp: '2026-10-22T00:00:21Z',
+                message: { ...assistant.message, id: 'm3', usage: { ...usage, output_tokens: 100 } } }, 9),
+            event(stream('message_delta', { usage: { output_tokens: 2000 } }), 10),
+            event(stream('message_stop', {}, assistant.timestamp), 11),
+            event(stream('message_stop', {}, '2026-10-22T00:00:24Z'), 12)], resume_cursor: '12' },
+        { data: [event({ ...user, uuid: 'u4', timestamp: '2026-10-22T00:00:30Z' }, 13),
+            event(stream('message_start', { message: { id: 'm4', usage } }), 14),
+            event(stream('message_delta', { usage: { output_tokens: 2000 } }), 15),
+            event(stream('message_stop', {}, '2026-10-22T00:00:38Z'), 16)], resume_cursor: '16' },
+    ]);
+    assert.equal((await f.reader.read()).tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
+    const ambiguous = await f.reader.read();
+    assert.equal(ambiguous.steps, 2); assert.equal(ambiguous.outputTokens, 140); assert.equal(ambiguous.tps, 20);
+    const completed = await f.reader.read();
+    assert.equal(completed.steps, 3); assert.equal(completed.outputTokens, 2140);
+    assert.equal(completed.tps, 204); // m3's confirmed partial output stays excluded from the average.
 });
 
 test('finds the account provider above a deeply nested Remote Control composer', async t => {

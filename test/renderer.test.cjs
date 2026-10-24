@@ -61,6 +61,8 @@ test('shows five stats, missing TPS and no context, without changing composer la
     const c = f.run(); await tick();
     const bar = f.doc.querySelector('[data-session-stats]');
     assert.match(bar.textContent, /2 turns.*33 steps.*— tok\/s.*11\.7M tok.*Cache hit 96%/);
+    assert.match(f.doc.querySelector('[data-stat="tps"]').title, /整个会话.*有效响应样本/);
+    assert.match(f.doc.querySelector('[data-stat="tps"]').title, /首 Token 等待/);
     assert.doesNotMatch(bar.textContent, /context|上下文/i);
     assert.equal(f.dom.window.getComputedStyle(bar).position, 'fixed');
     assert.equal(f.doc.querySelector('form').outerHTML, before);

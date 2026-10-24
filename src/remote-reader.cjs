@@ -11,6 +11,10 @@ function createRemoteReader(win, createMetrics, options = {}) {
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
     const sequence = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value
         : typeof value === 'string' && /^\d{1,16}$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
+    const timestamp = value => {
+        const parsed = typeof value === 'string' ? Date.parse(value) : NaN;
+        return Number.isFinite(parsed) ? parsed : null;
+    };
 
     function identity() {
         const url = new URL(win.location.href);
@@ -50,11 +54,13 @@ function createRemoteReader(win, createMetrics, options = {}) {
     function cancel() { state?.controller?.abort(); state = null; }
     function valid(current) { return !stopped && current === state && same(current.bound, identity()); }
     function snapshot(current) {
-        const stats = current.complete ? current.metrics.snapshot() : {
+        const stats = current.complete ? current.metrics.snapshot({
+            pendingResponseIds: [...current.pendingStreams],
+            pendingRequestIds: [...current.pendingRequests],
+        }) : {
             turns: null, steps: null, totalTokens: null, inputTokens: null, outputTokens: null,
             cachedInputTokens: null, cacheHit: null, tps: null, usageComplete: false,
         };
-        if (current.stream) stats.tps = null;
         return { ...stats, threadId: current.bound.threadId, source: 'remote_control', status: 'ok' };
     }
     function ingest(current, row) {
@@ -65,18 +71,48 @@ function createRemoteReader(win, createMetrics, options = {}) {
             if (!record(event)) throw new Error('Invalid stream event');
             if (event.type === 'message_start') {
                 if (typeof event.message?.id !== 'string') throw new Error('Missing response identity');
-                current.stream = { id: event.message.id, usage: {}, model: event.message.model };
+                // 隔离整个重放段；无身份的 delta/stop 不能操作另一条活动流。
+                if (current.completedStreams.has(event.message.id) || current.replayDepth) {
+                    current.replayDepth++;
+                    if (!current.completedStreams.has(event.message.id)) {
+                        current.pendingStreams.add(event.message.id);
+                        current.stream = null; // 重放未闭合就出现新流，归属不明确时保留 pending。
+                    }
+                    return;
+                }
+                current.stream = { id: event.message.id, usage: {}, model: event.message.model,
+                    confirmedUsage: {}, needsOutput: false,
+                    boundaryAt: Math.max(current.inputAt ?? -Infinity, timestamp(row.timestamp) ?? -Infinity) };
+                current.pendingStreams.add(current.stream.id);
+            }
+            if (current.replayDepth) {
+                if (event.type === 'message_stop') current.replayDepth--;
+                return;
             }
             if (current.stream) {
                 const usage = event.type === 'message_start' ? event.message?.usage : event.usage;
                 for (const field of fields) {
                     const count = usage?.[field];
-                    if (Number.isSafeInteger(count) && count >= 0)
+                    if (Number.isSafeInteger(count) && count >= 0) {
                         current.stream.usage[field] = Math.max(current.stream.usage[field] ?? 0, count);
+                        if (event.type === 'message_start') current.stream.confirmedUsage[field] = count;
+                        else if (event.type === 'message_delta' && field === 'output_tokens') current.stream.needsOutput = false;
+                    }
                 }
                 if (event.type === 'message_stop') {
+                    const completedAt = timestamp(row.timestamp);
+                    if (completedAt !== null && completedAt < current.stream.boundaryAt) {
+                        // 迟到旧 tail 已混入无身份 delta；恢复明确属于当前 ID 的用量，等待新输出确认。
+                        current.stream.usage = { ...current.stream.confirmedUsage };
+                        current.stream.needsOutput = true;
+                        return;
+                    }
+                    if (current.stream.needsOutput) { current.stream = null; return; }
                     current.metrics.ingest({ type: 'assistant', timestamp: row.timestamp,
-                        message: { role: 'assistant', ...current.stream } });
+                        message: { role: 'assistant', id: current.stream.id,
+                            model: current.stream.model, usage: current.stream.usage } });
+                    current.pendingStreams.delete(current.stream.id);
+                    current.completedStreams.add(current.stream.id);
                     current.stream = null;
                 }
             }
@@ -86,15 +122,30 @@ function createRemoteReader(win, createMetrics, options = {}) {
         if (!record(row.message) || row.message.role !== row.type) throw new Error('Invalid message');
         if (row.type === 'user' && !row.uuid && !row.promptId
             || row.type === 'assistant' && !row.message.id && !row.requestId) throw new Error('Missing message identity');
+        if (row.type === 'assistant' && typeof row.requestId === 'string' && row.requestId.trim()) {
+            if (typeof row.message.id === 'string' && row.message.id.trim()) current.pendingRequests.delete(row.requestId);
+            // 不猜测 request-only 快照属于哪个流；显式身份关联前只保留用量计数。
+            else if (current.pendingStreams.size && !current.requestIds.has(row.requestId))
+                current.pendingRequests.add(row.requestId);
+            current.requestIds.add(row.requestId);
+        }
         // session_id/JSONL sessionId 是远端 CLI ID，统计边界使用已确认的 bridge ID。
         const newInput = current.metrics.ingest({ ...row, sessionId: undefined });
-        if (row.type === 'user' && newInput) current.stream = null;
+        // 被新输入放弃的未结束流仍排除出 TPS，不能把半截样本当成已完成响应。
+        if (row.type === 'user' && newInput) {
+            current.stream = null;
+            current.inputAt = timestamp(row.timestamp);
+            current.replayDepth = 0; // 真正的新输入建立独立边界，不继承缺少 stop 的旧重放段。
+        }
         else if (row.type === 'assistant' && current.stream && row.message.id === current.stream.id) {
             // 内容块的 assistant 快照可能先于最终 message_delta，必须继续合并后续用量。
             for (const field of fields) {
                 const count = row.message.usage?.[field];
-                if (Number.isSafeInteger(count) && count >= 0)
+                if (Number.isSafeInteger(count) && count >= 0) {
                     current.stream.usage[field] = Math.max(current.stream.usage[field] ?? 0, count);
+                    current.stream.confirmedUsage[field] = Math.max(current.stream.confirmedUsage[field] ?? 0, count);
+                    if (field === 'output_tokens') current.stream.needsOutput = false;
+                }
             }
         }
     }
@@ -175,7 +226,10 @@ function createRemoteReader(win, createMetrics, options = {}) {
             if (same(retry?.bound, bound) && Date.now() < retry.after) return Promise.resolve(null);
             if (!same(state?.bound, bound)) {
                 cancel(); state = { bound, metrics: createMetrics(), cursor: null, sequence: -1, rows: 0,
-                    complete: false, stream: null, inflight: null, result: null, checkedAt: -Infinity };
+                    complete: false, stream: null, inputAt: null, replayDepth: 0,
+                    pendingStreams: new Set(), completedStreams: new Set(),
+                    pendingRequests: new Set(), requestIds: new Set(),
+                    inflight: null, result: null, checkedAt: -Infinity };
             }
             const current = state;
             if (current.inflight) return current.inflight;

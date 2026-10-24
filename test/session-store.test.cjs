@@ -72,19 +72,20 @@ test('incremental continuation replay preserves prompt timing and cumulative usa
 
     await fs.appendFile(file, JSON.stringify({ ...prompt, uuid: 'u3', promptId: 'p2',
         timestamp: '2026-10-22T00:00:30Z' }) + '\n');
-    assert.equal((await store.getStats(ID)).tps, null);
+    assert.equal((await store.getStats(ID)).tps, 4);
     await fs.appendFile(file, line('m2', 30, { timestamp: '2026-10-22T00:00:36Z' }));
-    assert.equal((await store.getStats(ID)).tps, 5);
+    assert.equal((await store.getStats(ID)).tps, 110 / 26); // 80 / 20 seconds and 30 / 6 seconds.
 
     await fs.appendFile(file, JSON.stringify({ ...prompt, uuid: 'tool-result', promptId: 'p2',
         timestamp: '2026-10-22T00:02:00Z', message: { role: 'user',
             content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'test result' }] } }) + '\n');
-    assert.equal((await store.getStats(ID)).tps, null);
+    assert.equal((await store.getStats(ID)).tps, 110 / 26);
     await fs.appendFile(file, line('m3', 60, { timestamp: '2026-10-22T00:02:10Z' }));
     const following = await store.getStats(ID);
     assert.equal(following.turns, 2); assert.equal(following.steps, 3);
     assert.equal(following.inputTokens, 300); assert.equal(following.outputTokens, 170);
-    assert.equal(following.totalTokens, 470); assert.equal(following.tps, 6);
+    // The tool gap is excluded: (80 + 30 + 60) tokens / (20 + 6 + 10) seconds.
+    assert.equal(following.totalTokens, 470); assert.equal(following.tps, 170 / 36);
     assert.deepEqual(await store.getStats(ID), following);
 });
 test('resets after truncation and same-size rewrite', async t => {

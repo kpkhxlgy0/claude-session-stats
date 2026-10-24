@@ -45,19 +45,20 @@ async function setup(t, records) {
     return { store, file };
 }
 
-test('a relocated same-file ancestry contributes once and a new input starts current TPS', async t => {
+test('a relocated same-file ancestry contributes once and preserves session TPS across inputs', async t => {
     const { store, file } = await setup(t, [root, oldInput, oldReply, oldInput, oldReply, marker, newInput]);
     const waiting = await store.getStats(ID);
     assert.equal(waiting.status, 'ok');
     assert.equal(waiting.turns, 2); assert.equal(waiting.steps, 1);
-    assert.equal(waiting.totalTokens, 140); assert.equal(waiting.tps, null);
+    assert.equal(waiting.totalTokens, 140); assert.equal(waiting.tps, 4);
 
     await fs.appendFile(file, lines([newReply]));
     const continued = await store.getStats(ID);
     assert.equal(continued.status, 'ok'); assert.equal(continued.usageComplete, true);
     assert.equal(continued.turns, 2); assert.equal(continued.steps, 2);
     assert.equal(continued.inputTokens, 200); assert.equal(continued.outputTokens, 70);
-    assert.equal(continued.totalTokens, 270); assert.equal(continued.tps, 5);
+    // Verified ancestry and the new reply: (40 + 30) tokens / (10 + 6) seconds.
+    assert.equal(continued.totalTokens, 270); assert.equal(continued.tps, 4.375);
     assert.deepEqual(await store.getStats(ID), continued);
     await fs.appendFile(file, lines([oldInput, oldReply, marker, newReply]));
     assert.deepEqual(await store.getStats(ID), continued);
@@ -123,7 +124,7 @@ test('a later relocation marker or parent completes verified ancestry on the nex
     await fs.appendFile(lateParent.file, lines([root]));
     const completed = await lateParent.store.getStats(ID);
     assert.equal(completed.status, 'ok'); assert.equal(completed.totalTokens, 270);
-    assert.equal(completed.tps, 5);
+    assert.equal(completed.tps, 4.375); // (40 + 30) tokens / (10 + 6) seconds.
     assert.deepEqual(await lateParent.store.getStats(ID), completed);
 });
 

@@ -281,7 +281,7 @@ test('malformed records cannot corrupt a complete measurement', () =>
     assert.equal(metrics.snapshot().usageComplete, true);
 });
 
-test('TPS estimates the last response using timestamps, not thinking or aggregate cost timing', () =>
+test('TPS estimates response time using timestamps, not thinking or aggregate cost timing', () =>
 {
     const metrics = createMetrics();
     metrics.ingest(user('user-1', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
@@ -293,17 +293,17 @@ test('TPS estimates the last response using timestamps, not thinking or aggregat
     assert.equal(metrics.snapshot().tps, 4);
 });
 
-test('tool results start a new TPS interval without counting tool execution as generation', () =>
+test('tool results preserve the session TPS and start the next interval after tool execution', () =>
 {
     const metrics = createMetrics();
     metrics.ingest(user('prompt', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
     metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
     metrics.ingest(user('tool', [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'done' }],
         { timestamp: '2026-01-01T00:02:00Z' }));
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 4);
     metrics.ingest(assistant('second', completeUsage({ output_tokens: 300 }),
         { timestamp: '2026-01-01T00:02:06Z' }));
-    assert.equal(metrics.snapshot().tps, 50);
+    assert.equal(metrics.snapshot().tps, 21.25); // (40 + 300) tokens / (10 + 6) seconds.
     assert.equal(metrics.snapshot().turns, 1);
 });
 
@@ -323,9 +323,9 @@ test('cumulative response blocks and replay keep one output count and the origin
     assert.equal(metrics.snapshot().steps, 1);
     metrics.ingest(user('next', 'next', { timestamp: '2026-01-01T00:00:20Z' }));
     metrics.ingest(first);
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 40);
     metrics.ingest(assistant('next', completeUsage(), { timestamp: '2026-01-01T00:00:24Z' }));
-    assert.equal(metrics.snapshot().tps, 10);
+    assert.equal(metrics.snapshot().tps, 440 / 14); // 400 / 10 seconds and 40 / 4 seconds.
 });
 
 test('replayed prompt aliases preserve TPS and cumulative usage when the carrier UUID changes', () =>
@@ -349,20 +349,20 @@ test('replayed prompt aliases preserve TPS and cumulative usage when the carrier
     }
 });
 
-test('replaying an older prompt under another UUID cannot clear the newer response speed', () =>
+test('replaying an older prompt under another UUID preserves the session response samples', () =>
 {
     const metrics = createMetrics();
     metrics.ingest(user('original', 'first', { promptId: 'first', timestamp: '2026-01-01T00:00:00Z' }));
     metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
     metrics.ingest(user('next', 'second', { promptId: 'second', timestamp: '2026-01-01T00:00:20Z' }));
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 4);
     metrics.ingest(assistant('second', completeUsage(), { timestamp: '2026-01-01T00:00:22Z' }));
     metrics.ingest(user('old-replay', 'first', { promptId: 'first', timestamp: '2026-01-01T00:00:00Z' }));
     const stats = metrics.snapshot();
     assert.equal(stats.turns, 2);
     assert.equal(stats.steps, 2);
     assert.equal(stats.totalTokens, 280);
-    assert.equal(stats.tps, 20);
+    assert.equal(stats.tps, 80 / 12); // Two 40-token responses taking 10 and 2 seconds.
 });
 
 test('tool results without UUIDs use tool identities independently of the prompt and replay carriers', () =>
@@ -373,20 +373,20 @@ test('tool results without UUIDs use tool identities independently of the prompt
     const result = user(undefined, [{ type: 'tool_result', tool_use_id: 'tool-1' }],
         { promptId: 'prompt', timestamp: '2026-01-01T00:00:20Z' });
     metrics.ingest(result);
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 4);
     metrics.ingest(assistant('second', completeUsage({ output_tokens: 60 }),
         { timestamp: '2026-01-01T00:00:30Z' }));
-    assert.equal(metrics.snapshot().tps, 6);
+    assert.equal(metrics.snapshot().tps, 5); // (40 + 60) tokens / (10 + 10) seconds.
     metrics.ingest({ ...result, uuid: 'replayed-tool', timestamp: '2026-01-01T00:00:40Z' });
-    assert.equal(metrics.snapshot().tps, 6);
+    assert.equal(metrics.snapshot().tps, 5);
     metrics.ingest(user(undefined, [{ type: 'tool_result', tool_use_id: 'tool-2' }],
         { promptId: 'prompt', timestamp: '2026-01-01T00:00:50Z' }));
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 5);
     metrics.ingest(assistant('third', completeUsage({ output_tokens: 100 }),
         { timestamp: '2026-01-01T00:01:00Z' }));
     const stats = metrics.snapshot();
     assert.equal(stats.turns, 1); assert.equal(stats.steps, 3);
-    assert.equal(stats.totalTokens, 500); assert.equal(stats.tps, 10);
+    assert.equal(stats.totalTokens, 500); assert.equal(stats.tps, 200 / 30);
 });
 
 test('a tool result without a row or tool identity cannot lend the previous input time to TPS', () =>
@@ -397,7 +397,7 @@ test('a tool result without a row or tool identity cannot lend the previous inpu
     metrics.ingest(user(undefined, [{ type: 'tool_result' }],
         { promptId: 'prompt', timestamp: '2026-01-01T00:00:20Z' }));
     metrics.ingest(assistant('second', completeUsage(), { timestamp: '2026-01-01T00:00:30Z' }));
-    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot().tps, 4); // The second response has no trustworthy start time.
     assert.equal(metrics.snapshot().totalTokens, 280);
 });
 
@@ -432,4 +432,189 @@ test('request aliases preserve the TPS interval and excluded rows cannot move it
         { requestId: 'request-1', timestamp: '2026-01-01T00:00:10Z' }));
     assert.equal(metrics.snapshot().tps, 40);
     assert.equal(metrics.snapshot().steps, 1);
+});
+
+test('session TPS divides total response output by total duration across user turns', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage({ output_tokens: 1000 }),
+        { timestamp: '2026-01-01T00:00:05Z' }));
+    assert.equal(metrics.snapshot().tps, 200);
+    metrics.ingest(user('second', 'next', { timestamp: '2026-01-01T00:00:10Z' }));
+    assert.equal(metrics.snapshot().tps, 200);
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: 1000 }),
+        { timestamp: '2026-01-01T00:00:30Z' }));
+    assert.equal(metrics.snapshot().tps, 80); // 2000 tokens / 25 seconds, rather than (200 + 50) / 2.
+});
+
+test('pending response IDs exclude only matching TPS samples while retaining every usage count', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:10Z' }));
+    metrics.ingest(user('second', 'next', { timestamp: '2026-01-01T00:00:20Z' }));
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: 300 }),
+        { timestamp: '2026-01-01T00:00:26Z' }));
+    metrics.ingest(user('third', 'next', { timestamp: '2026-01-01T00:00:30Z' }));
+    metrics.ingest(assistant('third', completeUsage({ output_tokens: 100 }),
+        { timestamp: '2026-01-01T00:00:40Z' }));
+    const all = metrics.snapshot();
+    assert.deepEqual(metrics.snapshot({ pendingResponseId: 'second' }), { ...all, tps: 7 });
+    assert.deepEqual(metrics.snapshot({ pendingResponseId: 'request-second' }), all);
+    assert.deepEqual(metrics.snapshot({ pendingResponseId: 'message:second' }), all);
+    assert.equal(all.tps, 440 / 26);
+    assert.deepEqual(metrics.snapshot(), all);
+});
+
+test('multiple pending responses stay excluded together until completed', () =>
+{
+    const metrics = createMetrics();
+    for (const [id, start, end, output] of [
+        ['first', '00', '10', 40], ['second', '20', '30', 1000], ['third', '40', '50', 2000]
+    ])
+    {
+        metrics.ingest(user(id, 'prompt', { timestamp: `2026-01-01T00:00:${start}Z` }));
+        metrics.ingest(assistant(id, completeUsage({ output_tokens: output }),
+            { timestamp: `2026-01-01T00:00:${end}Z` }));
+    }
+    const all = metrics.snapshot();
+    assert.deepEqual(metrics.snapshot({ pendingResponseIds: ['second', 'third'] }), { ...all, tps: 4 });
+    assert.deepEqual(metrics.snapshot({ pendingResponseId: 'first', pendingResponseIds: ['second', 'third'] }),
+        { ...all, tps: null });
+    assert.deepEqual(metrics.snapshot(), all);
+});
+
+test('known zero-output responses contribute elapsed time but cannot create a positive TPS alone', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('zero', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('zero', completeUsage({ output_tokens: 0 }),
+        { timestamp: '2026-01-01T00:00:10Z' }));
+    assert.equal(metrics.snapshot().tps, null);
+    metrics.ingest(user('positive', 'prompt', { timestamp: '2026-01-01T00:00:20Z' }));
+    metrics.ingest(assistant('positive', completeUsage(), { timestamp: '2026-01-01T00:00:30Z' }));
+    assert.equal(metrics.snapshot().tps, 2); // 40 tokens over both ten-second responses.
+    assert.equal(metrics.snapshot({ pendingResponseId: 'zero' }).tps, 4);
+});
+
+test('missing or invalid response data contributes neither output nor duration to session TPS', () =>
+{
+    for (const [start, end, output] of [
+        [undefined, '2026-01-01T00:00:30Z', 10000],
+        ['2026-01-01T00:00:20Z', undefined, 10000],
+        ['invalid', '2026-01-01T00:00:30Z', 10000],
+        ['2026-01-01T00:00:20Z', 'invalid', 10000],
+        [Infinity, '2026-01-01T00:00:30Z', 10000],
+        ['2026-01-01T00:00:20Z', NaN, 10000],
+        ['2026-01-01T00:00:30Z', '2026-01-01T00:00:20Z', 10000],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:20Z', 10000],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:20.099Z', 10000],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', undefined],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', -1],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', 1.5],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', NaN],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', Infinity],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', '40'],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', Number.MAX_SAFE_INTEGER + 1],
+        ['2026-01-01T00:00:20Z', '2026-01-01T00:00:30Z', null]
+    ])
+    {
+        const metrics = createMetrics();
+        metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+        metrics.ingest(assistant('first', completeUsage({ output_tokens: 1000 }),
+            { timestamp: '2026-01-01T00:00:05Z' }));
+        metrics.ingest(user('invalid', 'prompt', { timestamp: start }));
+        metrics.ingest(assistant('invalid', completeUsage({ output_tokens: output }), { timestamp: end }));
+        assert.equal(metrics.snapshot().tps, 200, JSON.stringify([start, end, output]));
+    }
+});
+
+test('a response lasting exactly 100 milliseconds is a usable TPS sample', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('prompt', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('response', completeUsage({ output_tokens: 20 }),
+        { timestamp: '2026-01-01T00:00:00.100Z' }));
+    assert.equal(metrics.snapshot().tps, 200);
+});
+
+test('cumulative usage updates replace a session sample and replay cannot double-count it', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage({ output_tokens: 1000 }),
+        { timestamp: '2026-01-01T00:00:05Z' }));
+    metrics.ingest(user('second', 'prompt', { timestamp: '2026-01-01T00:00:10Z' }));
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: undefined }),
+        { timestamp: '2026-01-01T00:00:30Z' }));
+    assert.equal(metrics.snapshot().tps, 200);
+    const completed = assistant('second', completeUsage({ output_tokens: 1000 }),
+        { timestamp: '2026-01-01T00:00:30Z' });
+    metrics.ingest(completed);
+    assert.equal(metrics.snapshot().tps, 80);
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: 2000 }),
+        { timestamp: '2026-01-01T00:00:35Z' }));
+    metrics.ingest(completed);
+    assert.equal(metrics.snapshot().tps, 100); // (1000 + 2000) tokens / (5 + 25) seconds.
+    assert.equal(metrics.snapshot().steps, 2);
+    assert.equal(metrics.snapshot().outputTokens, 3000);
+});
+
+test('request-to-message alias upgrades contribute one session sample in either arrival order', () =>
+{
+    for (const requestFirst of [true, false])
+    {
+        const metrics = createMetrics();
+        metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+        metrics.ingest(assistant('first', completeUsage({ output_tokens: 1000 }),
+            { timestamp: '2026-01-01T00:00:05Z' }));
+        metrics.ingest(user('second', 'next', { timestamp: '2026-01-01T00:00:10Z' }));
+        const request = assistant(undefined, completeUsage({ output_tokens: 1 }),
+            { requestId: 'shared-request', timestamp: '2026-01-01T00:00:12Z' });
+        const message = assistant('second', completeUsage({ output_tokens: 1000 }),
+            { requestId: 'shared-request', timestamp: '2026-01-01T00:00:30Z' });
+        for (const row of requestFirst ? [request, message, request] : [message, request, message])
+            metrics.ingest(row);
+        assert.equal(metrics.snapshot().tps, 80);
+        assert.equal(metrics.snapshot().steps, 2);
+        assert.equal(metrics.snapshot().outputTokens, 2000);
+        assert.equal(metrics.snapshot({ pendingResponseId: 'second' }).tps, 200);
+    }
+});
+
+test('session TPS becomes unknown when the valid sample output sum exceeds safe integers', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage({ output_tokens: Number.MAX_SAFE_INTEGER }),
+        { timestamp: '2026-01-01T00:00:10Z' }));
+    assert.equal(metrics.snapshot().tps, Number.MAX_SAFE_INTEGER / 10);
+    metrics.ingest(user('second', 'prompt', { timestamp: '2026-01-01T00:00:20Z' }));
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: Number.MAX_SAFE_INTEGER }),
+        { timestamp: '2026-01-01T00:00:30Z' }));
+    assert.equal(metrics.snapshot().tps, null);
+    assert.equal(metrics.snapshot({ pendingResponseId: 'second' }).tps, Number.MAX_SAFE_INTEGER / 10);
+});
+
+test('pending request fallbacks stay excluded until their explicit message identity arrives', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest(user('first', 'prompt', { timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('first', completeUsage(), { timestamp: '2026-01-01T00:00:02Z' }));
+    metrics.ingest(user('second', 'next', { timestamp: '2026-01-01T00:00:10Z' }));
+    metrics.ingest(assistant(undefined, completeUsage({ output_tokens: 1000 }),
+        { requestId: 'request-2', timestamp: '2026-01-01T00:00:12Z' }));
+    const pending = metrics.snapshot();
+    assert.equal(pending.tps, 260);
+    assert.deepEqual(metrics.snapshot({ pendingResponseId: 'second', pendingRequestIds: ['request-2'] }),
+        { ...pending, tps: 20 });
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: 1000 }),
+        { requestId: 'request-2', timestamp: '2026-01-01T00:00:14Z' }));
+    assert.equal(metrics.snapshot({ pendingResponseId: 'second', pendingRequestIds: ['request-2'] }).tps, 20);
+    metrics.ingest(assistant('second', completeUsage({ output_tokens: 2000 }),
+        { requestId: 'request-2', timestamp: '2026-01-01T00:00:18Z' }));
+    const completed = metrics.snapshot({ pendingRequestIds: ['request-2'] });
+    assert.equal(completed.tps, 204); // (40 + 2000) tokens / (2 + 8) seconds.
+    assert.equal(completed.steps, 2); assert.equal(completed.outputTokens, 2040);
 });

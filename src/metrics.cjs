@@ -24,12 +24,22 @@ function timestamp(value)
     return Number.isFinite(time) ? time : null;
 }
 
-function estimateTps(response)
+function estimateTps(responses, pendingKeys)
 {
-    if (!response || response.startedAt === null || response.completedAt === null
-        || !(response.output_tokens > 0)) return null;
-    const elapsed = response.completedAt - response.startedAt;
-    return elapsed >= MinimumResponseMs ? response.output_tokens / (elapsed / 1000) : null;
+    let outputTokens = 0;
+    let elapsedMs = 0;
+    for (const [key, response] of responses)
+    {
+        if (pendingKeys.has(key) || !Number.isFinite(response.startedAt)
+            || !Number.isFinite(response.completedAt) || tokenCount(response.output_tokens) === null) continue;
+        const elapsed = response.completedAt - response.startedAt;
+        if (!Number.isFinite(elapsed) || elapsed < MinimumResponseMs) continue;
+        outputTokens += response.output_tokens;
+        elapsedMs += elapsed;
+        if (!Number.isSafeInteger(outputTokens) || !Number.isFinite(elapsedMs)) return null;
+    }
+    const rate = outputTokens / (elapsedMs / 1000);
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
 }
 
 function sumCounts(values)
@@ -71,7 +81,6 @@ function createMetrics({ sessionId } = {})
     const toolInputs = new Set();
     let currentSessionId = identifier(sessionId);
     let lastInputAt = null;
-    let lastResponse = null;
 
     function acceptsSession(row)
     {
@@ -114,7 +123,6 @@ function createMetrics({ sessionId } = {})
                         mergeUsage(target, fallback);
                         if (target.startedAt !== fallback.startedAt) target.startedAt = null;
                         target.completedAt = Math.max(target.completedAt ?? -Infinity, fallback.completedAt ?? -Infinity);
-                        if (lastResponse === fallback) lastResponse = target;
                     }
                     else responses.set(messageKey, fallback);
                     responses.delete(requestKey);
@@ -138,7 +146,7 @@ function createMetrics({ sessionId } = {})
             const isToolResult = Array.isArray(message.content)
                 && message.content.some(block => isRecord(block) && block.type === 'tool_result');
             if ((!isPrompt && !isToolResult) || !acceptsSession(row)) return;
-            if (!promptId && !uuid) { lastInputAt = null; lastResponse = null; return true; }
+            if (!promptId && !uuid) { lastInputAt = null; return true; }
             const isNewPrompt = isPrompt && ingestTurn(promptId, uuid);
             let isNewToolResult = false;
             if (isToolResult)
@@ -148,7 +156,6 @@ function createMetrics({ sessionId } = {})
                 if (ids.some(id => id === null) && !uuid)
                 {
                     lastInputAt = null;
-                    lastResponse = null;
                     return true;
                 }
                 const keys = ids.every(id => id !== null) ? ids.map(id => `tool:${id}`) : [`uuid:${uuid}`];
@@ -159,7 +166,6 @@ function createMetrics({ sessionId } = {})
             if (isNewPrompt || isNewToolResult)
             {
                 lastInputAt = timestamp(row.timestamp);
-                lastResponse = null;
                 return true;
             }
         }
@@ -172,9 +178,8 @@ function createMetrics({ sessionId } = {})
             if (!key) return;
             if (!responses.has(key))
             {
-                lastResponse = { ...Object.fromEntries(TokenFields.map(field => [field, null])),
-                    startedAt: lastInputAt, completedAt: null };
-                responses.set(key, lastResponse);
+                responses.set(key, { ...Object.fromEntries(TokenFields.map(field => [field, null])),
+                    startedAt: lastInputAt, completedAt: null });
             }
             const response = responses.get(key);
             mergeUsage(response, message.usage);
@@ -183,8 +188,13 @@ function createMetrics({ sessionId } = {})
         }
     }
 
-    function snapshot()
+    function snapshot({ pendingResponseId, pendingResponseIds = [], pendingRequestIds = [] } = {})
     {
+        const pendingKeys = new Set();
+        for (const id of [pendingResponseId, ...pendingResponseIds])
+            if (identifier(id)) pendingKeys.add(`message:${id}`);
+        for (const id of pendingRequestIds)
+            if (identifier(id)) pendingKeys.add(`request:${id}`);
         const totals = TokenFields.map(field => responses.size
             ? sumCounts([...responses.values()].map(usage => usage[field])) : null);
         const inputTokens = sumCounts(totals.slice(0, 3));
@@ -201,8 +211,8 @@ function createMetrics({ sessionId } = {})
             outputTokens,
             cachedInputTokens,
             cacheHit,
-            // 使用最近响应的日志时间差估算；包含首字等待，工具返回后重新计时。
-            tps: estimateTps(lastResponse),
+            // 汇总会话内有效响应的输出和日志耗时；包含首字等待，排除工具执行间隔和未完成响应。
+            tps: estimateTps(responses, pendingKeys),
             usageComplete: totalTokens !== null
         };
     }

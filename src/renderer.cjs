@@ -98,8 +98,9 @@ function makeBar(doc, remote) {
     const scope = remote ? '当前 Remote Control 会话' : '当前主会话';
     fields.turns.title = `${scope}的用户轮次，按 promptId/uuid 去重，排除工具返回和系统注入消息`;
     fields.steps.title = `${scope}的模型响应次数，按消息 ID 去重；不等于工具调用次数`;
-    fields.tps.title = '估算：最近响应的输出 tokens ÷ 从上一条用户消息或工具返回到该响应的'
-        + `${remote ? '同步历史' : '日志'}时间差；包含请求等待和网络耗时，数据不足时显示 —`;
+    fields.tps.title = '整个会话平均 TPS（估算）：有效响应样本的输出 tokens 总和 ÷ 对应耗时总和；'
+        + `以${remote ? '已同步历史' : '已确认日志'}为范围，耗时从用户输入或工具返回计至响应记录，包含首 Token 等待和网络耗时。`
+        + '新输入、工具执行和后续生成期间保留已有平均值；缺少有效样本时显示 —。';
     return { bar, fields };
 }
 
