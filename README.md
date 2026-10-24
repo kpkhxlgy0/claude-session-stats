@@ -14,9 +14,9 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-版本：[v0.4.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.4.0)。
+版本：[v0.4.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.4.1)。
 
-Remote Control 统计同步需要运行端和接收端都安装 v0.4.0 或更新版本。
+Remote Control 统计同步需要运行端和接收端都安装 v0.4.1 或更新版本。
 
 也可以使用 PowerShell 7 运行仓库根目录的脚本：
 

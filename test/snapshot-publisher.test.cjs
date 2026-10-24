@@ -94,20 +94,79 @@ test('atomic replacement never exposes partial JSON to concurrent filesystem rea
     const f = await fixture(t);
     await f.publisher.start();
     let reading = true;
+    let activeAttempt = null, precedingUnavailable = false;
     const errors = [];
     const reader = (async () => { while (reading) {
+        const attempt = activeAttempt, wasUnavailable = precedingUnavailable;
         try {
             const snapshot = await f.snapshot();
+            assert.equal(snapshot.schemaVersion, 1);
             assert.equal(snapshot.producer, 'claude-session-stats');
-            assert.equal(typeof snapshot.stats.turns, 'number');
-        } catch (error) { errors.push(error); reading = false; }
+            assert.equal(snapshot.bridgeSessionId, BRIDGE);
+            assert.equal(snapshot.organizationId, ORG);
+            assert.ok(Number.isSafeInteger(snapshot.revision) && snapshot.revision > 0);
+            assert.ok(Number.isSafeInteger(snapshot.stats.turns) && snapshot.stats.turns >= 2 && snapshot.stats.turns <= 14);
+            assert.deepEqual(snapshot.stats, { ...STATS, turns: snapshot.stats.turns });
+        } catch (error) {
+            errors.push({ error, attempt, wasUnavailable });
+            if (error.code !== 'ENOENT') reading = false;
+        }
     } })();
     try { for (let turns = 3; turns < 15; turns++) {
         f.setStats({ ...STATS, turns });
-        assert.equal((await f.publisher.readLocal(LOCAL)).turns, turns);
+        activeAttempt = { unavailable: false };
+        const local = await f.publisher.readLocal(LOCAL);
+        activeAttempt.unavailable = local.status === 'unavailable';
+        precedingUnavailable = activeAttempt.unavailable;
+        if (local.status === 'ok') {
+            for (const [field, value] of Object.entries({ ...STATS, turns })) assert.equal(local[field], value, field);
+        } else {
+            assert.equal(local.status, 'unavailable');
+            for (const field of ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens',
+                'cachedInputTokens', 'cacheHit', 'tps']) assert.equal(local[field], null, field);
+            assert.equal(local.usageComplete, false);
+            assert.equal(local.snapshotRevision, undefined);
+        }
     } } finally { reading = false; await reader; }
-    assert.deepEqual(errors, []);
+    for (const { error, attempt, wasUnavailable } of errors) {
+        if (error.code !== 'ENOENT' || !wasUnavailable && !attempt?.unavailable) throw error;
+    }
+    const recovered = await f.publisher.readLocal(LOCAL);
+    for (const [field, value] of Object.entries({ ...STATS, turns: 14 })) assert.equal(recovered[field], value, field);
+    const final = await f.snapshot();
+    assert.deepEqual(final.stats, { ...STATS, turns: 14 });
+    assert.equal(final.revision, recovered.snapshotRevision);
 });
+
+test('Windows rename lock exhaustion returns no metrics and recovers after the lock is released',
+    { skip: process.platform !== 'win32' }, async t => {
+        const f = await fixture(t);
+        await f.publisher.start();
+        const destination = await fs.realpath(f.destination);
+        const rename = fs.rename;
+        let locked = true;
+        t.mock.method(fs, 'rename', async (source, target) => {
+            if (locked && target === destination) {
+                const error = new Error('Fixture Windows replacement lock');
+                error.code = 'EPERM';
+                throw error;
+            }
+            return rename(source, target);
+        });
+        f.setStats({ ...STATS, turns: 4 });
+        const unavailable = await f.publisher.readLocal(LOCAL);
+        assert.equal(unavailable.status, 'unavailable');
+        for (const field of ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens',
+            'cachedInputTokens', 'cacheHit', 'tps']) assert.equal(unavailable[field], null, field);
+        assert.equal(unavailable.usageComplete, false);
+        assert.equal(unavailable.snapshotRevision, undefined);
+        await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
+        locked = false;
+        const recovered = await f.publisher.readLocal(LOCAL);
+        for (const [field, value] of Object.entries({ ...STATS, turns: 4 })) assert.equal(recovered[field], value, field);
+        assert.deepEqual((await f.snapshot()).stats, { ...STATS, turns: 4 });
+        assert.deepEqual((await fs.readdir(f.directory)).sort(), ['.gitignore', `${BRIDGE}.json`]);
+    });
 
 test('refuses unknown destination ownership and preserves unrelated project files', async t => {
     const f = await fixture(t);
@@ -263,21 +322,85 @@ test('returning bindings preserve monotonic revisions for the lifetime of the pu
     assert.equal((await f.snapshot()).revision, restored.snapshotRevision);
 });
 
-async function pauseLocalValidation(t, f) {
-    let entered, release, reads = 0;
+async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000 } = {}) {
+    const destination = await fs.realpath(f.destination);
+    let entered, releaseWait, timer, armHold, reads = 0, paused = false, released = false;
     const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
+    const wait = new Promise(resolve => { releaseWait = resolve; });
+    const release = () => { released = true; clearTimeout(timer); releaseWait(); };
+    const deadline = new Promise((_, reject) => {
+        const expire = reason => {
+            release();
+            reject(new Error(reason));
+        };
+        timer = setTimeout(() => expire('Timed out waiting for snapshot validation'), timeoutMs);
+        armHold = () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => expire('Timed out releasing snapshot validation'), holdMs);
+        };
+    });
     const originalOpen = fs.open;
     t.mock.method(fs, 'open', async (file, flags, ...args) => {
         // The unchanged poll reads once; pause its caller's subsequent local validation.
-        if (file === f.destination && flags === 'r' && ++reads === 2) { entered(); await wait; }
+        if (!released && file === destination && flags === 'r' && ++reads === 2) {
+            paused = true; armHold(); entered(); await wait;
+        }
         return originalOpen(file, flags, ...args);
     });
     t.after(release);
-    const local = f.publisher.readLocal(LOCAL);
-    await ready;
+    const read = f.publisher.readLocal(LOCAL);
+    const local = Promise.race([read, deadline]);
+    void local.catch(() => {});
+    try {
+        await Promise.race([ready, deadline, read.then(() => {
+            if (!paused) throw new Error('Local read completed without pausing snapshot validation');
+        })]);
+    } catch (error) { release(); throw error; }
     return { local, release };
 }
+
+test('delayed validation matches the canonical snapshot through an aliased workspace path', async t => {
+    const f = await fixture(t);
+    const alias = path.join(f.root, 'workspace-alias');
+    await fs.symlink(f.workspace, alias, 'junction');
+    await f.write({ ...f.row, cwd: alias });
+    f.destination = path.join(alias, '.claude', 'session-stats', `${BRIDGE}.json`);
+    await f.publisher.start();
+    assert.notEqual(f.destination, await fs.realpath(f.destination));
+    const paused = await pauseLocalValidation(t, f);
+    f.setStats({ ...STATS, turns: 4 });
+    let newer;
+    try { newer = await f.publisher.readLocal(LOCAL); }
+    finally { paused.release(); }
+    assert.equal(newer.snapshotRevision, 2);
+    assert.equal((await paused.local).status, 'unavailable');
+    assert.equal((await f.snapshot()).revision, newer.snapshotRevision);
+});
+
+test('the validation pause helper rejects a completed read that never reaches its barrier', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    await fs.rm(f.metadata);
+    let timeout;
+    try {
+        await assert.rejects(Promise.race([pauseLocalValidation(t, f), new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(new Error('Validation readiness wait was unbounded')), 10000);
+        })]), /Local read completed without pausing snapshot validation/);
+    } finally { clearTimeout(timeout); }
+});
+
+test('the validation pause helper releases and rejects an abandoned barrier within its deadline', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f, { holdMs: 40 });
+    let timeout;
+    try {
+        await assert.rejects(Promise.race([paused.local, new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(new Error('Validation release wait was unbounded')), 500);
+        })]), /Timed out releasing snapshot validation/);
+    } finally { clearTimeout(timeout); paused.release(); }
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'ok');
+});
 
 test('a delayed older local validation cannot clear or delete a newer shared publication', async t => {
     const f = await fixture(t);
