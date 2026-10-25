@@ -182,7 +182,14 @@ function createMetrics({ sessionId } = {})
                     startedAt: lastInputAt, completedAt: null });
             }
             const response = responses.get(key);
+            const previousOutput = response.output_tokens;
             mergeUsage(response, message.usage);
+            if (response.inputBoundary)
+            {
+                // Replayed inherited responses cannot turn a fork's idle time into generation time.
+                if (response.output_tokens !== previousOutput) response.startedAt = null;
+                return;
+            }
             const end = timestamp(row.timestamp);
             response.completedAt = end === null ? null : Math.max(response.completedAt ?? end, end);
         }
@@ -217,7 +224,13 @@ function createMetrics({ sessionId } = {})
         };
     }
 
-    return { ingest, snapshot };
+    function resetInput()
+    {
+        lastInputAt = null;
+        for (const response of responses.values()) response.inputBoundary = true;
+    }
+
+    return { ingest, snapshot, resetInput };
 }
 
 module.exports = { createMetrics };

@@ -14,9 +14,9 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-版本：[v0.4.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.4.1)。
+版本：[v0.5.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.5.0)。
 
-Remote Control 统计同步需要运行端和接收端都安装 v0.4.1 或更新版本。
+Remote Control 统计同步协议兼容 v0.4.1 及更新版本。使用 fork 继承历史 TPS 时，运行端需要 v0.5.0 或更新版本；建议两端一起更新。
 
 也可以使用 PowerShell 7 运行仓库根目录的脚本：
 
@@ -52,7 +52,7 @@ Claude++ 已运行时，源码和构建产物更新会自动热加载，无需�
 | Steps | 当前主会话的模型响应次数，按 message.id / requestId 去重；同一响应的重复记录和累计快照不会重复累加 |
 | Token | 累计普通输入 + 缓存写入 + 缓存读取 + 输出 |
 | Cache hit | 累计缓存读取 ÷ 累计总输入；缺字段或分母为零时显示 `—` |
-| TPS | 整个会话内有效响应的输出 tokens 总和 ÷ 对应响应耗时总和；跨用户轮次累计，以 `≈` 标记估算值 |
+| TPS | 包括 fork 继承历史的有效响应输出 tokens 总和 ÷ 对应响应耗时总和；跨用户轮次累计，以 `≈` 标记估算值 |
 
 Token 采用运行端原始会话日志提供的用量，不按可见文本长度估算。Remote Control 读取运行端已经算好的统计快照。
 模型代理或转发服务若缺失 usage 字段，相应指标显示 `—`。
@@ -69,6 +69,14 @@ TPS 因此只代表当前可验证的有效响应样本；该值包含首 Token 
 续接或重连重放同一 `promptId` 时，即使记录 UUID 改变，也不重新开始 TPS 计时，
 真正的新输入和工具返回仍分别开始新的计时间隔。
 工具返回优先按 `tool_use_id` 去重，缺失时使用记录 UUID；两者都缺失时不推算该次响应的 TPS。
+
+Fork 的 TPS 会继承实际复制的历史，再与分支之后的新响应一起累计，不把父会话后来新增的响应计入。
+Desktop fork 使用会话元数据中的父子关系，核对副本与源日志的消息、顺序和时间；
+带有 `forkedFrom` 的 SDK/CLI 副本则追溯原记录，使用原始时间，避免把 fork 时刻误算为响应结束时间。
+多层 fork 继续追溯并去重；分支创建后的等待不计入历史响应耗时。
+这只扩大 TPS 的继承范围，Turns、Steps、Token 和 Cache hit 仍沿用原有会话范围。
+无法验证来源、边界或文件版本时 TPS 显示 `—`，不冒充完整累计值；独立可验证的其他指标继续显示。
+接收端仍只读取运行端的同一份统计快照，不另读父会话日志，也不重新估算 TPS。
 
 ## 数据和会话范围
 
@@ -129,6 +137,7 @@ npm run validate
 修改 `src/renderer.cjs` 后运行 build 更新 `index.js`。Claude++ 的 renderer 环境没有 Node require，发布入口因此内嵌 renderer；main 仍加载 `src/main.cjs`。
 `src/session-map.cjs` 负责 Desktop 到日志的映射，`src/session-store.cjs` 负责只读增量加载，`src/metrics.cjs` 负责统计。
 `src/session-history.cjs` 负责核对本地迁移日志的父子关系，确认可以计入的已复制历史。
+`src/fork-metadata.cjs` 核对 Desktop fork 的父子映射，`src/fork-history.cjs` 有界读取和验证继承来源，只扩展 TPS 样本。
 `src/snapshot.cjs` 定义两端共用的快照协议；`src/snapshot-bindings.cjs` 和 `src/snapshot-publisher.cjs` 负责运行端映射和后台发布。
 `src/remote-reader.cjs` 在当前页面通过 RC 获取快照，`src/remote-bridge.cjs` 负责主 frame 校验与 IPC 清理。
 

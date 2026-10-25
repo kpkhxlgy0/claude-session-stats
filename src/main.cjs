@@ -2,6 +2,7 @@
 const path = require('node:path');
 const os = require('node:os');
 const { createSessionStore } = require('./session-store.cjs');
+const { createDesktopForkResolver } = require('./fork-metadata.cjs');
 const { resolveSession, isLocalId } = require('./session-map.cjs');
 const { createRemoteBridge } = require('./remote-bridge.cjs');
 const { buildRemoteScripts } = require('./remote-reader.cjs');
@@ -11,7 +12,8 @@ function startMain(api, options = {}) {
     const claudeData = options.claudeData ?? require('electron').app.getPath('userData');
     const claudeHome = options.claudeHome ?? (process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
     const resolve = options.resolveSession ?? resolveSession;
-    const store = options.store ?? createSessionStore({ claudeHome });
+    const store = options.store ?? createSessionStore({ claudeHome,
+        resolveFork: options.resolveFork ?? createDesktopForkResolver({ claudeData }).resolveFork });
     const publisher = options.publisher ?? require('./snapshot-publisher.cjs').createSnapshotPublisher({ claudeData, store });
     let stopped = false;
     let stopping;

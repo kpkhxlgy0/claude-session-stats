@@ -3,6 +3,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createSessionHistory } = require('./session-history.cjs');
+const { createForkHistory, version } = require('./fork-history.cjs');
 
 const UuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SessionPattern = /^([0-9a-f-]{36})\.jsonl$/i;
@@ -26,7 +27,7 @@ const EmptyStats = Object.freeze({
     usageComplete: false,
 });
 
-function createSessionStore({ claudeHome, createMetrics } = {})
+function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
 {
     const makeMetrics = createMetrics || ((sessionId) => require('./metrics.cjs').createMetrics({ sessionId }));
     const roots = typeof claudeHome === 'string' && claudeHome.length
@@ -51,6 +52,7 @@ function createSessionStore({ claudeHome, createMetrics } = {})
                 stats[key] = value;
             }
         }
+        if (entry && entry.hasFork) stats.tps = entry.forkTps;
         return { ...stats, status, threadId };
     }
 
@@ -62,6 +64,11 @@ function createSessionStore({ claudeHome, createMetrics } = {})
         entry.historyIncomplete = false;
         entry.corrupt = false;
         entry.identity = null;
+        entry.version = null;
+        entry.hasFork = false;
+        entry.hasMarkedFork = false;
+        entry.forkTps = null;
+        entry.forkHistory = createForkHistory({ sessionId: entry.id, locate, resolveFork });
         rewind(entry);
     }
 
@@ -193,6 +200,9 @@ function createSessionStore({ claudeHome, createMetrics } = {})
                     if (record !== undefined)
                     {
                         if (trackHistory) entry.history.ingest(record);
+                        if (record && Object.hasOwn(record, 'forkedFrom') && !record.isSidechain
+                            && (!record.sessionId || record.sessionId === entry.id || entry.historyUuids.has(record.uuid)))
+                            entry.hasMarkedFork = true;
                         entry.metrics.ingest(entry.historyUuids.has(record && record.uuid)
                             ? { ...record, sessionId: entry.id } : record);
                     }
@@ -242,6 +252,7 @@ function createSessionStore({ claudeHome, createMetrics } = {})
             if (!stat.isFile()) throw new Error('Invalid session file');
             const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
             if (entry.identity !== null && (entry.identity !== identity || stat.size < entry.offset
+                || stat.size === entry.offset && entry.version !== version(stat)
                 || !await matchesGuard(handle, entry.head, 0)
                 || !await matchesGuard(handle, entry.tail, entry.offset - entry.tail.length)))
             {
@@ -259,6 +270,9 @@ function createSessionStore({ claudeHome, createMetrics } = {})
                 rewind(entry);
                 await readContents(entry, handle, stat.size, false);
             }
+            if (version(await handle.stat()) !== version(stat) || version(await fs.lstat(entry.path)) !== version(stat))
+                throw Object.assign(new Error('Session changed during read'), { code: 'ESTALE' });
+            entry.version = version(stat);
         }
         finally
         {
@@ -275,21 +289,41 @@ function createSessionStore({ claudeHome, createMetrics } = {})
             entry.path = located;
         }
         if (!entry.path) return result(entry.id, 'not-found');
-        try
+        const forkBudget = { nodes: 0, bytes: 0 };
+        for (let attempt = 0; attempt < 2; attempt++)
         {
-            await read(entry);
+            try
+            {
+                await read(entry);
+                if (entry.historyIncomplete) return result(entry.id, 'incomplete');
+                let metadata;
+                try { metadata = await resolveFork?.(entry.id); }
+                catch { metadata = { incomplete: true }; }
+                entry.hasFork = entry.hasMarkedFork || Boolean(metadata);
+                if (entry.hasFork)
+                {
+                    const fork = await entry.forkHistory.resolve(entry.path, entry.version, metadata, forkBudget);
+                    entry.forkTps = fork.tps;
+                    if (fork.currentChanged) throw Object.assign(new Error('Fork changed during sample'), { code: 'ESTALE' });
+                }
+                if (version(await fs.lstat(entry.path)) !== entry.version)
+                    throw Object.assign(new Error('Session changed during sample'), { code: 'ESTALE' });
+                // Missing lineage proof affects TPS only; existing counters remain usable.
+                return result(entry.id, entry.corrupt ? 'incomplete' : 'ok', entry);
+            }
+            catch (error)
+            {
+                if (error.code !== 'ENOENT' && error.code !== 'ESTALE') throw error;
+                reset(entry);
+                if (error.code === 'ENOENT')
+                {
+                    index.delete(entry.id);
+                    entry.path = await locate(entry.id);
+                    if (!entry.path) return result(entry.id, 'not-found');
+                }
+                if (attempt) return result(entry.id, 'incomplete');
+            }
         }
-        catch (error)
-        {
-            if (error.code !== 'ENOENT') throw error;
-            reset(entry);
-            index.delete(entry.id);
-            entry.path = await locate(entry.id);
-            if (!entry.path) return result(entry.id, 'not-found');
-            await read(entry);
-        }
-        if (entry.historyIncomplete) return result(entry.id, 'incomplete');
-        return result(entry.id, entry.corrupt ? 'incomplete' : 'ok', entry);
     }
 
     async function getStats(rawThreadId)

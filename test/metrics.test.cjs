@@ -4,6 +4,21 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { createMetrics } = require('../src/metrics.cjs');
 
+test('resetting a fork input boundary preserves samples and needs a new input for subsequent responses', () =>
+{
+    const metrics = createMetrics();
+    metrics.ingest({ type: 'user', uuid: 'inherited-input', timestamp: '2026-01-01T00:00:00Z',
+        message: { role: 'user', content: 'input' } });
+    const response = (id, timestamp) => ({ type: 'assistant', timestamp,
+        message: { role: 'assistant', id, usage: { output_tokens: 1000 } } });
+    metrics.ingest(response('inherited', '2026-01-01T00:00:05Z'));
+    metrics.resetInput();
+    metrics.ingest(response('inherited', '2026-01-01T00:00:50Z'));
+    metrics.ingest(response('own-without-input', '2026-01-01T00:01:00Z'));
+    assert.equal(metrics.snapshot().tps, 200);
+    assert.equal(metrics.snapshot().steps, 2);
+});
+
 function user(uuid, content = 'prompt', fields = {})
 {
     return { type: 'user', sessionId: 'session-1', uuid, message: { role: 'user', content }, ...fields };
