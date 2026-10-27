@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const { createCliWorkspaceResolver } = require('../src/cli-workspace.cjs');
+const { createSnapshotPublisher } = require('../src/snapshot-publisher.cjs');
 
 const CLI = '33333333-3333-4333-8333-333333333333';
 const LOCAL = 'local_44444444-4444-4444-8444-444444444444';
@@ -42,11 +43,15 @@ async function fixture(t, options = {}) {
     let registered = [desktop, active, second];
     let processHook;
     let processQueries = 0;
+    const gitCalls = [];
     const execFile = (command, args, _options, callback) => {
         if (command !== 'git') return callback(new Error(`Unexpected command: ${command}`));
+        gitCalls.push(args);
         const cwd = args[1];
         const top = [...repositories.keys()].sort((a, b) => b.length - a.length).find(directory => inside(directory, cwd));
         if (!top) return callback(new Error('Not a Git repository'));
+        if (args.includes('--git-common-dir') && args.includes('--show-toplevel'))
+            return callback(null, repositories.get(top) + '\n' + top + '\n', '');
         if (args.includes('--git-common-dir')) return callback(null, repositories.get(top) + '\n', '');
         if (args.includes('--show-toplevel')) return callback(null, top + '\n', '');
         if (args.includes('worktree')) return callback(null,
@@ -66,9 +71,108 @@ async function fixture(t, options = {}) {
     }
     return { root, claudeHome, sessions, desktop, active, second, foreign, common, binding, row,
         resolver, write, processes, repositories, setRegistered: value => { registered = value; },
-        execFile, setProcessHook: value => { processHook = value; },
+        execFile, gitCalls, setProcessHook: value => { processHook = value; },
         getProcessQueries: () => processQueries };
 }
+
+test('fresh verified resolution proves the current workspace with three Git calls each time', async t => {
+    const f = await fixture(t);
+    await f.write();
+    assert.equal(typeof f.resolver.resolveVerified, 'function');
+    const resolved = await f.resolver.resolveVerified(f.binding);
+    assert.equal(resolved.workspaceRoot, await fs.realpath(f.active));
+    assert.equal(typeof resolved.evidenceKey, 'string');
+    assert.equal(resolved.verify, undefined);
+    assert.equal(f.gitCalls.length, 3);
+    assert.equal(f.getProcessQueries(), 1);
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), resolved);
+    assert.equal(f.gitCalls.length, 6);
+    assert.equal(f.getProcessQueries(), 2);
+    await f.write({ cwd: f.second });
+    const changed = await f.resolver.resolveVerified(f.binding);
+    assert.equal(changed.workspaceRoot, await fs.realpath(f.second));
+    assert.notEqual(changed.evidenceKey, resolved.evidenceKey);
+});
+
+test('a fresh proof never joins an inspection started before its call', async t => {
+    const f = await fixture(t);
+    await f.write();
+    let entered, release;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    let paused = false;
+    const resolver = createCliWorkspaceResolver({ claudeHome: f.claudeHome, platform: 'win32',
+        hostname: 'fixture-host', getProcessIdentities: async () => f.processes,
+        execFile: (command, args, options, callback) => {
+            if (!paused && args.includes('worktree')) {
+                paused = true;
+                release = () => f.execFile(command, args, options, callback);
+                entered();
+            } else f.execFile(command, args, options, callback);
+        } });
+    assert.equal(typeof resolver.resolveVerified, 'function');
+    const first = resolver.resolveVerified(f.binding);
+    await waiting;
+    try {
+        await f.write({ cwd: f.second });
+        let timer;
+        const second = await Promise.race([resolver.resolveVerified(f.binding), new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Fresh proof joined an older inspection')), 1000);
+        })]).finally(() => clearTimeout(timer));
+        assert.equal(second.workspaceRoot, await fs.realpath(f.second));
+    } finally { release(); }
+    assert.deepEqual(await first, { unavailable: true });
+});
+
+test('local snapshot reads use six Git calls and a fresh proof after snapshot I/O', async t => {
+    const f = await fixture(t);
+    await f.write();
+    const claudeData = path.join(f.root, 'desktop-data');
+    const metadata = path.join(claudeData, 'claude-code-sessions', f.binding.accountId, f.binding.organizationId,
+        LOCAL + '.json');
+    await fs.mkdir(path.dirname(metadata), { recursive: true });
+    await fs.writeFile(metadata, JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
+        cwd: f.desktop, bridgeSessionIds: [BRIDGE] }));
+    const publisher = createSnapshotPublisher({ claudeData, resolveWorkspace: f.resolver, pollMs: 600000,
+        store: { getStats: async () => ({ status: 'ok', usageComplete: true, turns: 1, steps: 1,
+            totalTokens: 10, inputTokens: 4, outputTokens: 6, cachedInputTokens: 0, cacheHit: 0, tps: 3 }) } });
+    t.after(() => publisher.stop());
+    await publisher.start();
+    f.gitCalls.length = 0;
+    const beforeQueries = f.getProcessQueries();
+    assert.equal((await publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
+    assert.equal(f.gitCalls.length, 6);
+    assert.equal(f.getProcessQueries() - beforeQueries, 2);
+
+    const originalOpen = fs.open;
+    const snapshot = path.join(f.active, '.claude', 'session-stats', BRIDGE + '.json');
+    let changed = false;
+    t.mock.method(fs, 'open', async (file, ...args) => {
+        const handle = await originalOpen(file, ...args);
+        if (file !== snapshot || changed) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...readArgs) => {
+            const result = await handle.read(...readArgs);
+            changed = true;
+            await f.write({ cwd: f.second });
+            return result;
+        } };
+    });
+    assert.equal((await publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
+    assert.equal(changed, true);
+});
+
+test('combined Git directory output rejects missing, extra, relative and control-bearing paths', async t => {
+    const f = await fixture(t);
+    await f.write();
+    for (const output of [f.common + '\n', f.common + '\n' + f.desktop + '\nextra\n',
+        f.common + '\nrelative\n', f.common + '\n\n', f.common + '\n' + f.desktop + '\r\n\n',
+        f.common + '\n' + f.desktop + '\0\n', f.common + '\n' + f.desktop + '\t\n']) {
+        const resolver = createCliWorkspaceResolver({ claudeHome: f.claudeHome, platform: 'win32',
+            hostname: 'fixture-host', getProcessIdentities: async () => f.processes,
+            execFile: (command, args, options, callback) => args.includes('rev-parse')
+                ? callback(null, output, '') : f.execFile(command, args, options, callback) });
+        assert.deepEqual(await resolver(f.binding), { unavailable: true }, JSON.stringify(output));
+    }
+});
 
 test('no active matching registry preserves the ordinary Desktop workspace', async t => {
     const f = await fixture(t);

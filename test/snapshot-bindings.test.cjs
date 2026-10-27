@@ -14,7 +14,7 @@ const OTHER = 'local_55555555-5555-4555-8555-555555555555';
 const BRIDGE = 'session_666666666666666666666666';
 
 async function fixture(t) {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-bindings-'));
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-bindings-')));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const claudeData = path.join(root, 'desktop');
     const workspaceRoot = path.join(root, 'workspace');
@@ -141,6 +141,81 @@ test('metadata changed during asynchronous workspace verification invalidates a 
             if (change) await f.write({ ...f.row, remoteControlUserEnabled: false });
             return true;
         } });
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    change = true;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+});
+
+test('fresh verified resolver results are consumed once per discovery and recheck', async t => {
+    const f = await fixture(t);
+    await f.write();
+    const active = path.join(f.root, 'active');
+    await fs.mkdir(active);
+    const worktree = await fs.realpath(active);
+    let proofs = 0;
+    const resolveWorkspace = async () => { throw new Error('Legacy resolution must not run'); };
+    resolveWorkspace.resolveVerified = async () => {
+        proofs++;
+        return { workspaceRoot: worktree, evidenceKey: 'fresh-proof' };
+    };
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    assert.equal(binding?.workspaceRoot, worktree);
+    assert.equal(proofs, 1);
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), true);
+    assert.equal(proofs, 2);
+});
+
+test('fresh verified resolver results still require a valid result shape', async t => {
+    const f = await fixture(t);
+    await f.write();
+    const resolveWorkspace = async () => null;
+    const array = Object.assign([], { workspaceRoot: f.workspaceRoot, evidenceKey: 'proof' });
+    for (const result of [undefined, {}, { unavailable: true },
+        array,
+        { workspaceRoot: 'relative', evidenceKey: 'proof' },
+        { workspaceRoot: f.workspaceRoot, evidenceKey: '' },
+        { workspaceRoot: f.workspaceRoot, evidenceKey: 'x'.repeat(16385) }]) {
+        resolveWorkspace.resolveVerified = async () => result;
+        assert.deepEqual(await discoverSnapshotBindings(f.claudeData, { resolveWorkspace }), []);
+    }
+    resolveWorkspace.resolveVerified = async () => null;
+    assert.equal((await discoverSnapshotBindings(f.claudeData, { resolveWorkspace }))[0]?.workspaceRoot,
+        await fs.realpath(f.workspaceRoot));
+});
+
+test('recheck resolves only matching immutable identities before comparing a moved root', async t => {
+    const f = await fixture(t);
+    await f.write({ ...f.row, bridgeSessionIds: ['session_other', BRIDGE] });
+    const worktree = path.join(f.root, 'active');
+    await fs.mkdir(worktree);
+    const resolvedRoot = await fs.realpath(worktree);
+    const requested = [];
+    const resolveWorkspace = async binding => {
+        requested.push(binding.bridgeSessionId);
+        return { workspaceRoot: resolvedRoot, evidenceKey: 'proof', verify: async () => true };
+    };
+    const binding = (await discoverSnapshotBindings(f.claudeData, { resolveWorkspace }))
+        .find(candidate => candidate.bridgeSessionId === BRIDGE);
+    requested.length = 0;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), true);
+    assert.deepEqual(requested, [BRIDGE]);
+    for (const change of [{ accountId: CLI }, { organizationId: CLI }, { localSessionId: OTHER },
+        { cliSessionId: ACCOUNT }, { bridgeSessionId: 'session_missing' }]) {
+        requested.length = 0;
+        assert.equal(await recheckSnapshotBinding({ ...binding, ...change }, { resolveWorkspace }), false);
+        assert.deepEqual(requested, []);
+    }
+});
+
+test('metadata changed during a fresh proof cannot confirm the previous binding', async t => {
+    const f = await fixture(t);
+    await f.write();
+    let change = false;
+    const resolveWorkspace = async () => null;
+    resolveWorkspace.resolveVerified = async () => {
+        if (change) await f.write({ ...f.row, remoteControlUserEnabled: false });
+        return { workspaceRoot: await fs.realpath(f.workspaceRoot), evidenceKey: 'proof' };
+    };
     const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
     change = true;
     assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);

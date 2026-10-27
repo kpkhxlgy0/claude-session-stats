@@ -138,12 +138,13 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
         return { found, pids, home, sessions };
     }
 
-    async function gitValue(cwd, flag) {
-        const output = await run('git', ['-C', cwd, 'rev-parse', '--path-format=absolute', flag]);
-        const value = output.replace(/\r?\n$/, '');
-        if (!value || value.includes('\n') || value.includes('\r') || value.includes('\0'))
+    async function gitDirectories(cwd) {
+        const output = await run('git', ['-C', cwd, 'rev-parse', '--path-format=absolute',
+            '--git-common-dir', '--show-toplevel']);
+        const values = output.replace(/\r?\n$/, '').split(/\r?\n/);
+        if (values.length !== 2 || values.some(value => !value || /[\x00-\x1f\x7f-\x9f]/.test(value)))
             throw new Error('Invalid Git directory');
-        return directory(value);
+        return Promise.all(values.map(directory));
     }
 
     async function nestedGit(desktop, active) {
@@ -161,9 +162,8 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
 
     async function association(desktop, active) {
         if (!await nestedGit(desktop, active)) return ['desktop', desktop.path, desktop.identity];
-        const [sourceCommon, activeCommon, sourceTop, activeTop] = await Promise.all([
-            gitValue(desktop.path, '--git-common-dir'), gitValue(active.path, '--git-common-dir'),
-            gitValue(desktop.path, '--show-toplevel'), gitValue(active.path, '--show-toplevel')]);
+        const [[sourceCommon, sourceTop], [activeCommon, activeTop]] = await Promise.all([
+            gitDirectories(desktop.path), gitDirectories(active.path)]);
         if (!samePath(sourceCommon.path, activeCommon.path) || sourceCommon.identity !== activeCommon.identity
             || !contains(sourceTop.path, desktop.path) || !contains(activeTop.path, active.path))
             throw new Error('Unrelated Git workspace');
@@ -227,14 +227,17 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
         }
     }
 
-    return async function resolveWorkspace(binding) {
+    async function resolveWorkspace(binding) {
         const resolved = await inspect(binding);
         if (!resolved || resolved.unavailable) return resolved;
         return { ...resolved, verify: async () => {
             const current = await inspect(binding);
             return !!current && !current.unavailable && current.evidenceKey === resolved.evidenceKey;
         } };
-    };
+    }
+    // Each call owns a complete fresh proof, including its final registry/root recheck.
+    resolveWorkspace.resolveVerified = inspect;
+    return resolveWorkspace;
 }
 
 module.exports = { createCliWorkspaceResolver };

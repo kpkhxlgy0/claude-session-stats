@@ -66,12 +66,15 @@ async function recordBindings(record, { localSessionId, accountId, organizationI
 async function resolveBindingWorkspace(binding, resolveWorkspace) {
     if (!resolveWorkspace) return binding;
     try {
-        const resolved = await resolveWorkspace(binding);
+        const verified = typeof resolveWorkspace.resolveVerified === 'function';
+        const resolved = verified ? await resolveWorkspace.resolveVerified(binding) : await resolveWorkspace(binding);
         if (resolved === null) return binding;
-        if (!resolved || resolved.unavailable || typeof resolved.workspaceRoot !== 'string'
+        if (!resolved || typeof resolved !== 'object' || Array.isArray(resolved)
+            || resolved.unavailable || typeof resolved.workspaceRoot !== 'string'
             || !path.isAbsolute(resolved.workspaceRoot) || typeof resolved.evidenceKey !== 'string'
-            || !resolved.evidenceKey.length || resolved.evidenceKey.length > 16384
-            || typeof resolved.verify !== 'function') return null;
+            || !resolved.evidenceKey.length || resolved.evidenceKey.length > 16384) return null;
+        if (verified) return { ...binding, workspaceRoot: resolved.workspaceRoot, workspaceEvidence: resolved.evidenceKey };
+        if (typeof resolved.verify !== 'function') return null;
         const root = await fs.realpath(resolved.workspaceRoot);
         const before = await safeDirectory(root);
         if (root !== resolved.workspaceRoot || !await resolved.verify()
@@ -94,6 +97,8 @@ async function recheckSnapshotBinding(binding, { resolveWorkspace } = {}) {
             accountId: path.basename(account), organizationId: path.basename(org), metadataFile: binding.metadataFile });
         let matched = false;
         for (const base of candidates) {
+            if (['accountId', 'organizationId', 'localSessionId', 'cliSessionId', 'bridgeSessionId', 'metadataFile']
+                .some(key => base[key] !== binding[key])) continue;
             const candidate = await resolveBindingWorkspace(base, resolveWorkspace);
             if (candidate && Object.keys(candidate).length === Object.keys(binding).length
                 && Object.keys(candidate).every(key => candidate[key] === binding[key])) matched = true;

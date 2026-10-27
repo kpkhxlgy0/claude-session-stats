@@ -59,6 +59,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     const ownTemps = new Set();
     const protectedRoots = resolveProtectedRoots(installationRoot, watchedTweaksRoot);
     let publicationRevision = 0;
+    let requestedLocalId;
     let timer, pending, stopPending, stopped = false, started = false, completedPoll = false, epoch = 0;
 
     function unavailable(localSessionId) {
@@ -204,16 +205,13 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         }
     }
 
-    async function poll() {
-        const runEpoch = epoch;
-        const blocked = new Set();
-        const bindings = await discoverSnapshotBindings(claudeData, { resolveWorkspace,
-            onUnavailableWorkspace: id => blocked.add(id) });
-        if (stopped || runEpoch !== epoch) return;
-        unavailableWorkspaces = blocked;
+    async function pruneStates(bindings, onlyBindings) {
         const keys = new Set(bindings.map(bindingKey));
+        const onlyKeys = onlyBindings && new Set(onlyBindings.map(bindingKey));
         for (const [key, state] of states) {
-            if (!keys.has(key)) {
+            if (!keys.has(key) && (!onlyKeys || onlyKeys.has(key))) {
+                // A failed final confirmation is not evidence that this session is unbound.
+                if (onlyKeys) unavailableWorkspaces.add(state.binding.localSessionId);
                 states.delete(key);
                 if (state.destination) {
                     const replacement = bindings.find(candidate => candidate.accountId === state.binding.accountId
@@ -228,11 +226,9 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 }
             }
         }
-        for (const binding of bindings) {
-            const key = bindingKey(binding);
-            if (!states.has(key)) states.set(key, { binding, snapshot: null });
-        }
-        const samples = new Map();
+    }
+
+    async function collect(bindings, samples, runEpoch) {
         for (const binding of bindings) {
             if (stopped || runEpoch !== epoch) return;
             const key = sourceKey(binding);
@@ -242,11 +238,12 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 catch { samples.set(key, null); }
             }
         }
-        // One batch confirmation catches new duplicates and overwritten mappings after collection.
-        const confirmed = new Set((await discoverSnapshotBindings(claudeData, { resolveWorkspace })).map(bindingKey));
-        if (stopped || runEpoch !== epoch) return;
+    }
+
+    async function publishBatch(bindings, samples, confirmed, runEpoch) {
+        const published = [];
         for (const binding of bindings) {
-            if (stopped || runEpoch !== epoch) return;
+            if (stopped || runEpoch !== epoch) return published;
             const key = bindingKey(binding);
             const previous = states.get(key);
             const state = previous || { binding, snapshot: null };
@@ -275,12 +272,51 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 state.publication = { snapshot, finished: new Promise(resolve => { finishPublication = resolve; }) };
                 state.snapshot = await publish(binding, snapshot, runEpoch);
                 state.destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId));
+                published.push(binding);
             } catch {
                 state.snapshot = null;
                 if (state.destination) await removeOwn(state.destination, binding);
             } finally {
                 if (finishPublication) { state.publication = null; finishPublication(); }
             }
+        }
+        return published;
+    }
+
+    async function poll() {
+        const runEpoch = epoch;
+        const blocked = new Set();
+        const bindings = await discoverSnapshotBindings(claudeData, { resolveWorkspace,
+            onUnavailableWorkspace: id => blocked.add(id) });
+        if (stopped || runEpoch !== epoch) return;
+        unavailableWorkspaces = blocked;
+        await pruneStates(bindings);
+        for (const binding of bindings) {
+            const key = bindingKey(binding);
+            if (!states.has(key)) states.set(key, { binding, snapshot: null });
+        }
+        const requested = bindings.filter(binding => binding.localSessionId === requestedLocalId);
+        const ready = requested.some(binding => {
+            const snapshot = states.get(bindingKey(binding)).snapshot;
+            return snapshot && protocol.parseSnapshot(JSON.stringify(snapshot),
+                { ...binding, now: now() }).ok;
+        });
+        const priority = !ready && requested.length && requested.length < bindings.length ? requested : [];
+        const priorityKeys = new Set(priority.map(bindingKey));
+        const batches = priority.length ? [priority, bindings.filter(binding => !priorityKeys.has(bindingKey(binding)))]
+            : [bindings];
+        const samples = new Map();
+        let earlyPublished = [];
+        for (let index = 0; index < batches.length; index++) {
+            await collect(batches[index], samples, runEpoch);
+            if (stopped || runEpoch !== epoch) return;
+            // Every batch uses global confirmation, including bindings sampled in an earlier batch.
+            const confirmedBindings = await discoverSnapshotBindings(claudeData, { resolveWorkspace });
+            if (stopped || runEpoch !== epoch) return;
+            if (index > 0) await pruneStates(confirmedBindings, earlyPublished);
+            const published = await publishBatch(batches[index], samples, new Set(confirmedBindings.map(bindingKey)), runEpoch);
+            if (index === 0 && priority.length) earlyPublished = published;
+            if (stopped || runEpoch !== epoch) return;
         }
         completedPoll = true;
     }
@@ -306,6 +342,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     async function readLocal(localSessionId, { waitForPoll = true } = {}) {
         if (!isLocalId(localSessionId)) return null;
         if (stopped) return unavailable(localSessionId);
+        if (!waitForPoll) requestedLocalId = localSessionId.toLowerCase();
         if (waitForPoll) await queuePoll();
         if (stopped) return unavailable(localSessionId);
         const bound = [...states.values()].filter(state => state.binding.localSessionId === localSessionId.toLowerCase());
