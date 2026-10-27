@@ -43,6 +43,18 @@ test('failed publication cannot fall back to a differently calculated local samp
     f.controller.stop();
 });
 
+test('renderer requests a committed sample without waiting for the global publication poll', async () => {
+    const seen = [];
+    const f = fixture({ publisher: { start() {}, stop() {}, async readLocal(id, options) {
+        seen.push({ id, options });
+        return { status: 'unavailable', tps: null };
+    } } });
+    assert.equal((await f.read(LOCAL)).status, 'unavailable');
+    assert.deepEqual(seen, [{ id: LOCAL, options: { waitForPoll: false } }]);
+    assert.deepEqual(f.calls, []);
+    f.controller.stop();
+});
+
 test('stop during a snapshot read invalidates its late local reply', async () => {
     let finish;
     const f = fixture({ publisher: { start() {}, readLocal: () => new Promise(resolve => { finish = resolve; }), stop() {} } });

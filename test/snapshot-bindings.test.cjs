@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
-const { discoverSnapshotBindings } = require('../src/snapshot-bindings.cjs');
+const { discoverSnapshotBindings, recheckSnapshotBinding } = require('../src/snapshot-bindings.cjs');
 
 const ACCOUNT = '11111111-1111-4111-8111-111111111111';
 const ORG = '22222222-2222-4222-8222-222222222222';
@@ -98,4 +98,50 @@ test('does not follow metadata directory junctions or oversized records', async 
     await fs.rename(path.join(sessions, ACCOUNT), moved);
     await fs.symlink(moved, path.join(sessions, ACCOUNT), 'junction');
     assert.deepEqual(await discoverSnapshotBindings(f.claudeData), []);
+});
+test('verified live workspace supersedes stale Desktop cwd and changes invalidate the binding', async t => {
+    const f = await fixture(t);
+    await f.write();
+    const worktree = path.join(f.root, 'verified-worktree');
+    await fs.mkdir(worktree);
+    let evidence = 'pid:100:birth:1', valid = true;
+    const resolveWorkspace = async binding => {
+        assert.equal(binding.cliSessionId, CLI);
+        assert.equal(binding.localSessionId, LOCAL);
+        assert.equal(binding.bridgeSessionId, BRIDGE);
+        assert.equal(binding.workspaceRoot, await fs.realpath(f.workspaceRoot));
+        return { workspaceRoot: await fs.realpath(worktree), evidenceKey: evidence, verify: async () => valid };
+    };
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    assert.equal(binding.workspaceRoot, await fs.realpath(worktree));
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), true);
+    evidence = 'pid:101:birth:2';
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+    valid = false;
+    assert.deepEqual(await discoverSnapshotBindings(f.claudeData, { resolveWorkspace }), []);
+});
+
+test('unverifiable active workspace cannot fall back to the Desktop directory', async t => {
+    const f = await fixture(t);
+    await f.write();
+    for (const result of [{ unavailable: true }, { workspaceRoot: 'relative', evidenceKey: 'x', verify: async () => true },
+        { workspaceRoot: f.workspaceRoot, evidenceKey: 'x', verify: async () => false }]) {
+        assert.deepEqual(await discoverSnapshotBindings(f.claudeData, { resolveWorkspace: async () => result }), []);
+    }
+    assert.equal((await discoverSnapshotBindings(f.claudeData, { resolveWorkspace: async () => null }))[0].workspaceRoot,
+        await fs.realpath(f.workspaceRoot));
+});
+
+test('metadata changed during asynchronous workspace verification invalidates a prior binding', async t => {
+    const f = await fixture(t);
+    await f.write();
+    let change = false;
+    const resolveWorkspace = async () => ({ workspaceRoot: await fs.realpath(f.workspaceRoot),
+        evidenceKey: 'stable', verify: async () => {
+            if (change) await f.write({ ...f.row, remoteControlUserEnabled: false });
+            return true;
+        } });
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    change = true;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
 });

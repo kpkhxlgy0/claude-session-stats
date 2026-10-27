@@ -9,7 +9,13 @@ const { isLocalId } = require('./session-map.cjs');
 function fileIdentity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
 function bindingKey(binding) {
     return JSON.stringify([binding.accountId, binding.organizationId, binding.localSessionId,
-        binding.cliSessionId, binding.bridgeSessionId, binding.workspaceRoot, binding.metadataFile]);
+        binding.cliSessionId, binding.bridgeSessionId, binding.workspaceRoot, binding.metadataFile,
+        binding.workspaceEvidence ?? null]);
+}
+
+function sourceKey(binding) {
+    return JSON.stringify([binding.accountId, binding.organizationId, binding.cliSessionId,
+        binding.workspaceRoot, binding.workspaceEvidence ?? null]);
 }
 
 function containsPath(root, candidate) {
@@ -42,17 +48,18 @@ async function resolveProtectedRoots(installationRoot, watchedTweaksRoot) {
     } catch { return null; }
 }
 
-function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2000,
+function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Date.now, pollMs = 2000,
     heartbeatMs = 10000, publisherId = randomUUID(), installationRoot = path.resolve(__dirname, '..'),
     watchedTweaksRoot = process.env.CLAUDE_PLUSPLUS_USER_ROOT
         ? path.join(process.env.CLAUDE_PLUSPLUS_USER_ROOT, 'tweaks') : null } = {}) {
     const protocol = createSnapshotProtocol();
     const states = new Map();
+    let unavailableWorkspaces = new Set();
     const ownFiles = new Map();
     const ownTemps = new Set();
     const protectedRoots = resolveProtectedRoots(installationRoot, watchedTweaksRoot);
     let publicationRevision = 0;
-    let timer, pending, stopPending, stopped = false, started = false, epoch = 0;
+    let timer, pending, stopPending, stopped = false, started = false, completedPoll = false, epoch = 0;
 
     function unavailable(localSessionId) {
         return { ...protocol.projectStats({ status: 'unavailable', usageComplete: false }),
@@ -103,11 +110,12 @@ function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2
         try {
             const opened = await handle.stat();
             if (!opened.isFile() || fileIdentity(opened) !== fileIdentity(info))
-                throw new Error('Snapshot destination changed');
+                throw Object.assign(new Error('Snapshot destination changed'), { code: 'SNAPSHOT_DESTINATION_CHANGED' });
             const buffer = Buffer.alloc(protocol.maxBytes + 1);
             const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-            if (bytesRead > protocol.maxBytes || fileIdentity(await fs.lstat(file)) !== fileIdentity(info))
-                throw new Error('Snapshot destination changed');
+            if (bytesRead > protocol.maxBytes) throw new Error('Unsafe snapshot destination');
+            if (fileIdentity(await fs.lstat(file)) !== fileIdentity(info))
+                throw Object.assign(new Error('Snapshot destination changed'), { code: 'SNAPSHOT_DESTINATION_CHANGED' });
             const text = buffer.subarray(0, bytesRead).toString('utf8');
             let generatedAt;
             try { generatedAt = JSON.parse(text)?.generatedAt; } catch { /* strict protocol rejects below */ }
@@ -144,7 +152,7 @@ function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2
 
     async function current(binding, runEpoch) {
         if (stopped || epoch !== runEpoch) return false;
-        const matches = await recheckSnapshotBinding(binding);
+        const matches = await recheckSnapshotBinding(binding, { resolveWorkspace });
         return !stopped && epoch === runEpoch && matches;
     }
 
@@ -198,26 +206,44 @@ function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2
 
     async function poll() {
         const runEpoch = epoch;
-        const bindings = await discoverSnapshotBindings(claudeData);
+        const blocked = new Set();
+        const bindings = await discoverSnapshotBindings(claudeData, { resolveWorkspace,
+            onUnavailableWorkspace: id => blocked.add(id) });
         if (stopped || runEpoch !== epoch) return;
+        unavailableWorkspaces = blocked;
         const keys = new Set(bindings.map(bindingKey));
         for (const [key, state] of states) {
             if (!keys.has(key)) {
                 states.delete(key);
-                if (state.destination) await removeOwn(state.destination, state.binding);
+                if (state.destination) {
+                    const replacement = bindings.find(candidate => candidate.accountId === state.binding.accountId
+                        && candidate.organizationId === state.binding.organizationId
+                        && candidate.localSessionId === state.binding.localSessionId
+                        && candidate.cliSessionId === state.binding.cliSessionId
+                        && candidate.bridgeSessionId === state.binding.bridgeSessionId);
+                    if (state.binding.workspaceEvidence || replacement?.workspaceEvidence) {
+                        // Forget moved/unverifiable destinations; never use their payload as migration input.
+                        ownFiles.delete(state.destination);
+                    } else await removeOwn(state.destination, state.binding);
+                }
             }
+        }
+        for (const binding of bindings) {
+            const key = bindingKey(binding);
+            if (!states.has(key)) states.set(key, { binding, snapshot: null });
         }
         const samples = new Map();
         for (const binding of bindings) {
             if (stopped || runEpoch !== epoch) return;
-            const sourceKey = `${binding.accountId}:${binding.organizationId}:${binding.cliSessionId}`;
-            if (!samples.has(sourceKey)) {
-                try { samples.set(sourceKey, await store.getStats(binding.cliSessionId)); }
-                catch { samples.set(sourceKey, null); }
+            const key = sourceKey(binding);
+            if (!samples.has(key)) {
+                try { samples.set(key, await store.getStats(binding.cliSessionId, binding.workspaceEvidence ? {
+                    workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch) } : undefined)); }
+                catch { samples.set(key, null); }
             }
         }
         // One batch confirmation catches new duplicates and overwritten mappings after collection.
-        const confirmed = new Set((await discoverSnapshotBindings(claudeData)).map(bindingKey));
+        const confirmed = new Set((await discoverSnapshotBindings(claudeData, { resolveWorkspace })).map(bindingKey));
         if (stopped || runEpoch !== epoch) return;
         for (const binding of bindings) {
             if (stopped || runEpoch !== epoch) return;
@@ -225,9 +251,9 @@ function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2
             const previous = states.get(key);
             const state = previous || { binding, snapshot: null };
             states.set(key, state);
+            let finishPublication;
             try {
-                const sourceKey = `${binding.accountId}:${binding.organizationId}:${binding.cliSessionId}`;
-                const raw = samples.get(sourceKey);
+                const raw = samples.get(sourceKey(binding));
                 const stats = protocol.projectStats(raw);
                 if (!stats || !confirmed.has(key) || !await current(binding, runEpoch))
                     throw new Error('Snapshot statistics unavailable');
@@ -246,13 +272,17 @@ function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2
                 if (!snapshot) throw new Error('Snapshot statistics unavailable');
                 // Reserve before I/O: even an invalidated write may have been observed remotely.
                 publicationRevision = snapshot.revision;
+                state.publication = { snapshot, finished: new Promise(resolve => { finishPublication = resolve; }) };
                 state.snapshot = await publish(binding, snapshot, runEpoch);
                 state.destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId));
             } catch {
                 state.snapshot = null;
                 if (state.destination) await removeOwn(state.destination, binding);
+            } finally {
+                if (finishPublication) { state.publication = null; finishPublication(); }
             }
         }
+        completedPoll = true;
     }
 
     function queuePoll() {
@@ -273,35 +303,57 @@ function createSnapshotPublisher({ claudeData, store, now = Date.now, pollMs = 2
         return queuePoll();
     }
 
-    async function readLocal(localSessionId) {
+    async function readLocal(localSessionId, { waitForPoll = true } = {}) {
         if (!isLocalId(localSessionId)) return null;
         if (stopped) return unavailable(localSessionId);
-        await queuePoll();
+        if (waitForPoll) await queuePoll();
         if (stopped) return unavailable(localSessionId);
         const bound = [...states.values()].filter(state => state.binding.localSessionId === localSessionId.toLowerCase());
-        if (!bound.length) return null;
+        if (!bound.length) return !completedPoll || unavailableWorkspaces.has(localSessionId.toLowerCase())
+            ? unavailable(localSessionId) : null;
         const state = bound.find(candidate => candidate.snapshot);
         if (!state) return unavailable(localSessionId);
-        const snapshot = state.snapshot;
-        try {
-            const runEpoch = epoch;
-            const parsed = protocol.parseSnapshot(JSON.stringify(snapshot), { bridgeSessionId: state.binding.bridgeSessionId,
-                organizationId: state.binding.organizationId, now: now() });
-            if (!parsed.ok || !await current(state.binding, runEpoch)) throw new Error('Snapshot identity changed');
-            const expected = await directories(state.binding, false);
-            const existing = await readDestination(state.destination, state.binding);
-            await confirmDirectories(expected);
-            if (!existing || JSON.stringify(existing.snapshot) !== JSON.stringify(snapshot)
-                || !await current(state.binding, runEpoch)) throw new Error('Published snapshot changed');
-        } catch {
-            // A newer poll may have replaced this sample while validation was awaiting I/O.
-            // File cleanup belongs to the serialized poll/stop paths, never an older read.
-            if (state.snapshot === snapshot) state.snapshot = null;
-            return unavailable(localSessionId);
+        const runEpoch = epoch, key = bindingKey(state.binding);
+        const active = () => !stopped && epoch === runEpoch && states.get(key) === state && state.snapshot;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const snapshot = state.snapshot;
+            try {
+                if (!active() || !await current(state.binding, runEpoch)) throw new Error('Snapshot identity changed');
+                const expected = await directories(state.binding, false);
+                let existing = await readDestination(state.destination, state.binding);
+                const publication = state.publication;
+                const observed = JSON.stringify(existing?.snapshot);
+                if (existing && publication && observed !== JSON.stringify(snapshot)
+                    && observed !== JSON.stringify(state.snapshot) && observed === JSON.stringify(publication.snapshot)) {
+                    // Rename exposes this candidate before its final identity check commits it.
+                    // Wait only for that publication, then reread the actual destination.
+                    await publication.finished;
+                    if (!active()) throw new Error('Snapshot identity changed');
+                    existing = await readDestination(state.destination, state.binding);
+                }
+                await confirmDirectories(expected);
+                if (!await current(state.binding, runEpoch) || !active()) throw new Error('Snapshot identity changed');
+                const latest = state.snapshot;
+                const encoded = JSON.stringify(existing?.snapshot);
+                let sample;
+                if (existing && encoded === JSON.stringify(latest)) sample = latest;
+                else if (existing && encoded === JSON.stringify(snapshot)
+                    && snapshot.stats.status === 'ok' && latest.stats.status === 'ok') sample = snapshot;
+                else throw new Error('Published snapshot changed');
+                const parsed = protocol.parseSnapshot(JSON.stringify(sample), { bridgeSessionId: state.binding.bridgeSessionId,
+                    organizationId: state.binding.organizationId, now: now() });
+                if (!parsed.ok) throw new Error('Published snapshot expired');
+                return { ...sample.stats, threadId: localSessionId, snapshotGeneratedAt: sample.generatedAt,
+                    snapshotRevision: sample.revision, snapshotPublisherId: sample.publisherId };
+            } catch (error) {
+                // Atomic replacement can cross lstat/open/read. Retry only this file-identity race;
+                // each attempt must still match a committed sample and recheck the binding.
+                if (error.code === 'SNAPSHOT_DESTINATION_CHANGED' && attempt < 2 && active()) continue;
+                // File cleanup belongs to serialized poll/stop paths, never an older read.
+                if (state.snapshot === snapshot) state.snapshot = null;
+                return unavailable(localSessionId);
+            }
         }
-        if (stopped || state.snapshot !== snapshot) return unavailable(localSessionId);
-        return { ...snapshot.stats, threadId: localSessionId, snapshotGeneratedAt: snapshot.generatedAt,
-            snapshotRevision: snapshot.revision, snapshotPublisherId: snapshot.publisherId };
     }
 
     function stop() {

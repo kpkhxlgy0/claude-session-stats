@@ -62,10 +62,10 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
                 if (init.method === 'POST') {
                     const request = JSON.parse(init.body).events[0].payload;
                     assert.deepEqual(request.request, { subtype: 'read_file', path: relative, max_bytes: 16384,
-                        encoding: 'utf-8', anchor: { kind: 'workspace_root' } });
+                        encoding: 'utf-8' });
                     const contents = await fs.readFile(path.join(workspace, relative), 'utf8');
                     events.push({ sequence_num: ++sequence, payload: { type: 'control_response', response: {
-                        request_id: request.request_id, subtype: 'success', response: { contents, absPath: relative, anchor: 'workspace_root' } } } });
+                        request_id: request.request_id, subtype: 'success', response: { contents, absPath: relative } } } });
                     body = {};
                 } else body = { data: url.searchParams.get('sort_order') === 'desc' ? events.slice(-1)
                     : events.filter(e => e.sequence_num > Number(url.searchParams.get('cursor') ?? 0)), resume_cursor: String(sequence) };
@@ -81,7 +81,14 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         const fields = ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheHit',
             'tps', 'usageComplete', 'snapshotGeneratedAt', 'snapshotRevision', 'snapshotPublisherId'];
         async function compare(expected) {
-            const local = await handler('local_' + CHILD), remote = await receiver.read();
+            let local;
+            const deadline = Date.now() + 5000;
+            do {
+                local = await handler('local_' + CHILD);
+                if (local.status === 'ok' && local.tps === expected) break;
+                await new Promise(resolve => setTimeout(resolve, 20));
+            } while (Date.now() < deadline);
+            const remote = await receiver.read();
             assert.equal(local.status, 'ok');
             assert.equal(local.tps, expected);
             assert.equal(remote.status, 'ok');

@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createSessionHistory } = require('./session-history.cjs');
 const { createForkHistory, version } = require('./fork-history.cjs');
+const { createSessionSourceResolver } = require('./session-source.cjs');
 
 const UuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SessionPattern = /^([0-9a-f-]{36})\.jsonl$/i;
@@ -34,6 +35,7 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         ? [path.join(claudeHome, 'projects')]
         : [];
     const sessions = new Map();
+    const resolveSource = createSessionSourceResolver();
     let index = new Map();
     let indexAt = -Infinity;
     let indexPending;
@@ -68,7 +70,8 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         entry.hasFork = false;
         entry.hasMarkedFork = false;
         entry.forkTps = null;
-        entry.forkHistory = createForkHistory({ sessionId: entry.id, locate, resolveFork });
+        entry.forkHistory = createForkHistory({ sessionId: entry.id,
+            locate: id => locate(id, id === entry.id ? entry.context : undefined), resolveFork });
         rewind(entry);
     }
 
@@ -133,7 +136,9 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                         {
                             if (!found.has(id) && found.size >= MaxIndexEntries)
                                 throw new Error('Session index entry limit reached');
-                            found.set(id, found.has(id) ? null : path.join(directory, child.name));
+                            const candidates = found.get(id) || [];
+                            candidates.push(path.join(directory, child.name));
+                            found.set(id, candidates);
                         }
                     }
                     if (filenameCount >= MaxFilenames) throw new Error('Session index file limit reached');
@@ -158,10 +163,18 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         }
     }
 
-    async function locate(threadId)
+    async function locateSource(threadId, context)
     {
         await refreshIndex();
-        return index.get(threadId) || null;
+        const candidates = index.get(threadId);
+        if (!candidates?.length) return null;
+        if (candidates.length === 1) return { path: candidates[0] };
+        return resolveSource(threadId, candidates, context);
+    }
+
+    async function locate(threadId, context)
+    {
+        return (await locateSource(threadId, context))?.path || null;
     }
 
     function consume(entry, chunk, trackHistory)
@@ -282,18 +295,19 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
 
     async function poll(entry)
     {
-        const located = await locate(entry.id);
-        if (entry.path !== located)
-        {
-            reset(entry);
-            entry.path = located;
-        }
-        if (!entry.path) return result(entry.id, 'not-found');
         const forkBudget = { nodes: 0, bytes: 0 };
         for (let attempt = 0; attempt < 2; attempt++)
         {
             try
             {
+                const source = await locateSource(entry.id, entry.context);
+                const located = source?.path || null;
+                if (entry.path !== located)
+                {
+                    reset(entry);
+                    entry.path = located;
+                }
+                if (!entry.path) return result(entry.id, 'not-found');
                 await read(entry);
                 if (entry.historyIncomplete) return result(entry.id, 'incomplete');
                 let metadata;
@@ -308,6 +322,8 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                 }
                 if (version(await fs.lstat(entry.path)) !== entry.version)
                     throw Object.assign(new Error('Session changed during sample'), { code: 'ESTALE' });
+                if (source.verify && !await source.verify())
+                    throw Object.assign(new Error('Session source proof changed'), { code: 'ESTALE' });
                 // Missing lineage proof affects TPS only; existing counters remain usable.
                 return result(entry.id, entry.corrupt ? 'incomplete' : 'ok', entry);
             }
@@ -318,7 +334,7 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                 if (error.code === 'ENOENT')
                 {
                     index.delete(entry.id);
-                    entry.path = await locate(entry.id);
+                    entry.path = await locate(entry.id, entry.context);
                     if (!entry.path) return result(entry.id, 'not-found');
                 }
                 if (attempt) return result(entry.id, 'incomplete');
@@ -326,14 +342,24 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         }
     }
 
-    async function getStats(rawThreadId)
+    async function getStats(rawThreadId, context)
     {
         const threadId = typeof rawThreadId === 'string' && UuidPattern.test(rawThreadId)
             ? rawThreadId.toLowerCase() : null;
         if (disposed || !threadId || !roots.length) return result(threadId, 'unavailable');
-        let entry = sessions.get(threadId);
+        if (context && (typeof context.workspaceRoot !== 'string' || !path.isAbsolute(context.workspaceRoot)
+            || typeof context.verify !== 'function')) return result(threadId, 'unavailable');
+        const cacheKey = JSON.stringify([threadId, context?.workspaceRoot || null]);
+        let entry;
+        async function current()
+        {
+            try { return !context || await context.verify() === true; }
+            catch { return false; }
+        }
         try
         {
+            if (!await current()) return result(threadId, 'unavailable');
+            entry = sessions.get(cacheKey);
             if (!entry)
             {
                 if (sessions.size >= MaxSessions)
@@ -342,16 +368,20 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                     if (!idle) return result(threadId, 'unavailable');
                     sessions.delete(idle[0]);
                 }
-                entry = { id: threadId, path: null };
+                entry = { id: threadId, path: null, context };
                 reset(entry);
             }
-            sessions.delete(threadId);
-            sessions.set(threadId, entry);
-            if (entry.inFlight) return entry.inFlight;
-            entry.inFlight = poll(entry).then(stats => disposed ? result(threadId, 'unavailable') : stats)
-                .catch(() => result(threadId, 'unavailable'))
-                .finally(() => { entry.inFlight = null; });
-            return entry.inFlight;
+            sessions.delete(cacheKey);
+            sessions.set(cacheKey, entry);
+            if (!entry.inFlight)
+            {
+                entry.context = context;
+                entry.inFlight = poll(entry).then(stats => disposed ? result(threadId, 'unavailable') : stats)
+                    .catch(() => result(threadId, 'unavailable'))
+                    .finally(() => { entry.inFlight = null; });
+            }
+            const stats = await entry.inFlight;
+            return !disposed && await current() ? stats : result(threadId, 'unavailable');
         }
         catch
         {

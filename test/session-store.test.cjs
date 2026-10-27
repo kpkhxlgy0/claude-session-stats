@@ -8,9 +8,9 @@ const { createSessionStore } = require('../src/session-store.cjs');
 const ID = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 
-async function setup(t) {
+async function setup(t, options = {}) {
     const claudeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-'));
-    const store = createSessionStore({ claudeHome });
+    const store = createSessionStore({ claudeHome, ...options });
     t.after(async () => { store.dispose(); await fs.rm(claudeHome, { recursive: true }); });
     const write = async (id, text, project = 'project') => {
         const directory = path.join(claudeHome, 'projects', project);
@@ -126,4 +126,50 @@ test('corrupt complete rows mark totals unavailable instead of reporting an unde
     const { store, write } = await setup(t);
     await write(ID, line('a', 5) + '{corrupt}\n');
     assert.equal((await store.getStats(ID)).status, 'incomplete');
+});
+
+test('verified relocation reads one proven byte extension without summing its stale copy', async t => {
+    const { store, write, claudeHome } = await setup(t);
+    const workspaceRoot = path.join(claudeHome, 'active workspace');
+    await fs.mkdir(workspaceRoot);
+    const prefix = line('a', 5) + JSON.stringify({ type: 'relocated', sessionId: ID, relocatedCwd: workspaceRoot }) + '\n';
+    await write(ID, prefix, 'active-project-copy');
+    await write(ID, prefix + line('b', 7), 'original-project');
+    const stats = await store.getStats(ID, { workspaceRoot, verify: async () => true });
+    assert.equal(stats.status, 'ok'); assert.equal(stats.steps, 2); assert.equal(stats.totalTokens, 212);
+    assert.equal((await store.getStats(ID)).status, 'not-found');
+});
+
+test('concurrent no-context and other-workspace queries cannot borrow duplicate source proof', async t => {
+    const { store, write, claudeHome } = await setup(t);
+    const workspaceRoot = path.join(claudeHome, 'active');
+    const otherRoot = path.join(claudeHome, 'other workspace');
+    await fs.mkdir(workspaceRoot); await fs.mkdir(otherRoot);
+    const prefix = line('a', 5) + JSON.stringify({ type: 'relocated', sessionId: ID, relocatedCwd: workspaceRoot }) + '\n';
+    await write(ID, prefix, 'one'); await write(ID, prefix + line('b', 7), 'two');
+    const [active, unbound, other, invalid] = await Promise.all([
+        store.getStats(ID, { workspaceRoot, verify: async () => true }), store.getStats(ID),
+        store.getStats(ID, { workspaceRoot: otherRoot, verify: async () => true }),
+        store.getStats(ID, { workspaceRoot, verify: async () => false })]);
+    assert.equal(active.status, 'ok'); assert.equal(active.totalTokens, 212);
+    assert.equal(unbound.status, 'not-found'); assert.equal(other.status, 'not-found');
+    assert.equal(invalid.status, 'unavailable');
+});
+
+test('a stale duplicate diverging after collection invalidates the pending and cached sample', async t => {
+    let mutate;
+    const { store, write, claudeHome } = await setup(t, { resolveFork: async () => { await mutate?.(); return null; } });
+    const workspaceRoot = path.join(claudeHome, 'active');
+    await fs.mkdir(workspaceRoot);
+    const prefix = line('a', 5) + JSON.stringify({ type: 'relocated', sessionId: ID, relocatedCwd: workspaceRoot }) + '\n';
+    const shorter = await write(ID, prefix, 'one');
+    const longest = await write(ID, prefix + line('b', 7), 'two');
+    const context = { workspaceRoot, verify: async () => true };
+    assert.equal((await store.getStats(ID, context)).status, 'ok');
+    const replacement = await write(ID, prefix + line('b', 7), 'replacement');
+    await fs.rename(replacement, longest);
+    mutate = async () => { mutate = null; await fs.appendFile(shorter, line('divergent', 999)); };
+    const result = await store.getStats(ID, context);
+    assert.equal(result.status, 'not-found'); assert.equal(result.totalTokens, 0);
+    assert.equal((await store.getStats(ID, context)).status, 'not-found');
 });

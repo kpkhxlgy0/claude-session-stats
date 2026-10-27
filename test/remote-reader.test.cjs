@@ -47,7 +47,7 @@ function fixture(t, options = {}) {
         if (!request.url.pathname.endsWith('/events')) return response(detail);
         if (request.url.searchParams.get('sort_order') === 'desc') return response({ data: [], resume_cursor: '10' });
         return response({ data: [event(onReply({ type: 'control_response', response: { request_id: requestId,
-            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: PATH, anchor: 'workspace_root' } } }), 12)], resume_cursor: '12' });
+            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: PATH } } }), 12)], resume_cursor: '12' });
     };
     const reader = createRemoteReader(win, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0,
         responsePollMs: 1, timeoutMs: 100, now: () => clock, ...options });
@@ -68,7 +68,7 @@ test('reads the fixed workspace snapshot through one correlated control request 
     assert.equal(payload.type, 'control_request');
     assert.match(payload.uuid, /^[0-9a-f-]{36}$/i); assert.match(payload.request_id, /^[0-9a-f-]{36}$/i);
     assert.deepEqual(payload.request, { subtype: 'read_file', path: PATH, max_bytes: 16384,
-        encoding: 'utf-8', anchor: { kind: 'workspace_root' } });
+        encoding: 'utf-8' });
     assert.equal(JSON.parse(post.init.body).events.length, 1);
     const postIndex = f.requests.indexOf(post);
     assert.equal(new URL(f.requests[postIndex - 1].url).searchParams.get('sort_order'), 'desc');
@@ -102,7 +102,7 @@ test('synchronized messages and unrelated or pre-cursor responses never supply u
         if (init.method !== 'GET' || url.searchParams.get('sort_order') !== 'asc') return;
         polls++;
         const payload = { type: 'control_response', response: { request_id: requestId,
-            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: PATH, anchor: 'workspace_root' } } };
+            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: PATH } } };
         if (polls === 1) return response({ data: [
             event(payload, 10), event({ ...payload, response: { ...payload.response, request_id: 'old-request' } }, 11),
             event({ type: 'user', uuid: 'prompt', message: { role: 'user', content: 'private prompt' } }, 12),
@@ -128,7 +128,7 @@ test('matching denied, missing and unsupported replies return unavailable withou
 test('invalid file envelopes and malformed snapshots fail closed', async t => {
     const invalid = [
         value => ({ ...value, truncated: true }), value => ({ ...value, encoding: 'base64' }),
-        value => ({ ...value, anchor: undefined }), value => ({ ...value, anchor: 'cwd' }),
+        value => ({ ...value, anchor: 'workspace_root' }), value => ({ ...value, anchor: 'cwd' }),
         value => ({ ...value, absPath: '.claude/session-stats/session_Other.json' }),
         value => ({ ...value, absPath: `/workspace/../${PATH}` }),
         value => ({ ...value, contents: 'x'.repeat(16385) }), value => ({ ...value, contents: '😀'.repeat(5000) }),
@@ -179,7 +179,7 @@ test('cache expires while an RPC is pending and concurrent reads share its one r
     f.setFetch(({ url, requestId, snapshot }) => url.searchParams.get('sort_order') === 'asc'
         ? new Promise(resolve => { release = () => resolve(response({ data: [event({ type: 'control_response',
             response: { request_id: requestId, subtype: 'success', response: { contents: JSON.stringify(snapshot()),
-                absPath: PATH, anchor: 'workspace_root' } } }, 12)], resume_cursor: '12' })); }) : undefined);
+                absPath: PATH } } }, 12)], resume_cursor: '12' })); }) : undefined);
     const first = f.reader.read(), second = f.reader.read(); assert.equal(first, second);
     await waitFor(() => release);
     assert.equal(f.reader.peek().tps, 20); f.advance(1001);
@@ -299,8 +299,35 @@ test('serialized bridge returns pending at 750ms, finishes in the page and clean
     const posted = JSON.parse(f.requests.find(request => request.init.method === 'POST').init.body).events[0].payload;
     const sample = f.snapshot(); sample.generatedAt = Date.now();
     release(response({ data: [event({ type: 'control_response', response: { request_id: posted.request_id,
-        subtype: 'success', response: { contents: JSON.stringify(sample), absPath: PATH, anchor: 'workspace_root' } } }, 12)], resume_cursor: '12' }));
+        subtype: 'success', response: { contents: JSON.stringify(sample), absPath: PATH } } }, 12)], resume_cursor: '12' }));
     const reader = f.win[Symbol.for('claudepp.session-stats.slow-owner')];
     assert.equal((await reader.read()).tps, 20); assert.equal(timers.size, 0);
     vm.runInContext(cleanupScript, context); assert.equal(f.win[Symbol.for('claudepp.session-stats.slow-owner')], undefined);
+});
+test('current-directory snapshot requests do not use the fixed launch-root anchor', async t => {
+    const f = fixture(t);
+    f.setReply(value => {
+        delete value.response.response.anchor;
+        return value;
+    });
+    const result = await f.reader.read();
+    assert.equal(result.status, 'ok');
+    assert.equal(result.tps, 20);
+    const posts = f.requests.filter(request => request.init.method === 'POST');
+    assert.equal(posts.length, 1);
+    assert.deepEqual(JSON.parse(posts[0].init.body).events[0].payload.request,
+        { subtype: 'read_file', path: PATH, max_bytes: 16384, encoding: 'utf-8' });
+});
+
+test('a denied current-directory read never tries another path, anchor or data source', async t => {
+    const f = fixture(t);
+    f.setReply(value => ({ ...value, response: { request_id: value.response.request_id,
+        subtype: 'error', error: 'read denied: ' + PATH } }));
+    const result = await f.reader.read();
+    assert.equal(result.unavailableReason, 'snapshot-denied');
+    assert.equal(result.tps, null);
+    const posts = f.requests.filter(request => request.init.method === 'POST');
+    assert.equal(posts.length, 1);
+    assert.deepEqual(JSON.parse(posts[0].init.body).events[0].payload.request,
+        { subtype: 'read_file', path: PATH, max_bytes: 16384, encoding: 'utf-8' });
 });

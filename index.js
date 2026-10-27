@@ -88,7 +88,7 @@ const SnapshotUnavailable = {
     timeout: '统计快照读取超时，稍后重试',
     transport: '统计快照连接暂不可用',
     'snapshot-missing': '运行端尚未生成统计快照，请在运行端安装或更新 Session Stats',
-    'snapshot-denied': '运行端拒绝读取统计快照，请检查运行端 Session Stats 和目录读取权限',
+    'snapshot-denied': '运行端无法读取统计快照，请检查运行端 Session Stats、当前工作目录和读取权限',
     'snapshot-unsupported': '运行端当前版本不支持读取统计快照',
     'snapshot-invalid': '运行端统计快照数据无效',
     'snapshot-identity': '统计快照与当前会话或组织不匹配',

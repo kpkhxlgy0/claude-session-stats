@@ -3,6 +3,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { createSessionStore } = require('./session-store.cjs');
 const { createDesktopForkResolver } = require('./fork-metadata.cjs');
+const { createCliWorkspaceResolver } = require('./cli-workspace.cjs');
 const { resolveSession, isLocalId } = require('./session-map.cjs');
 const { createRemoteBridge } = require('./remote-bridge.cjs');
 const { buildRemoteScripts } = require('./remote-reader.cjs');
@@ -14,7 +15,8 @@ function startMain(api, options = {}) {
     const resolve = options.resolveSession ?? resolveSession;
     const store = options.store ?? createSessionStore({ claudeHome,
         resolveFork: options.resolveFork ?? createDesktopForkResolver({ claudeData }).resolveFork });
-    const publisher = options.publisher ?? require('./snapshot-publisher.cjs').createSnapshotPublisher({ claudeData, store });
+    const resolveWorkspace = options.resolveWorkspace ?? createCliWorkspaceResolver({ claudeHome });
+    const publisher = options.publisher ?? require('./snapshot-publisher.cjs').createSnapshotPublisher({ claudeData, store, resolveWorkspace });
     let stopped = false;
     let stopping;
     try {
@@ -24,7 +26,7 @@ function startMain(api, options = {}) {
         const unavailable = { threadId: isLocalId(sessionId) ? sessionId : null, status: 'unavailable', tps: null };
         if (stopped || !isLocalId(sessionId)) return unavailable;
         try {
-            const shared = await publisher.readLocal(sessionId);
+            const shared = await publisher.readLocal(sessionId, { waitForPoll: false });
             if (stopped) return unavailable;
             if (shared !== null) return { ...shared, threadId: sessionId };
             const cliSessionId = await resolve(claudeData, sessionId);

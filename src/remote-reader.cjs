@@ -85,7 +85,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
     }
     function accept(current, file, expectedPath) {
         if (!record(file) || typeof file.contents !== 'string' || file.contents.length > protocol.maxBytes
-            || utf8Bytes(file.contents) > protocol.maxBytes || file.anchor !== 'workspace_root'
+            || utf8Bytes(file.contents) > protocol.maxBytes || file.anchor !== undefined
             || file.truncated !== undefined && file.truncated !== false
             || file.encoding !== undefined && file.encoding !== 'utf-8' || !samePath(file.absPath, expectedPath))
             throw failure('snapshot-invalid');
@@ -180,9 +180,11 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             const initial = readPage(await request(`${base}/events?${new URLSearchParams({ limit: '1', sort_order: 'desc' })}`), 0, true);
             let cursor = initial.cursor;
             const requestId = win.crypto.randomUUID();
+            // workspace_root is fixed at CLI launch; EnterWorktree changes its allowed cwd.
+            // Use one current-directory contract, never a fallback after a refused anchored read.
             await request(`${base}/events`, { events: [{ payload: { type: 'control_request', uuid: win.crypto.randomUUID(),
                 request_id: requestId, request: { subtype: 'read_file', path, max_bytes: protocol.maxBytes,
-                    encoding: 'utf-8', anchor: { kind: 'workspace_root' } } } }] });
+                    encoding: 'utf-8' } } }] });
             for (let page = 0; page < (options.maxPages ?? 128); page++) {
                 const params = new URLSearchParams({ limit: '500', sort_order: 'asc', cursor: String(cursor) });
                 const data = readPage(await request(`${base}/events?${params}`), cursor);

@@ -14,9 +14,9 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-版本：[v0.5.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.5.0)。
+版本：[v0.5.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.5.1)。
 
-Remote Control 统计同步协议兼容 v0.4.1 及更新版本。使用 fork 继承历史 TPS 时，运行端需要 v0.5.0 或更新版本；建议两端一起更新。
+快照数据格式保持不变。使用这次工作树目录同步修复时，**运行端和接收端都需要更新到 v0.5.1**；旧接收端仍使用启动目录锚点，无法保证进入工作树后的快照读取。
 
 也可以使用 PowerShell 7 运行仓库根目录的脚本：
 
@@ -85,6 +85,8 @@ Desktop fork 使用会话元数据中的父子关系，核对副本与源日志�
 - 检查记录的 sessionId 与请求一致，cliSessionId 有效，且不存在其他账户中的同名记录。缺失或歧义时显示 `—`。
 - 增量读取 `$env:CLAUDE_CONFIG_DIR\projects\<项目>\<cliSessionId>.jsonl`；环境变量未设置时使用用户目录下的 `.claude`。
 - 日志索引最长缓存 15 秒，新日志可能需要等待下一次索引刷新。文件追加、截断、替换会重新计算或增量更新。
+- 工作树迁移若留下同 UUID 的日志副本，仅在活动 CLI 工作目录已验证、迁移标记匹配，且所有副本都逐字节构成同一份完整历史的前缀时，
+  读取唯一最长的一份，不叠加副本。目录名或修改时间不作为选源依据；历史分叉、证明缺失和超出读取上限时仍不显示统计。
 - 本地迁移日志有匹配当前会话的 `relocated` 标记、且当前记录通过完整 `parentUuid` 链连接到已复制历史时，
   将同一文件内的这些旧会话记录纳入统计，继续按模型响应 ID 去重，不另外读取源日志叠加。
   无关记录和子代理分支不计入；父链缺失、循环、身份冲突或消息顺序不明确时显示 `—`。
@@ -101,9 +103,15 @@ Desktop fork 使用会话元数据中的父子关系，核对副本与源日志�
   快照只包含统计数值、会话/组织标识、发布者标识、递增版本和更新时间，不包含正文、原始日志路径或认证信息。
 - 后台每 2 秒检查日志，即使会话不在当前可见标签页也能更新。数值变化时原子替换快照，未变化时每 10 秒更新心跳。
   本地有 RC 绑定的统计条返回同一次成功写出的样本。发布失败时不另算一个数冒充共享快照。
-- 接收端通过当前 Desktop 页面已有登录态，发送 `read_file` 控制请求读取固定快照路径，使用 `workspace_root` 锚点。
+  界面读取已发布样本，不等待整批后台统计完成；冷启动尚无样本时显示等待状态。读取时仍校验会话、目录、文件和有效期，
+  正常的心跳替换不会把已经确认的成功样本变成不可用。
+- Windows 运行端结合 CLI 的活动会话登记、进程启动标识和 Desktop 身份映射确认当前目录。
+  会话进入或退出工作树后，在确认后的当前目录重新生成快照；移到原项目之外时还需核对 Git 共同目录和工作树登记。
+  身份冲突、目录关联不明或进程无法确认时不向猜测的目录发布。旧目录的快照不作为迁移来源，并按时效失效。
+- 接收端通过当前 Desktop 页面已有登录态，发送 `read_file` 控制请求读取固定快照路径，由 CLI 按当前工作目录解析。
+  `workspace_root` 固定在会话启动目录，不能代表进入工作树后的当前目录，因此不再作为快照路径锚点。
   请求不触发模型生成，不读取 Cookie/令牌，不开放额外服务，不修改 Claude++ 核心或远端读取权限。
-  RC 需要支持该文件读取接口和路径锚点；只安装接收端不能代替运行端生成快照。
+  RC 需要支持该文件读取接口；运行端和接收端都需更新，只安装接收端不能代替运行端生成快照。
 - 默认每 5 秒刷新；同一身份只有一个进行中的请求，每次最多等待 12 秒，失败后等待 30 秒重试。
   底栏等待最多 750ms 后先返回已确认状态。网络传输会使两端暂时看到不同版本；同一快照版本的全部数值完全相同。
 - 快照最多 16 KiB；校验会话、组织、固定来源、版本顺序和数值。超过 30 秒未更新或来自未来超过 5 秒的数据不可用。
@@ -137,8 +145,10 @@ npm run validate
 修改 `src/renderer.cjs` 后运行 build 更新 `index.js`。Claude++ 的 renderer 环境没有 Node require，发布入口因此内嵌 renderer；main 仍加载 `src/main.cjs`。
 `src/session-map.cjs` 负责 Desktop 到日志的映射，`src/session-store.cjs` 负责只读增量加载，`src/metrics.cjs` 负责统计。
 `src/session-history.cjs` 负责核对本地迁移日志的父子关系，确认可以计入的已复制历史。
+`src/session-source.cjs` 仅对有活动工作目录证明的同 UUID 迁移副本验证完整前缀关系，拒绝有分歧的历史。
 `src/fork-metadata.cjs` 核对 Desktop fork 的父子映射，`src/fork-history.cjs` 有界读取和验证继承来源，只扩展 TPS 样本。
 `src/snapshot.cjs` 定义两端共用的快照协议；`src/snapshot-bindings.cjs` 和 `src/snapshot-publisher.cjs` 负责运行端映射和后台发布。
+`src/cli-workspace.cjs` 核对 CLI 活动会话与工作树目录，避免 Desktop 初始目录与实际运行目录不一致。
 `src/remote-reader.cjs` 在当前页面通过 RC 获取快照，`src/remote-bridge.cjs` 负责主 frame 校验与 IPC 清理。
 
 本项目沿用 [Codex++ Session Stats](https://github.com/kpkhxlgy0/session-stats) 的五项显示、增量读取和安装脚本设计，

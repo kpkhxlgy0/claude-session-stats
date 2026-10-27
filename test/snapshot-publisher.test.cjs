@@ -90,6 +90,97 @@ test('timer publishes changed data with no local tab read', async t => {
     });
 });
 
+async function within(promise, timeoutMs = 500) {
+    let timer;
+    try {
+        return await Promise.race([promise, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Local snapshot read waited for background collection')), timeoutMs);
+        })]);
+    } finally { clearTimeout(timer); }
+}
+
+test('fast local reads return a committed sample while background statistics collection is blocked', async t => {
+    let blocked = false, entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { store: { async getStats() {
+        if (blocked) { entered(); await wait; return { ...STATS, turns: 4 }; }
+        return STATS;
+    } } });
+    await f.publisher.start();
+    blocked = true;
+    const poll = f.publisher.start();
+    await ready;
+    try {
+        const local = await within(f.publisher.readLocal(LOCAL, { waitForPoll: false }));
+        assert.equal(local.status, 'ok');
+        assert.equal(local.turns, 2);
+        assert.equal(local.snapshotRevision, 1);
+        assert.equal((await f.snapshot()).revision, 1);
+    } finally { release(); await poll; }
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).snapshotRevision, 2);
+});
+
+test('fast local reads fail closed before the initial publication and proven unbound reads remain null', async t => {
+    let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { store: { async getStats() { entered(); await wait; return STATS; } } });
+    let poll;
+    try {
+        const cold = await within(f.publisher.readLocal(LOCAL, { waitForPoll: false }));
+        assert.equal(cold.status, 'unavailable');
+        assert.equal(cold.snapshotRevision, undefined);
+        poll = f.publisher.start();
+        await ready;
+        assert.equal((await within(f.publisher.readLocal(LOCAL, { waitForPoll: false }))).status, 'unavailable');
+    } finally { release(); await poll; }
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).snapshotRevision, 1);
+    assert.equal(await f.publisher.readLocal('local_99999999-9999-4999-8999-999999999999', { waitForPoll: false }), null);
+});
+
+test('fast local reads do not treat a newly discovered pending publication as an unbound session', async t => {
+    const secondLocal = 'local_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const secondCli = '99999999-9999-4999-8999-999999999999';
+    let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { store: { async getStats(id) {
+        if (id === secondCli) { entered(); await wait; }
+        return STATS;
+    } } });
+    await f.publisher.start();
+    await fs.writeFile(path.join(path.dirname(f.metadata), `${secondLocal}.json`), JSON.stringify({ ...f.row,
+        sessionId: secondLocal, cliSessionId: secondCli, bridgeSessionIds: ['session_second'] }));
+    const poll = f.publisher.start();
+    await ready;
+    try {
+        assert.equal((await within(f.publisher.readLocal(secondLocal, { waitForPoll: false }))).status, 'unavailable');
+    } finally { release(); await poll; }
+});
+
+test('default local reads still wait for fresh statistics and return the new publication', async t => {
+    let blocked = false, entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { store: { async getStats() {
+        if (blocked) { entered(); await wait; return { ...STATS, turns: 4 }; }
+        return STATS;
+    } } });
+    await f.publisher.start();
+    blocked = true;
+    let settled = false;
+    const local = f.publisher.readLocal(LOCAL).then(value => { settled = true; return value; });
+    await ready;
+    try {
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(settled, false);
+    } finally { release(); }
+    const result = await local;
+    assert.equal(result.turns, 4);
+    assert.equal(result.snapshotRevision, 2);
+});
+
 test('atomic replacement never exposes partial JSON to concurrent filesystem readers', async t => {
     const f = await fixture(t);
     await f.publisher.start();
@@ -322,7 +413,7 @@ test('returning bindings preserve monotonic revisions for the lifetime of the pu
     assert.equal((await f.snapshot()).revision, restored.snapshotRevision);
 });
 
-async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000 } = {}) {
+async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, stage = 'before-open' } = {}) {
     const destination = await fs.realpath(f.destination);
     let entered, releaseWait, timer, armHold, reads = 0, paused = false, released = false;
     const ready = new Promise(resolve => { entered = resolve; });
@@ -343,7 +434,14 @@ async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000 } = 
     t.mock.method(fs, 'open', async (file, flags, ...args) => {
         // The unchanged poll reads once; pause its caller's subsequent local validation.
         if (!released && file === destination && flags === 'r' && ++reads === 2) {
-            paused = true; armHold(); entered(); await wait;
+            const pause = async () => { paused = true; armHold(); entered(); await wait; };
+            if (stage === 'after-close') {
+                const handle = await originalOpen(file, flags, ...args);
+                const close = handle.close.bind(handle);
+                handle.close = async () => { await close(); await pause(); };
+                return handle;
+            }
+            await pause();
         }
         return originalOpen(file, flags, ...args);
     });
@@ -373,7 +471,7 @@ test('delayed validation matches the canonical snapshot through an aliased works
     try { newer = await f.publisher.readLocal(LOCAL); }
     finally { paused.release(); }
     assert.equal(newer.snapshotRevision, 2);
-    assert.equal((await paused.local).status, 'unavailable');
+    assert.equal((await paused.local).snapshotRevision, 2);
     assert.equal((await f.snapshot()).revision, newer.snapshotRevision);
 });
 
@@ -412,11 +510,148 @@ test('a delayed older local validation cannot clear or delete a newer shared pub
     try { newer = await f.publisher.readLocal(LOCAL); }
     finally { paused.release(); }
     assert.equal(newer.snapshotRevision, 2);
-    assert.equal((await paused.local).status, 'unavailable');
+    assert.equal((await paused.local).snapshotRevision, 2);
     assert.equal((await f.snapshot()).revision, newer.snapshotRevision);
     const current = await f.publisher.readLocal(LOCAL);
     assert.equal(current.snapshotRevision, newer.snapshotRevision);
     assert.equal(current.turns, 4);
+});
+
+test('an unchanged heartbeat crossing before a local file open reselects the committed publication', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f);
+    f.setClock(110000);
+    let newer;
+    try { newer = await f.publisher.readLocal(LOCAL); }
+    finally { paused.release(); }
+    assert.equal(newer.snapshotRevision, 2);
+    const local = await paused.local;
+    assert.equal(local.status, 'ok');
+    assert.equal(local.snapshotRevision, 2);
+    assert.equal(local.turns, 2);
+});
+
+test('an unchanged heartbeat crossing after a local file read preserves its validated successful sample', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f, { stage: 'after-close' });
+    f.setClock(110000);
+    let newer;
+    try { newer = await f.publisher.readLocal(LOCAL); }
+    finally { paused.release(); }
+    assert.equal(newer.snapshotRevision, 2);
+    const local = await paused.local;
+    assert.equal(local.status, 'ok');
+    assert.equal(local.snapshotRevision, 1);
+    assert.equal(local.turns, 2);
+    assert.equal((await f.snapshot()).revision, 2);
+});
+
+async function exposePendingPublication(t, f) {
+    const destination = await fs.realpath(f.destination);
+    let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const rename = fs.rename;
+    let paused = false;
+    t.mock.method(fs, 'rename', async (source, target) => {
+        const result = await rename(source, target);
+        if (!paused && target === destination) { paused = true; entered(); await wait; }
+        return result;
+    });
+    t.after(release);
+    f.setClock(110000);
+    const poll = f.publisher.start();
+    await within(ready);
+    return { poll, release };
+}
+
+test('a visible pending heartbeat waits for its own successful commit before returning local statistics', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const pending = await exposePendingPublication(t, f);
+    const local = f.publisher.readLocal(LOCAL, { waitForPoll: false });
+    try {
+        assert.equal((await f.snapshot()).revision, 2);
+        assert.equal(await Promise.race([local.then(() => 'settled'),
+            new Promise(resolve => setTimeout(() => resolve('pending'), 100))]), 'pending');
+    } finally { pending.release(); await pending.poll; }
+    const result = await within(local);
+    assert.equal(result.status, 'ok');
+    assert.equal(result.snapshotRevision, 2);
+    assert.equal(result.turns, 2);
+});
+
+test('a visible pending publication cannot return statistics when its final binding check fails', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const pending = await exposePendingPublication(t, f);
+    const local = f.publisher.readLocal(LOCAL, { waitForPoll: false });
+    try {
+        assert.equal(await Promise.race([local.then(() => 'settled'),
+            new Promise(resolve => setTimeout(() => resolve('pending'), 100))]), 'pending');
+        await f.write({ ...f.row, cliSessionId: '99999999-9999-4999-8999-999999999999' });
+    } finally { pending.release(); await pending.poll; }
+    const result = await within(local);
+    assert.equal(result.status, 'unavailable');
+    assert.equal(result.snapshotRevision, undefined);
+    assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
+});
+
+test('a newer non-ok publication invalidates an older successful local sample', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f, { stage: 'after-close' });
+    f.setStats({ ...STATS, status: 'incomplete', usageComplete: false });
+    try { assert.equal((await f.publisher.readLocal(LOCAL)).status, 'incomplete'); }
+    finally { paused.release(); }
+    const local = await paused.local;
+    assert.equal(local.status, 'unavailable');
+    assert.equal(local.snapshotRevision, undefined);
+    assert.equal((await f.snapshot()).stats.status, 'incomplete');
+});
+
+test('an invalidated publication cannot be resurrected by an older completed local file read', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f, { stage: 'after-close' });
+    f.setStats({ ...STATS, tps: Infinity });
+    try { assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable'); }
+    finally { paused.release(); }
+    assert.equal((await paused.local).status, 'unavailable');
+    assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
+});
+
+test('local validation rejects foreign replacements and same-publisher payload tampering', async t => {
+    for (const tamper of ['publisher', 'stats', 'revision']) {
+        await t.test(tamper, async t => {
+            const f = await fixture(t);
+            await f.publisher.start();
+            const paused = await pauseLocalValidation(t, f);
+            const replacement = await f.snapshot();
+            if (tamper === 'publisher') replacement.publisherId = OTHER_PUBLISHER;
+            if (tamper === 'stats') replacement.stats.turns = 999;
+            if (tamper === 'revision') replacement.revision = 999;
+            try { await fs.writeFile(f.destination, JSON.stringify(replacement)); }
+            finally { paused.release(); }
+            const local = await paused.local;
+            assert.equal(local.status, 'unavailable');
+            assert.equal(local.snapshotRevision, undefined);
+            assert.deepEqual(await f.snapshot(), replacement);
+        });
+    }
+});
+
+test('local validation rechecks freshness after its file read completes', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f, { stage: 'after-close' });
+    f.setClock(130001);
+    paused.release();
+    const local = await paused.local;
+    assert.equal(local.status, 'unavailable');
+    assert.equal(local.snapshotRevision, undefined);
 });
 
 test('stop invalidates a delayed local validation without recreating its removed snapshot', async t => {
@@ -509,4 +744,32 @@ test('a sibling project sharing a path prefix with an installation remains publi
     });
     await f.publisher.start();
     assert.equal((await f.publisher.readLocal(LOCAL)).status, 'ok');
+});
+test('workspace migration publishes fresh metrics without reading or copying the old workspace snapshot', async t => {
+    let currentRoot, rootKey = 'launch';
+    const f = await fixture(t, async ({ root, workspace }) => {
+        currentRoot = workspace;
+        return { resolveWorkspace: async () => ({
+            workspaceRoot: await fs.realpath(currentRoot), evidenceKey: rootKey, verify: async () => true }) };
+    });
+    await f.publisher.start();
+    const initial = await f.snapshot();
+    const worktree = path.join(f.root, 'worktree');
+    await fs.mkdir(worktree);
+    currentRoot = worktree; rootKey = 'worktree';
+    f.setStats({ ...STATS, turns: 4, tps: 8 });
+    const originalOpen = fs.open.bind(fs);
+    const spy = t.mock.method(fs, 'open', async (file, ...args) => {
+        if (path.resolve(file) === path.resolve(f.destination)) throw new Error('Old workspace must not be read');
+        return originalOpen(file, ...args);
+    });
+    const local = await f.publisher.readLocal(LOCAL);
+    assert.equal(local.status, 'ok');
+    assert.equal(local.tps, 8);
+    const migrated = JSON.parse(await fs.readFile(path.join(worktree, '.claude', 'session-stats', BRIDGE + '.json'), 'utf8'));
+    assert.equal(migrated.stats.turns, 4);
+    assert.equal(migrated.stats.tps, 8);
+    assert.ok(migrated.revision > initial.revision);
+    spy.mock.restore();
+    assert.deepEqual(await f.snapshot(), initial);
 });

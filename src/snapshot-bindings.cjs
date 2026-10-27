@@ -15,23 +15,30 @@ function sameFile(left, right) {
     return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
 }
 
+function sameVersion(left, right) {
+    return sameFile(left, right) && left.size === right.size
+        && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
 async function safeDirectory(directory) {
     const info = await fs.lstat(directory);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Unsafe metadata directory');
     return info;
 }
 
-async function readRecord(file) {
+async function readRecord(file, withVersion = false) {
     const info = await fs.lstat(file);
     if (!info.isFile() || info.isSymbolicLink() || info.size > MaxBytes) return null;
     const handle = await fs.open(file, 'r');
     try {
         const opened = await handle.stat();
-        if (!opened.isFile() || !sameFile(info, opened)) return null;
+        if (!opened.isFile() || !sameVersion(info, opened)) return null;
         const buffer = Buffer.alloc(MaxBytes + 1);
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-        if (bytesRead > MaxBytes || !sameFile(opened, await fs.lstat(file))) return null;
-        return JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+        if (bytesRead > MaxBytes || !sameVersion(opened, await handle.stat())
+            || !sameVersion(opened, await fs.lstat(file))) return null;
+        const record = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+        return withVersion ? { record, info: opened } : record;
     } finally { await handle.close(); }
 }
 
@@ -42,7 +49,7 @@ async function recordBindings(record, { localSessionId, accountId, organizationI
         || !record.bridgeSessionIds.length || record.bridgeSessionIds.length > 128) return [];
     const bridgeIds = record.bridgeSessionIds.map(normalizeBridgeId);
     if (bridgeIds.some(id => id === null)) return [];
-    // Match Desktop's getWorkspaceRoot, which anchors RC read_file requests.
+    // This is the declared Desktop root; a verified live CLI workspace may supersede it.
     const workspace = typeof record.worktreePath === 'string' && record.worktreePath !== ''
         ? record.worktreePath : record.cwd;
     if (typeof workspace !== 'string' || !path.isAbsolute(workspace)) return [];
@@ -56,23 +63,48 @@ async function recordBindings(record, { localSessionId, accountId, organizationI
         organizationId: organizationId.toLowerCase(), bridgeSessionId, workspaceRoot, metadataFile }));
 }
 
-async function recheckSnapshotBinding(binding) {
+async function resolveBindingWorkspace(binding, resolveWorkspace) {
+    if (!resolveWorkspace) return binding;
+    try {
+        const resolved = await resolveWorkspace(binding);
+        if (resolved === null) return binding;
+        if (!resolved || resolved.unavailable || typeof resolved.workspaceRoot !== 'string'
+            || !path.isAbsolute(resolved.workspaceRoot) || typeof resolved.evidenceKey !== 'string'
+            || !resolved.evidenceKey.length || resolved.evidenceKey.length > 16384
+            || typeof resolved.verify !== 'function') return null;
+        const root = await fs.realpath(resolved.workspaceRoot);
+        const before = await safeDirectory(root);
+        if (root !== resolved.workspaceRoot || !await resolved.verify()
+            || !sameFile(before, await safeDirectory(root))) return null;
+        return { ...binding, workspaceRoot: root, workspaceEvidence: resolved.evidenceKey };
+    } catch { return null; }
+}
+
+async function recheckSnapshotBinding(binding, { resolveWorkspace } = {}) {
     try {
         const org = path.dirname(binding.metadataFile);
         const account = path.dirname(org);
         const root = path.dirname(account);
         const directories = [path.dirname(root), root, account, org];
         const identities = await Promise.all(directories.map(safeDirectory));
-        const candidates = await recordBindings(await readRecord(binding.metadataFile), {
+        const read = await readRecord(binding.metadataFile, true);
+        if (!read) return false;
+        const candidates = await recordBindings(read.record, {
             localSessionId: path.basename(binding.metadataFile, '.json'),
             accountId: path.basename(account), organizationId: path.basename(org), metadataFile: binding.metadataFile });
+        let matched = false;
+        for (const base of candidates) {
+            const candidate = await resolveBindingWorkspace(base, resolveWorkspace);
+            if (candidate && Object.keys(candidate).length === Object.keys(binding).length
+                && Object.keys(candidate).every(key => candidate[key] === binding[key])) matched = true;
+        }
         for (let index = 0; index < directories.length; index++)
             if (!sameFile(identities[index], await safeDirectory(directories[index]))) return false;
-        return candidates.some(candidate => Object.keys(candidate).every(key => candidate[key] === binding[key]));
+        return matched && sameVersion(read.info, await fs.lstat(binding.metadataFile));
     } catch { return false; }
 }
 
-async function discoverSnapshotBindings(claudeData) {
+async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavailableWorkspace } = {}) {
     if (typeof claudeData !== 'string' || !path.isAbsolute(claudeData)) return [];
     const found = [], localCounts = new Map(), bridgeCounts = new Map();
     let directoryCount = 0, entryCount = 0, recordCount = 0;
@@ -115,8 +147,14 @@ async function discoverSnapshotBindings(claudeData) {
             }
         }
     } catch { return []; }
-    return found.filter(binding => localCounts.get(binding.localSessionId) === 1
-        && bridgeCounts.get(binding.bridgeSessionId) === 1)
-        .sort((a, b) => a.metadataFile.localeCompare(b.metadataFile) || a.bridgeSessionId.localeCompare(b.bridgeSessionId));
+    const resolved = [];
+    for (const binding of found) {
+        if (localCounts.get(binding.localSessionId) !== 1 || bridgeCounts.get(binding.bridgeSessionId) !== 1) continue;
+        const current = await resolveBindingWorkspace(binding, resolveWorkspace);
+        if (current) resolved.push(current);
+        else onUnavailableWorkspace?.(binding.localSessionId);
+    }
+    return resolved.sort((a, b) => a.metadataFile.localeCompare(b.metadataFile)
+        || a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
 module.exports = { discoverSnapshotBindings, recheckSnapshotBinding };
