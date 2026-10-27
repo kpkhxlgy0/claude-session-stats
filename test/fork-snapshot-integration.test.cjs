@@ -27,7 +27,7 @@ const encode = rows => rows.map(row => JSON.stringify(row) + '\n').join('');
 
 for (const mode of ['desktop-copy', 'sdk-rewritten']) {
     test(mode + ' fork includes inherited TPS in the production main and same RC snapshot after continuation and restart', async t => {
-        const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-fork-integration-'));
+        const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-fork-integration-')));
         const claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config'), workspace = path.join(root, 'workspace');
         const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG), logs = path.join(claudeHome, 'projects', 'fixture');
         await Promise.all([fs.mkdir(metadata, { recursive: true }), fs.mkdir(logs, { recursive: true }), fs.mkdir(workspace)]);

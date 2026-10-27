@@ -17,7 +17,7 @@ function inside(root, candidate) {
 }
 
 async function fixture(t, options = {}) {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-cli-workspace-'));
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-cli-workspace-')));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const claudeHome = path.join(root, 'claude');
     const sessions = path.join(claudeHome, 'sessions');

@@ -11,7 +11,7 @@ const OTHER = '22222222-2222-4222-8222-222222222222';
 const lines = rows => rows.map(row => JSON.stringify(row) + '\n').join('');
 
 async function fixture(t, options = {}) {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-source-'));
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-source-')));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const workspaceRoot = path.join(root, 'active');
     await fs.mkdir(workspaceRoot);

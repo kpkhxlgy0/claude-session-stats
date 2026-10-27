@@ -9,7 +9,7 @@ const ID = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 
 async function setup(t, options = {}) {
-    const claudeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-'));
+    const claudeHome = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-')));
     const store = createSessionStore({ claudeHome, ...options });
     t.after(async () => { store.dispose(); await fs.rm(claudeHome, { recursive: true }); });
     const write = async (id, text, project = 'project') => {

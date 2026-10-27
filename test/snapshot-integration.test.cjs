@@ -28,7 +28,7 @@ function turn(id, seconds, output) {
 }
 
 for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapshot and RC receiver share successive samples (CLI moved=${moved})`, async t => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-integration-'));
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-integration-')));
     const workspace = path.join(root, 'workspace'), claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG);
     const logs = path.join(claudeHome, 'projects', 'fixture');
@@ -118,7 +118,7 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
 });
 
 test('main wires the CLI workspace resolver into its real publisher', async t => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-main-workspace-'));
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-main-workspace-')));
     const workspace = path.join(root, 'workspace'), active = path.join(workspace, 'child');
     const claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG);
