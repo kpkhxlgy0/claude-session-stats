@@ -98,9 +98,10 @@ async function inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd
         const identities = await Promise.all(directories.map(safeDirectory));
         const read = await readRecord(binding.metadataFile, true);
         if (!read) return false;
-        const candidates = await recordBindings(read.record, {
+        const context = {
             localSessionId: path.basename(binding.metadataFile, '.json'),
-            accountId: path.basename(account), organizationId: path.basename(org), metadataFile: binding.metadataFile });
+            accountId: path.basename(account), organizationId: path.basename(org), metadataFile: binding.metadataFile };
+        const candidates = await recordBindings(read.record, context);
         let matched = false;
         for (const base of candidates) {
             if (['accountId', 'organizationId', 'localSessionId', 'cliSessionId', 'bridgeSessionId', 'metadataFile']
@@ -112,9 +113,16 @@ async function inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd
                 && Object.keys(candidate).every(key => candidate[key] === binding[key]))
                 matched = relocationCwd === undefined ? true : relocationEvidence;
         }
+        let checked = read;
+        if (!sameVersion(read.info, await fs.lstat(binding.metadataFile))) {
+            checked = await readRecord(binding.metadataFile, true);
+            // Compare declared bindings before a live workspace can supersede their roots.
+            if (!checked || snapshotBindingSetKey(candidates)
+                !== snapshotBindingSetKey(await recordBindings(checked.record, context))) return false;
+        }
         for (let index = 0; index < directories.length; index++)
             if (!sameFile(identities[index], await safeDirectory(directories[index]))) return false;
-        return sameVersion(read.info, await fs.lstat(binding.metadataFile)) ? matched : false;
+        return sameVersion(checked.info, await fs.lstat(binding.metadataFile)) ? matched : false;
     } catch { return false; }
 }
 
@@ -131,6 +139,11 @@ async function resolveSnapshotRelocation(binding, relocationCwd, { resolveWorksp
 function snapshotBindingIdentity(binding) {
     return JSON.stringify([binding.accountId, binding.organizationId, binding.localSessionId,
         binding.cliSessionId, binding.bridgeSessionId, binding.metadataFile]);
+}
+
+function snapshotBindingSetKey(bindings) {
+    return JSON.stringify(bindings.map(binding => JSON.stringify([
+        snapshotBindingIdentity(binding), binding.workspaceRoot])).sort());
 }
 
 async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavailableWorkspace,

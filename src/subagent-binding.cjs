@@ -117,8 +117,12 @@ function createSubagentBindings() {
             for (const props of details) {
                 if (props.openedToolUseId !== toolUseId) continue;
                 const id = props.paneView.agentId;
+                // A resumed task can point at its latest call while this pane stays
+                // on the original call. Require the pane's own exact call/agent link.
+                const resumedCall = props.paneView.isResumed === true && props.paneView.callId === toolUseId
+                    && props.task?.taskId === id;
                 if (!sessionMatches(props.sessionRef, selected) || typeof id !== 'string' || !AgentId.test(id)
-                    || props.task?.toolUseId !== undefined && props.task.toolUseId !== toolUseId
+                    || props.task?.toolUseId !== undefined && props.task.toolUseId !== toolUseId && !resumedCall
                     || props.task?.taskId !== undefined && props.task.taskId !== id
                     || agentId !== null && agentId !== id) return null;
                 agentId = id;

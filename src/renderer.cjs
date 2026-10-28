@@ -313,18 +313,20 @@ function startRenderer(api, options = {}) {
     }
     async function refresh(current) {
         if (current.inflight) return;
+        const requestedRoot = current.root;
         let pending;
         if (current.remote) {
-            pending = remoteRequests.get(current.root);
+            pending = remoteRequests.get(requestedRoot);
             if (pending?.has(current.sessionId)) return;
-            if (!pending) remoteRequests.set(current.root, pending = new Set());
+            if (!pending) remoteRequests.set(requestedRoot, pending = new Set());
             pending.add(current.sessionId);
         }
-        current.inflight = true;
+        const request = {};
+        current.inflight = request;
         try {
             const stats = await (current.remote ? api.ipc.invoke('remote-stats')
                 : api.ipc.invoke('stats', current.sessionId));
-            if (!isCurrent(current)) return;
+            if (!isCurrent(current) || current.root !== requestedRoot || current.inflight !== request) return;
             if (current.remote) {
                 if (stats?.threadId !== current.sessionId || stats.source !== 'remote_control'
                     || !(stats.status === 'ok' || stats.status === 'unavailable' && Object.hasOwn(SnapshotUnavailable, stats.unavailableReason))) {
@@ -334,15 +336,15 @@ function startRenderer(api, options = {}) {
                 if (!current.bar.isConnected) doc.body.append(current.bar);
             } else render(current, stats?.threadId === current.sessionId ? stats : null);
         } catch {
-            if (isCurrent(current)) {
+            if (isCurrent(current) && current.root === requestedRoot && current.inflight === request) {
                 if (current.remote) current.bar.remove();
                 else render(current, null);
             }
         } finally {
-            current.inflight = false;
+            if (current.inflight === request) current.inflight = false;
             if (pending) {
                 pending.delete(current.sessionId);
-                if (!pending.size) remoteRequests.delete(current.root);
+                if (!pending.size) remoteRequests.delete(requestedRoot);
             }
         }
     }
@@ -352,12 +354,24 @@ function startRenderer(api, options = {}) {
         const sessionId = parseSessionId(win.location.href);
         void reconcileAgents(sessionId);
         const root = sessionId && doc.visibilityState !== 'hidden' ? findComposer(win) : null;
-        if (!sessionId || !root) { remove(); return; }
-        if (!entry || entry.sessionId !== sessionId || entry.root !== root) {
+        if (!sessionId || doc.visibilityState === 'hidden') { remove(); return; }
+        if (!root) {
+            if (entry?.sessionId === sessionId && (!entry.root.isConnected || isVisible(entry.root, win))) {
+                entry.composerMissingAt ??= Date.now();
+                const elapsed = Date.now() - entry.composerMissingAt;
+                if (elapsed >= 0 && elapsed < 1500) return;
+            }
+            remove(); return;
+        }
+        if (!entry || entry.sessionId !== sessionId) {
             const remote = sessionId.startsWith('session_');
             remove(); entry = { ...makeBar(doc, remote), root, sessionId, remote, inflight: false };
             if (!remote) { render(entry, null); doc.body.append(entry.bar); }
         }
+        // Sending a prompt can replace the composer while the session stays the same.
+        // Move the existing bar; a late reply bound to the old root is ignored above.
+        if (entry.root !== root) entry.inflight = false;
+        entry.root = root; entry.composerMissingAt = null;
         position(entry); void refresh(entry);
     }
     function schedule() {

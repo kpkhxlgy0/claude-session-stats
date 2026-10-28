@@ -70,6 +70,70 @@ test('shows five stats, missing TPS and no context, without changing composer la
     assert.equal(f.doc.querySelector('[data-session-stats]'), null);
     assert.equal(f.doc.querySelector('[data-session-stats-style]'), null);
 });
+
+test('replacing the composer for a new prompt preserves the same session bar while stats are pending', async t => {
+    const f = fixture(t);
+    f.run(); await tick();
+    const bar = f.doc.querySelector('[data-session-stats]');
+    assert.match(bar.textContent, /33 steps/);
+    let settle;
+    f.api.ipc.invoke = (_, id) => new Promise(resolve => { settle = () => resolve({ ...stats, threadId: id, steps: 34 }); });
+    const old = f.doc.querySelector('form'), replacement = old.cloneNode(true);
+    for (const node of [replacement, ...replacement.children]) {
+        node.getClientRects = old.getClientRects; node.getBoundingClientRect = old.getBoundingClientRect;
+    }
+    old.replaceWith(replacement); await tick();
+    assert.equal(f.doc.querySelector('[data-session-stats]'), bar);
+    assert.match(bar.textContent, /33 steps/);
+    settle(); await new Promise(resolve => setTimeout(resolve, 0));
+    assert.match(bar.textContent, /34 steps/);
+});
+
+test('a short same-session composer gap keeps the bar but navigation clears it immediately', async t => {
+    const f = fixture(t);
+    f.run(); await tick();
+    const bar = f.doc.querySelector('[data-session-stats]');
+    const form = f.doc.querySelector('form'); form.remove(); await tick();
+    assert.equal(f.doc.querySelector('[data-session-stats]'), bar);
+    assert.match(bar.textContent, /33 steps/);
+    f.doc.querySelector('main').append(form); await tick();
+    assert.equal(f.doc.querySelector('[data-session-stats]'), bar);
+    form.remove(); f.dom.window.history.pushState({}, '', `/epitaxy/${OTHER}`); await tick();
+    assert.equal(f.doc.querySelector('[data-session-stats]'), null);
+});
+
+test('an absent composer cannot retain its old statistics indefinitely', async t => {
+    t.mock.timers.enable({ apis: ['Date'], now: 10000 });
+    const f = fixture(t);
+    f.run(); await tick();
+    f.doc.querySelector('form').remove(); await tick();
+    assert.ok(f.doc.querySelector('[data-session-stats]'));
+    t.mock.timers.tick(1500); await tick();
+    assert.equal(f.doc.querySelector('[data-session-stats]'), null);
+});
+
+test('reusing composer A after A to B to A ignores the first A request and its cleanup', async t => {
+    for (const outcome of ['resolve', 'reject']) await t.test(outcome, async t => {
+        const f = fixture(t); f.run(); await tick();
+        const bar = f.doc.querySelector('[data-session-stats]');
+        const pending = [];
+        f.api.ipc.invoke = (_, id) => new Promise((resolve, reject) => pending.push({ id, resolve, reject }));
+        await tick();
+        const a = f.doc.querySelector('form'), b = a.cloneNode(true);
+        for (const node of [b, ...b.children]) {
+            node.getClientRects = a.getClientRects; node.getBoundingClientRect = a.getBoundingClientRect;
+        }
+        a.replaceWith(b); await tick(); b.replaceWith(a); await tick();
+        assert.equal(pending.length, 3);
+        pending[2].resolve({ ...stats, threadId: ID, steps: 88 });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        assert.match(bar.textContent, /88 steps/);
+        if (outcome === 'resolve') pending[0].resolve({ ...stats, threadId: ID, steps: 11 });
+        else pending[0].reject(new Error('Old composer request failed'));
+        await new Promise(resolve => setTimeout(resolve, 0));
+        assert.match(bar.textContent, /88 steps/);
+    });
+});
 test('uses the empty center of the lower controls row instead of the input border', async t => {
     const f = fixture(t);
     const form = f.doc.querySelector('form');

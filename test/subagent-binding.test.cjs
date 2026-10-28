@@ -236,6 +236,50 @@ test('binds only the exact selected subagent in a pane to its matching detail id
     }
 });
 
+test('a resumed agent keeps its original selected call while its task tracks the newer call', t => {
+    for (const remote of [false, true]) {
+        const f = fixture(t, { remote });
+        f.props(f.view, { ...f.detail,
+            paneView: { ...f.detail.paneView, callId: f.view.view.toolUseId, isResumed: true },
+            task: { ...f.detail.task, toolUseId: 'toolu_new_resume_call' },
+        });
+        assert.deepEqual(bindings().resolveSubagent(f.pane, f.dom.window),
+            { sessionId: f.sessionId, agentId: 'agent_A-1', remote });
+    }
+});
+
+test('a different task call needs an exact resumed pane call and the same explicit agent identity', t => {
+    const f = fixture(t);
+    const resumed = { ...f.detail,
+        paneView: { ...f.detail.paneView, callId: f.view.view.toolUseId, isResumed: true },
+        task: { ...f.detail.task, toolUseId: 'toolu_new_resume_call' },
+    };
+    for (const change of [
+        { paneView: { ...resumed.paneView, isResumed: false } },
+        { paneView: { ...resumed.paneView, isResumed: undefined } },
+        { paneView: { ...resumed.paneView, isResumed: 'true' } },
+        { paneView: { ...resumed.paneView, callId: 'toolu_other' } },
+        { paneView: { ...resumed.paneView, callId: undefined } },
+        { task: { ...resumed.task, taskId: undefined } },
+        { task: { ...resumed.task, taskId: 'different_agent' } },
+        { paneView: { ...resumed.paneView, agentId: '../invalid' }, task: { ...resumed.task, taskId: '../invalid' } },
+        { sessionRef: { ...resumed.sessionRef, id: 'local_22222222-2222-4222-8222-222222222222' } },
+        { openedToolUseId: 'toolu_other' },
+    ]) {
+        f.props(f.view, { ...resumed, ...change });
+        assert.equal(bindings().resolveSubagent(f.pane, f.dom.window), null);
+    }
+    f.props(f.view, resumed, { ...resumed,
+        paneView: { ...resumed.paneView, agentId: 'different_agent' },
+        task: { ...resumed.task, taskId: 'different_agent' },
+    });
+    assert.equal(bindings().resolveSubagent(f.pane, f.dom.window), null);
+    f.props({ ...f.view, view: { kind: 'tasks' } }, resumed);
+    assert.equal(bindings().resolveSubagent(f.pane, f.dom.window), null);
+    f.props(f.view, resumed, { ...f.view, view: { kind: 'subagent', toolUseId: 'toolu_other' } });
+    assert.equal(bindings().resolveSubagent(f.pane, f.dom.window), null);
+});
+
 test('route identity and matching titles cannot replace the selected view/detail relationship', t => {
     const f = fixture(t);
     for (const props of [[f.view], [f.detail], [{ ...f.view, view: { kind: 'tasks' } }, f.detail],

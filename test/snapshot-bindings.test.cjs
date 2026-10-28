@@ -263,3 +263,139 @@ test('metadata changed during a fresh proof cannot confirm the previous binding'
     change = true;
     assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
 });
+
+for (const replacement of [false, true]) test(`harmless metadata ${replacement ? 'replacement' : 'refresh'} during a fresh proof preserves unique bindings`, async t => {
+    const f = await fixture(t);
+    const otherBridge = 'session_777777777777777777777777';
+    await f.write({ ...f.row, bridgeSessionIds: [BRIDGE, otherBridge] });
+    let refresh = false, proofs = 0;
+    const resolveWorkspace = async () => { throw new Error('Legacy resolution must not run'); };
+    resolveWorkspace.resolveVerified = async () => {
+        proofs++;
+        if (refresh) {
+            const updated = { ...f.row, title: 'Updated title', lastActivityAt: 12345, totalTokens: 900,
+                bridgeSessionIds: ['cse_777777777777777777777777', BRIDGE, BRIDGE] };
+            if (replacement) {
+                const pending = path.join(f.root, 'metadata-next.json');
+                await fs.writeFile(pending, JSON.stringify(updated));
+                await fs.rename(pending, path.join(f.claudeData, 'claude-code-sessions', ACCOUNT, ORG, `${LOCAL}.json`));
+            } else await f.write(updated);
+        }
+        return { workspaceRoot: f.workspaceRoot, evidenceKey: 'fresh-proof' };
+    };
+    const bindings = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    assert.deepEqual(bindings.map(binding => binding.bridgeSessionId), [BRIDGE, otherBridge]);
+    refresh = true;
+    assert.equal(await recheckSnapshotBinding(bindings[0], { resolveWorkspace }), true);
+    assert.equal(proofs, 3);
+    assert.deepEqual((await discoverSnapshotBindings(f.claudeData)).map(binding => binding.bridgeSessionId),
+        [BRIDGE, otherBridge]);
+});
+
+for (const field of ['sessionId', 'cliSessionId', 'bridgeSessionIds', 'remoteControlUserEnabled',
+    'isArchived', 'transcriptUnavailable', 'cwd', 'worktreePath'])
+    test(`a ${field} change during a fresh proof invalidates the previous semantic binding`, async t => {
+        const f = await fixture(t);
+        await f.write();
+        const active = path.join(f.root, 'active');
+        await fs.mkdir(active);
+        const activeRoot = await fs.realpath(active);
+        const changes = { sessionId: OTHER, cliSessionId: ACCOUNT,
+            bridgeSessionIds: [BRIDGE, 'session_added'], remoteControlUserEnabled: false,
+            isArchived: true, transcriptUnavailable: true, cwd: activeRoot, worktreePath: activeRoot };
+        let change = false;
+        const resolveWorkspace = async () => null;
+        resolveWorkspace.resolveVerified = async () => {
+            if (change) await f.write({ ...f.row, [field]: changes[field] });
+            return { workspaceRoot: activeRoot, evidenceKey: 'fresh-proof' };
+        };
+        const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+        assert.equal(binding.workspaceRoot, activeRoot);
+        change = true;
+        assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+    });
+
+test('changing a declared worktree to the same verified active root still invalidates the binding', async t => {
+    const f = await fixture(t);
+    const active = path.join(f.root, 'active');
+    await fs.mkdir(active);
+    const activeRoot = await fs.realpath(active);
+    await f.write({ ...f.row, worktreePath: f.workspaceRoot });
+    let change = false;
+    const resolveWorkspace = async () => null;
+    resolveWorkspace.resolveVerified = async () => {
+        if (change) await f.write({ ...f.row, worktreePath: activeRoot });
+        return { workspaceRoot: activeRoot, evidenceKey: 'fresh-proof' };
+    };
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    change = true;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+});
+
+for (const unsafe of [false, true]) test(`${unsafe ? 'unsafe' : 'replaced'} metadata directories during a fresh proof invalidate the binding`, async t => {
+    const f = await fixture(t);
+    await f.write();
+    let change = false;
+    const resolveWorkspace = async () => null;
+    resolveWorkspace.resolveVerified = async () => {
+        if (change) {
+            const org = path.join(f.claudeData, 'claude-code-sessions', ACCOUNT, ORG);
+            const moved = path.join(f.root, 'moved-org');
+            await fs.rename(org, moved);
+            if (unsafe) await fs.symlink(moved, org, 'junction');
+            else await f.write({ ...f.row, title: 'Same session in replacement directory' });
+        }
+        return { workspaceRoot: f.workspaceRoot, evidenceKey: 'fresh-proof' };
+    };
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    change = true;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+});
+
+test('an oversized metadata replacement during a fresh proof cannot confirm the binding', async t => {
+    const f = await fixture(t);
+    const file = await f.write();
+    let change = false;
+    const resolveWorkspace = async () => null;
+    resolveWorkspace.resolveVerified = async () => {
+        if (change) {
+            const pending = path.join(f.root, 'metadata-next.json');
+            await fs.writeFile(pending, JSON.stringify({ ...f.row, title: 'x'.repeat(2 * 1024 * 1024) }));
+            await fs.rename(pending, file);
+        }
+        return { workspaceRoot: f.workspaceRoot, evidenceKey: 'fresh-proof' };
+    };
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    change = true;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+});
+
+test('another metadata update after the stable reread rejects without repeating the workspace proof', async t => {
+    const f = await fixture(t);
+    const file = await f.write();
+    let change = false, reread = false, proofs = 0, reads = 0;
+    const resolveWorkspace = async () => null;
+    resolveWorkspace.resolveVerified = async () => {
+        proofs++;
+        if (change) {
+            await f.write({ ...f.row, title: 'First harmless update' });
+            reread = true;
+        }
+        return { workspaceRoot: f.workspaceRoot, evidenceKey: 'fresh-proof' };
+    };
+    const [binding] = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace });
+    const realpath = fs.realpath, open = fs.open;
+    t.mock.method(fs, 'realpath', async (target, ...args) => {
+        const result = await realpath(target, ...args);
+        if (reread && target === f.workspaceRoot) await f.write({ ...f.row, title: 'Second harmless update' });
+        return result;
+    });
+    t.mock.method(fs, 'open', async (target, ...args) => {
+        if (target === file) reads++;
+        return open(target, ...args);
+    });
+    change = true;
+    assert.equal(await recheckSnapshotBinding(binding, { resolveWorkspace }), false);
+    assert.equal(proofs, 2);
+    assert.equal(reads, 2);
+});

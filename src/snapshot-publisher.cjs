@@ -407,9 +407,16 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         })).values()];
         const revision = ++discoveryRevision;
         const { parents, identities } = await scanParents(targets);
-        if (!alive(runEpoch) || revision < appliedDiscovery) return { parents: [], revision, stale: true };
+        if (!alive(runEpoch)) return { parents: [], revision, stale: true };
         const scope = new Set(targets.map(snapshotBindingIdentity));
         const confirmed = parents.filter(parent => scope.has(snapshotBindingIdentity(parent)));
+        // A newer full scan may preserve these exact bindings while this fresh
+        // confirmation is in flight. Keep its sample, but never apply older
+        // proof over the newer discovery's identity or negative evidence.
+        if (revision < appliedDiscovery) return { parents: confirmed.filter(parent => {
+            const key = bindingKey(parent);
+            return knownParents.has(key) && !invalidParents.has(key);
+        }), revision, stale: false };
         const keys = new Set(confirmed.map(bindingKey));
         const contradicted = [];
         appliedProof = Math.max(appliedProof, revision);
@@ -492,6 +499,12 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     const stats = protocol.projectStats(raw);
                     if (!stats || !confirmed.has(key))
                         throw new Error('Snapshot statistics unavailable');
+                    if (stats.status === 'incomplete' && state.snapshot?.stats.status === 'ok') {
+                        if (!await current(binding, runEpoch)) throw new Error('Snapshot identity changed');
+                        // Keep the same published revision during an incomplete read.
+                        // Its original timestamp still expires for both local and RC readers.
+                        return;
+                    }
                     const time = now();
                     const unchanged = state.snapshot && JSON.stringify(stats) === JSON.stringify(state.snapshot.stats);
                     if (unchanged && time >= state.snapshot.generatedAt && time - state.snapshot.generatedAt < heartbeatMs) {
@@ -564,8 +577,20 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     confirmed = free.filter(binding => ids.has(binding.agentId)
                         && confirmedParents.some(parent => bindingKey(parent) === bindingKey(parentBinding(binding))));
                 }
-                if (!alive(runEpoch) || confirmation.stale || confirmation.revision < appliedDiscovery) return;
-                await pruneStates(confirmed, free);
+                if (!alive(runEpoch) || confirmation.stale) return;
+                confirmed = confirmed.filter(binding => {
+                    const key = bindingKey(parentBinding(binding));
+                    return knownParents.has(key) && !invalidParents.has(key);
+                });
+                const prunable = free.filter(binding => {
+                    const key = bindingKey(parentBinding(binding));
+                    // Do not let an older failed confirmation delete a snapshot
+                    // whose exact parent a newer full discovery has recovered.
+                    return confirmation.revision >= appliedDiscovery
+                        || confirmedParents.some(parent => bindingKey(parent) === key)
+                        || !knownParents.has(key) || invalidParents.has(key);
+                });
+                await pruneStates(confirmed, prunable);
                 const confirmedKeys = new Set(confirmed.map(bindingKey));
                 for (const binding of free) if (!confirmedKeys.has(bindingKey(binding))) completed(binding);
                 await publishBatch(free.filter(binding => confirmedKeys.has(bindingKey(binding))),
@@ -661,7 +686,9 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         if (agentId !== undefined && !protocol.normalizeAgentId(agentId)) return null;
         if (stopped) return unavailable(localSessionId, agentId);
         if (!waitForPoll) {
-            selectRequest(agentId !== undefined, localSessionId.toLowerCase(), agentId);
+            const child = agentId !== undefined, previous = child ? requestedChild : requestedParent;
+            const request = selectRequest(child, localSessionId.toLowerCase(), agentId);
+            if (request !== previous) void queueRequested(child);
         }
         if (waitForPoll) {
             if (agentId === undefined) await queueLane('parents', pollParents);

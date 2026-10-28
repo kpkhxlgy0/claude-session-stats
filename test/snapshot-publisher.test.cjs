@@ -117,6 +117,8 @@ test('same-parent checks wait for the next fresh cohort instead of joining a pro
         return { workspaceRoot: f.workspace, evidenceKey: 'stable-proof', verify: async () => true };
     } });
     await f.publisher.start();
+    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
+    await f.publisher.start();
     const originalOpen = fs.open;
     t.mock.method(fs, 'open', async (file, ...args) => {
         const handle = await originalOpen(file, ...args);
@@ -169,6 +171,8 @@ test('an unchanged sample before heartbeat performs no snapshot I/O or redundant
         if (sampled) { if (confirmation) redundantProofs++; else confirmation = true; }
         return null;
     }, store: { async getStats() { sampled = true; return STATS; } } });
+    await f.publisher.start();
+    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
     await f.publisher.start();
     const first = await f.snapshot();
     sampled = false; confirmation = false; redundantProofs = 0;
@@ -268,6 +272,13 @@ async function committedLocal(f) {
         await new Promise(resolve => setTimeout(resolve, 5));
     }
 }
+
+test('a new fast parent selection publishes without waiting for the timer', async t => {
+    const f = await fixture(t);
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
+    assert.equal((await committedLocal(f)).turns, 2);
+    assert.equal((await f.snapshot()).stats.turns, 2);
+});
 
 const SECOND_LOCAL = 'local_11111111-1111-4111-8111-111111111111';
 const SECOND_CLI = '99999999-9999-4999-8999-999999999999';
@@ -400,7 +411,7 @@ test('requested targets publish independently on cold and warm polls while globa
     assert.equal((await fresh).status, 'ok');
     const unrelated = JSON.parse(await fs.readFile(path.join(f.directory, 'session_unrelated.json'), 'utf8'));
     assert.equal(unrelated.stats.turns, 2);
-    assert.equal(discoveries, 3);
+    assert.equal(discoveries, 4);
     block = false; calls.length = 0; discoveries = 0;
     await f.publisher.start();
     assert.deepEqual(calls, [CLI, SECOND_CLI]);
@@ -513,17 +524,19 @@ test('lost workspace proof after early publication stays unavailable until a fre
 
 test('binding changes and stop before early publication cannot expose a priority sample', async t => {
     for (const action of ['binding', 'stop']) await t.test(action, async t => {
-        let entered, release;
+        let entered, enteredSecond, release;
         const ready = new Promise(resolve => { entered = resolve; });
+        const secondReady = new Promise(resolve => { enteredSecond = resolve; });
         const wait = new Promise(resolve => { release = resolve; });
         const f = await fixture(t, { store: { async getStats(id) {
             if (id === CLI) { entered(); await wait; }
+            else enteredSecond();
             return STATS;
         } } });
         await addUnrelated(f);
         await f.publisher.readLocal(LOCAL, { waitForPoll: false });
         const poll = f.publisher.start();
-        await within(ready);
+        await within(Promise.all([ready, secondReady]));
         let stopping;
         try {
             if (action === 'binding') await f.write({ ...f.row, cliSessionId: SECOND_CLI });
@@ -727,6 +740,36 @@ test('invalid statistics fail closed and remove only this publisher previous sna
     assert.equal(local.status, 'unavailable');
     assert.equal(local.snapshotRevision, undefined);
     assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
+});
+
+test('incomplete refresh retains the last shared valid sample without extending its lifetime', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const committed = await f.snapshot();
+    f.setStats({ status: 'incomplete', usageComplete: false });
+    f.setClock(120000);
+    const read = await f.publisher.readLocal(LOCAL);
+    assert.equal(read.status, 'ok');
+    assert.equal(read.snapshotRevision, committed.revision);
+    assert.equal(read.snapshotGeneratedAt, committed.generatedAt);
+    assert.deepEqual(await f.snapshot(), committed);
+    f.setClock(130001);
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable');
+    assert.equal((await f.snapshot()).generatedAt, committed.generatedAt);
+    f.setStats({ ...STATS, turns: 3 });
+    const recovered = await f.publisher.readLocal(LOCAL);
+    assert.equal(recovered.status, 'ok');
+    assert.equal(recovered.turns, 3);
+    assert.ok(recovered.snapshotRevision > committed.revision);
+});
+
+test('incomplete refresh cannot preserve a snapshot after its binding is disabled', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    f.setStats({ status: 'incomplete', usageComplete: false });
+    await f.write({ ...f.row, remoteControlUserEnabled: false });
+    assert.equal(await f.publisher.readLocal(LOCAL), null);
+    await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
 });
 
 test('metadata changes during stats collection invalidate the pending write', async t => {
@@ -1034,17 +1077,17 @@ test('a visible pending publication cannot return statistics when its final bind
     assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
 });
 
-test('a newer non-ok publication invalidates an older successful local sample', async t => {
+test('a newer unavailable publication invalidates an older successful local sample', async t => {
     const f = await fixture(t);
     await f.publisher.start();
     const paused = await pauseLocalValidation(t, f, { stage: 'after-close' });
-    f.setStats({ ...STATS, status: 'incomplete', usageComplete: false });
-    try { assert.equal((await f.publisher.readLocal(LOCAL)).status, 'incomplete'); }
+    f.setStats({ ...STATS, status: 'unavailable', usageComplete: false });
+    try { assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable'); }
     finally { paused.release(); }
     const local = await paused.local;
     assert.equal(local.status, 'unavailable');
     assert.equal(local.snapshotRevision, undefined);
-    assert.equal((await f.snapshot()).stats.status, 'incomplete');
+    assert.equal((await f.snapshot()).stats.status, 'unavailable');
 });
 
 test('an invalidated publication cannot be resurrected by an older completed local file read', async t => {

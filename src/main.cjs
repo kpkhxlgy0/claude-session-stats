@@ -17,7 +17,8 @@ function startMain(api, options = {}) {
     const resolve = options.resolveSession ?? resolveSession;
     const store = options.store ?? createSessionStore({ claudeHome,
         resolveFork: options.resolveFork ?? createDesktopForkResolver({ claudeData }).resolveFork });
-    const resolveWorkspace = options.resolveWorkspace ?? createCliWorkspaceResolver({ claudeHome });
+    const resolveWorkspace = options.resolveWorkspace ?? createCliWorkspaceResolver({ claudeHome,
+        processCacheMs: 2000, gitCacheMs: 2000 });
     const publisher = options.publisher ?? require('./snapshot-publisher.cjs').createSnapshotPublisher({ claudeData, store, resolveWorkspace });
     const protocol = createSnapshotProtocol();
     let stopped = false;

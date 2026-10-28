@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { execFile: nativeExecFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { test } = require('node:test');
 const { createCliWorkspaceResolver } = require('../src/cli-workspace.cjs');
 const { createSnapshotPublisher } = require('../src/snapshot-publisher.cjs');
@@ -75,6 +77,157 @@ async function fixture(t, options = {}) {
         getProcessQueries: () => processQueries };
 }
 
+async function gitFixture(t, options = {}) {
+    const f = await fixture(t);
+    const execute = promisify(nativeExecFile);
+    const git = async (...args) => (await execute('git', args, {
+        encoding: 'utf8', windowsHide: true, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }
+    })).stdout;
+    await fs.rm(f.common, { recursive: true });
+    await git('init', f.desktop);
+    await git('-C', f.desktop, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-m', 'Fixture');
+    await git('-C', f.desktop, 'worktree', 'add', '--detach', f.active);
+    await git('-C', f.desktop, 'worktree', 'add', '--detach', f.second);
+    await git('init', f.foreign);
+    const execFile = (command, args, execOptions, callback) => {
+        if (command === 'git') f.gitCalls.push(args);
+        return nativeExecFile(command, args, execOptions, callback);
+    };
+    f.resolver = createCliWorkspaceResolver({ claudeHome: f.claudeHome, platform: 'win32',
+        hostname: 'fixture-host', processCacheMs: 0, gitCacheMs: 2000,
+        getProcessIdentities: async () => f.processes, execFile, ...options });
+    return { ...f, git, nativeExecFile: execFile,
+        activeAdmin: (await fs.readFile(path.join(f.active, '.git'), 'utf8')).trim().slice(8) };
+}
+
+test('warm Git associations reuse proof for two seconds while registry checks remain fresh', async t => {
+    let now = 1000;
+    const f = await gitFixture(t, { now: () => now });
+    await f.write();
+    const first = await f.resolver.resolveVerified(f.binding);
+    assert.equal(first.workspaceRoot, await fs.realpath(f.active));
+    now = 2999;
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), first);
+    assert.equal(f.gitCalls.length, 3);
+    await f.write({ bridgeSessionId: 'session_conflict' });
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), { unavailable: true });
+    await f.write();
+    now = 3000;
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), first);
+    assert.equal(f.gitCalls.length, 6);
+    now = 500;
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), first);
+    assert.equal(f.gitCalls.length, 9);
+});
+
+test('cached Git association fingerprints top-level metadata for subdirectory cwd', async t => {
+    const f = await gitFixture(t);
+    const source = path.join(f.desktop, 'source');
+    const active = path.join(f.active, 'source');
+    await fs.mkdir(source);
+    await fs.mkdir(active);
+    const binding = { ...f.binding, workspaceRoot: source };
+    await f.write({ cwd: active });
+    assert.equal((await f.resolver.resolveVerified(binding)).workspaceRoot, active);
+    assert.equal((await f.resolver.resolveVerified(binding)).workspaceRoot, active);
+    assert.equal(f.gitCalls.length, 3);
+    await fs.appendFile(path.join(f.common, 'config'), '\n# changed\n');
+    assert.equal((await f.resolver.resolveVerified(binding)).workspaceRoot, active);
+    assert.equal(f.gitCalls.length, 6);
+    await fs.writeFile(path.join(active, '.git'), `gitdir: ${path.join(f.foreign, '.git')}\n`);
+    assert.deepEqual(await f.resolver.resolveVerified(binding), { unavailable: true });
+    assert.ok(f.gitCalls.length > 6);
+});
+
+test('Git registration additions, redirection and removal invalidate cached association', async t => {
+    for (const change of ['add', 'gitdir', 'commondir', 'remove', 'redirect']) {
+        const f = await gitFixture(t);
+        await f.write();
+        assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.active);
+        if (change === 'add') await f.git('-C', f.desktop, 'worktree', 'add', '--detach',
+            path.join(f.root, 'new registered worktree'));
+        if (change === 'gitdir') await fs.writeFile(path.join(f.activeAdmin, 'gitdir'),
+            path.join(f.foreign, '.git') + '\n');
+        if (change === 'commondir') await fs.writeFile(path.join(f.activeAdmin, 'commondir'),
+            path.join(f.foreign, '.git') + '\n');
+        if (change === 'remove') await fs.rm(f.activeAdmin, { recursive: true });
+        if (change === 'redirect') {
+            await fs.rm(path.join(f.active, '.git'));
+            await fs.writeFile(path.join(f.active, '.git'), `gitdir: ${path.join(f.foreign, '.git')}\n`);
+        }
+        const resolved = await f.resolver.resolveVerified(f.binding);
+        if (change === 'add') assert.equal(resolved.workspaceRoot, f.active);
+        else assert.deepEqual(resolved, { unavailable: true }, change);
+        assert.ok(f.gitCalls.length > 3, change);
+    }
+});
+
+test('directory replacements cannot retain a cached association identity', async t => {
+    const f = await gitFixture(t);
+    await f.write();
+    const first = await f.resolver(f.binding);
+    const old = f.active + '-old';
+    await fs.rename(f.active, old);
+    await fs.mkdir(f.active);
+    await fs.copyFile(path.join(old, '.git'), path.join(f.active, '.git'));
+    assert.equal(await first.verify(), false);
+    assert.equal(f.gitCalls.length, 6);
+    const replacement = await f.resolver.resolveVerified(f.binding);
+    assert.equal(replacement.workspaceRoot, f.active);
+    assert.notEqual(replacement.evidenceKey, first.evidenceKey);
+});
+
+test('unsafe or unbounded Git controls fall back to fresh native proof', async t => {
+    for (const change of ['linked', 'oversized', 'entries', 'missing']) {
+        const f = await gitFixture(t);
+        if (change === 'linked') {
+            const config = path.join(f.common, 'config');
+            const target = path.join(f.root, 'external config');
+            await fs.rename(config, target);
+            await fs.symlink(target, config, 'file');
+        }
+        if (change === 'oversized') await fs.appendFile(path.join(f.common, 'config'),
+            '#' + 'x'.repeat(64 * 1024) + '\n');
+        if (change === 'entries') for (let i = 0; i < 129; i++)
+            await fs.mkdir(path.join(f.common, 'worktrees', `extra-${i}`));
+        if (change === 'missing') await fs.rm(path.join(f.activeAdmin, 'commondir'));
+        await f.write();
+        const first = await f.resolver.resolveVerified(f.binding);
+        const calls = f.gitCalls.length;
+        assert.deepEqual(await f.resolver.resolveVerified(f.binding), first, change);
+        assert.ok(f.gitCalls.length > calls, change);
+    }
+});
+
+test('concurrent cold Git proofs cannot publish a cache for a changed registration generation', async t => {
+    const f = await gitFixture(t);
+    await f.write();
+    let entered, release, paused = false;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const resolver = createCliWorkspaceResolver({ claudeHome: f.claudeHome, platform: 'win32',
+        hostname: 'fixture-host', processCacheMs: 0, gitCacheMs: 2000,
+        getProcessIdentities: async () => f.processes,
+        execFile: (command, args, options, callback) => f.nativeExecFile(command, args, options,
+            (error, stdout, stderr) => {
+                if (!paused && args.includes('worktree')) {
+                    paused = true;
+                    release = () => callback(error, stdout, stderr);
+                    entered();
+                } else callback(error, stdout, stderr);
+            }) });
+    const first = resolver.resolveVerified(f.binding);
+    await waiting;
+    try {
+        await fs.writeFile(path.join(f.activeAdmin, 'gitdir'), path.join(f.foreign, '.git') + '\n');
+        assert.deepEqual(await resolver.resolveVerified(f.binding), { unavailable: true });
+    } finally { release(); }
+    assert.deepEqual(await first, { unavailable: true });
+    const calls = f.gitCalls.length;
+    assert.deepEqual(await resolver.resolveVerified(f.binding), { unavailable: true });
+    assert.ok(f.gitCalls.length > calls);
+});
+
 test('fresh verified resolution proves the current workspace with three Git calls each time', async t => {
     const f = await fixture(t);
     await f.write();
@@ -136,6 +289,10 @@ test('local snapshot reads use six Git calls and a fresh proof after snapshot I/
         store: { getStats: async () => ({ status: 'ok', usageComplete: true, turns: 1, steps: 1,
             totalTokens: 10, inputTokens: 4, outputTokens: 6, cachedInputTokens: 0, cacheHit: 0, tps: 3 }) } });
     t.after(() => publisher.stop());
+    await publisher.start();
+    // Select once and drain its immediate background refresh before measuring
+    // the two fresh proofs performed by a subsequent snapshot read itself.
+    await publisher.readLocal(LOCAL, { waitForPoll: false });
     await publisher.start();
     f.gitCalls.length = 0;
     const beforeQueries = f.getProcessQueries();

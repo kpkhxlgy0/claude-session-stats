@@ -1,5 +1,6 @@
 'use strict';
 const nativeFs = require('node:fs/promises');
+const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { execFile: nativeExecFile } = require('node:child_process');
@@ -16,9 +17,11 @@ function contains(root, candidate) {
 
 function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nativeExecFile,
     platform = process.platform, hostname = os.hostname(), getProcessIdentities,
-    now = Date.now, processCacheMs = 250, maxRegistryEntries = 512,
+    now = Date.now, processCacheMs = 250, gitCacheMs = 0, maxRegistryEntries = 512,
     maxRegistryBytes = 64 * 1024, maxRegistryTotalBytes = 4 * 1024 * 1024 } = {}) {
     const domain = `${platform}:${hostname.toLowerCase()}`;
+    const gitTtl = Number.isFinite(gitCacheMs) ? Math.min(2000, Math.max(0, gitCacheMs)) : 0;
+    const gitAssociations = new Map();
     let processBatch;
     function samePath(left, right) {
         if (!path.isAbsolute(left) || !path.isAbsolute(right)) return false;
@@ -29,7 +32,8 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
 
     function run(command, args, maxBuffer = 256 * 1024) {
         return new Promise((resolve, reject) => execFile(command, args,
-            { encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer }, (error, stdout) => {
+            { encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer,
+                ...(command === 'git' ? { env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } } : {}) }, (error, stdout) => {
                 if (error) reject(error);
                 else if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > maxBuffer)
                     reject(new Error('Invalid command output'));
@@ -160,19 +164,141 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
         return false;
     }
 
-    async function association(desktop, active) {
+    async function gitFingerprint(desktop, active, git) {
+        const parts = [];
+        let probes = 0, bytes = 0;
+        const stamp = info => [identity(info), info.size, info.mtimeMs, info.ctimeMs];
+        async function control(file, read = false) {
+            if (++probes > 1024) throw new Error('Git control probe limit');
+            let before;
+            try { before = await fs.lstat(file); }
+            catch (error) {
+                if (error.code !== 'ENOENT') throw error;
+                parts.push([file, null]);
+                return null;
+            }
+            if (before.isSymbolicLink() || !before.isFile() && !before.isDirectory()
+                || before.isFile() && (before.nlink !== 1 || before.size > 64 * 1024))
+                throw new Error('Unsafe Git control');
+            parts.push([file, before.isDirectory() ? ['directory', identity(before)] : stamp(before)]);
+            if (!read) return before;
+            if (!before.isFile() || (bytes += before.size) > 128 * 1024)
+                throw new Error('Git control byte limit');
+            // Reject links before opening; compare the handle and pathname again so
+            // replacement races cannot establish a reusable proof. O_NOFOLLOW is
+            // unavailable on Windows, where these identity checks remain required.
+            const handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+            try {
+                const opened = await handle.stat();
+                if (!unchanged(before, opened)) throw new Error('Git control changed');
+                const buffer = Buffer.alloc(64 * 1024 + 1);
+                const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+                const after = await fs.lstat(file);
+                if (bytesRead !== before.size || !unchanged(opened, await handle.stat())
+                    || after.isSymbolicLink() || !unchanged(opened, after)) throw new Error('Git control changed');
+                const text = buffer.subarray(0, bytesRead).toString('utf8');
+                parts.push([file, text]);
+                return text;
+            } finally { await handle.close(); }
+        }
+        const common = git[1];
+        for (const [root, expected] of [[common, git[2]], [git[3], git[4]], [git[5], git[6]]]) {
+            const checked = await directory(root);
+            if (checked.identity !== expected) throw new Error('Git root changed');
+            parts.push([root, checked.identity]);
+        }
+        const registrations = path.join(common, 'worktrees');
+        const before = await control(registrations);
+        if (before && !before.isDirectory()) throw new Error('Unsafe Git registrations');
+        for (const [cwd, top] of [[desktop.path, git[3]], [active.path, git[5]]]) {
+            let current = cwd, depth = 0;
+            for (; !samePath(current, top); current = path.dirname(current)) {
+                if (++depth > 64 || !contains(top, current) || await control(path.join(current, '.git')))
+                    throw new Error('Git discovery changed');
+            }
+            const marker = path.join(top, '.git');
+            const info = await control(marker);
+            if (!info) throw new Error('Missing Git marker');
+            let gitdir = marker;
+            if (info.isFile()) {
+                const value = await control(marker, true);
+                const match = /^gitdir: ([^\x00-\x1f\x7f-\x9f]+)\r?\n?$/.exec(value);
+                if (!match) throw new Error('Invalid Git redirection');
+                gitdir = path.resolve(top, match[1]);
+            }
+            // Only the common directory and its immediate registration directories
+            // are bounded, known control locations. Other layouts use native Git.
+            if (!samePath(gitdir, common) && !samePath(path.dirname(gitdir), registrations))
+                throw new Error('Unbounded Git control location');
+            if (!samePath(gitdir, common) && !before) throw new Error('Missing Git registrations');
+            const admin = await control(gitdir);
+            if (!admin?.isDirectory()) throw new Error('Unsafe Git administration directory');
+            if (!samePath(gitdir, common)) {
+                const relative = await control(path.join(gitdir, 'commondir'), true);
+                if (typeof relative !== 'string' || !/^[^\x00-\x1f\x7f-\x9f]+\r?\n?$/.test(relative)
+                    || !samePath(path.resolve(gitdir, relative.trimEnd()), common))
+                    throw new Error('Git common directory changed');
+            }
+        }
+        for (const name of ['config', 'config.worktree', 'commondir']) await control(path.join(common, name));
+        if (before) {
+            const names = [];
+            const handle = await fs.opendir(registrations);
+            for await (const child of handle) {
+                if (names.length >= 128 || !child.isDirectory() || child.isSymbolicLink())
+                    throw new Error('Git registration limit or link');
+                names.push(child.name);
+            }
+            for (const name of names.sort()) {
+                const entry = path.join(registrations, name);
+                if (!(await control(entry))?.isDirectory()) throw new Error('Git registration changed');
+                for (const file of ['gitdir', 'commondir', 'HEAD', 'locked', 'config', 'config.worktree', 'prunable'])
+                    await control(path.join(entry, file));
+            }
+            if (!unchanged(before, await fs.lstat(registrations))) throw new Error('Git registrations changed');
+        }
+        return JSON.stringify(parts);
+    }
+
+    async function fingerprint(desktop, active, git) {
+        try { return await gitFingerprint(desktop, active, git); }
+        catch { return null; }
+    }
+
+    async function association(desktop, active, cacheAllowed = true) {
         if (!await nestedGit(desktop, active)) return ['desktop', desktop.path, desktop.identity];
+        const key = JSON.stringify([desktop.path, desktop.identity, active.path, active.identity]);
+        const time = now(), cached = gitAssociations.get(key);
+        if (cacheAllowed && cached) {
+            if (time >= cached.time && time - cached.time < gitTtl
+                && await fingerprint(desktop, active, cached.git) === cached.fingerprint) {
+                const checked = now();
+                if (checked >= time && checked - cached.time < gitTtl) return cached.git;
+            }
+            if (gitAssociations.get(key) === cached) gitAssociations.delete(key);
+        }
         const [[sourceCommon, sourceTop], [activeCommon, activeTop]] = await Promise.all([
             gitDirectories(desktop.path), gitDirectories(active.path)]);
         if (!samePath(sourceCommon.path, activeCommon.path) || sourceCommon.identity !== activeCommon.identity
             || !contains(sourceTop.path, desktop.path) || !contains(activeTop.path, active.path))
             throw new Error('Unrelated Git workspace');
+        const git = ['git', sourceCommon.path, sourceCommon.identity, sourceTop.path, sourceTop.identity,
+            activeTop.path, activeTop.identity];
+        const before = gitTtl && cacheAllowed ? await fingerprint(desktop, active, git) : null;
         const output = await run('git', ['-C', desktop.path, 'worktree', 'list', '--porcelain', '-z']);
         const registered = output.split('\0').filter(field => field.startsWith('worktree ')).map(field => field.slice(9));
         if (!registered.some(value => samePath(value, sourceTop.path))
             || !registered.some(value => samePath(value, activeTop.path))) throw new Error('Unregistered Git workspace');
-        return ['git', sourceCommon.path, sourceCommon.identity, sourceTop.path, sourceTop.identity,
-            activeTop.path, activeTop.identity];
+        if (before !== null) {
+            if (before !== await fingerprint(desktop, active, git))
+                return association(desktop, active, false);
+            const checked = now();
+            if (checked < time) return git;
+            if (gitAssociations.size >= 32 && !gitAssociations.has(key))
+                gitAssociations.delete(gitAssociations.keys().next().value);
+            gitAssociations.set(key, { git, fingerprint: before, time: checked });
+        }
+        return git;
     }
 
     async function inspect(binding, relocationCwd) {
@@ -247,7 +373,8 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             return !!current && !current.unavailable && current.evidenceKey === resolved.evidenceKey;
         } };
     }
-    // Each call owns a complete fresh proof, including its final registry/root recheck.
+    // Each call owns fresh registry/root checks. Git association reuse is separately
+    // bounded by its TTL and unchanged control fingerprint.
     resolveWorkspace.resolveVerified = inspect;
     // Historical markers must not initiate network or device namespace probes.
     resolveWorkspace.resolveRelocationVerified = (binding, cwd) => typeof cwd === 'string' && path.isAbsolute(cwd)

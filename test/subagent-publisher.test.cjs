@@ -139,6 +139,22 @@ test('a child collection or destination failure cannot invalidate parent or sibl
     assert.equal((await f.snapshot('a')).agentId, 'b');
 });
 
+test('incomplete child refresh preserves the shared revision until membership changes', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const committed = await f.snapshot('a');
+    f.samples.set('a', { status: 'incomplete', usageComplete: false });
+    await f.publisher.start();
+    const read = await f.publisher.readLocal(LOCAL, { agentId: 'a' });
+    assert.equal(read.status, 'ok');
+    assert.equal(read.snapshotRevision, committed.revision);
+    assert.deepEqual(await f.snapshot('a'), committed);
+    f.setAgents(['b']);
+    await f.publisher.start();
+    assert.equal((await f.publisher.readLocal(LOCAL, { agentId: 'a' })).status, 'unavailable');
+    await assert.rejects(fs.stat(f.destination('a')), { code: 'ENOENT' });
+});
+
 test('child ownership rejects parent, foreign agent, organization and replayed payloads', async t => {
     for (const tamper of ['parent', 'agent', 'org', 'revision']) await t.test(tamper, async t => {
         const f = await fixture(t);
@@ -296,7 +312,10 @@ for (const blockedStage of ['discovery', 'collection']) test(`hung child ${block
         await within(ready);
         const first = await waitForSnapshot(f);
         time += 10001;
-        const next = await waitForSnapshot(f, undefined, snapshot => snapshot.revision > first.revision);
+        // A sample collected before the clock advance may still finish publishing.
+        // Wait for the next heartbeat's sample, not merely another publication.
+        const next = await waitForSnapshot(f, undefined, snapshot => snapshot.revision > first.revision
+            && snapshot.generatedAt === time);
         assert.equal(next.generatedAt, time);
         assert.ok(parentCalls >= 2);
         assert.equal((await within(f.publisher.readLocal(LOCAL, { waitForPoll: false }))).status, 'ok');
@@ -547,6 +566,144 @@ test('foreground exact requests for unknown children remain excluded by post-sam
     assert.equal((await f.snapshot('known')).stats.turns, 2);
     await assert.rejects(fs.stat(f.destination('unknown')), { code: 'ENOENT' });
     assert.equal((await f.publisher.readLocal(LOCAL, { agentId: 'unknown', waitForPoll: false })).status, 'unavailable');
+});
+
+test('an unchanged parent rediscovery during child membership confirmation preserves the fresh sample', async t => {
+    let armed = false, sampled = false, entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { store: {
+        async getStats() { return STATS; },
+        async listAgents() {
+            if (armed && sampled) { entered(); await blocked; }
+            return ['a'];
+        },
+        async getAgentStats() {
+            sampled = armed;
+            return { ...STATS, turns: armed ? 9 : 2 };
+        },
+    } });
+    await f.publisher.start();
+    const previous = await f.snapshot('a');
+    armed = true;
+    const read = f.publisher.readLocal(LOCAL, { agentId: 'a' });
+    try {
+        await within(ready);
+        assert.equal((await within(f.publisher.readLocal(LOCAL))).status, 'ok');
+    } finally { release(); }
+    const refreshed = await within(read);
+    assert.equal(refreshed.status, 'ok');
+    assert.equal(refreshed.turns, 9);
+    assert.ok(refreshed.snapshotRevision > previous.revision);
+    assert.equal((await f.snapshot('a')).stats.turns, 9);
+});
+
+test('a superseded failed parent confirmation preserves the recovered child publication', async t => {
+    let armed = false, sampled = false, unavailable = false, entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { resolveWorkspace: async binding => ({
+        workspaceRoot: binding.workspaceRoot, evidenceKey: 'stable', verify: async () => !unavailable,
+    }), store: {
+        async getStats() { return STATS; },
+        async listAgents() {
+            if (armed && sampled) { entered(); await blocked; }
+            return ['a'];
+        },
+        async getAgentStats() {
+            sampled = armed;
+            unavailable = armed;
+            return { ...STATS, turns: armed ? 9 : 2 };
+        },
+    } });
+    await f.publisher.start();
+    const previous = await f.snapshot('a');
+    armed = true;
+    const read = f.publisher.readLocal(LOCAL, { agentId: 'a' });
+    try {
+        await within(ready);
+        unavailable = false;
+        assert.equal((await within(f.publisher.readLocal(LOCAL))).status, 'ok');
+    } finally { release(); }
+    const recovered = await within(read);
+    assert.equal(recovered.status, 'ok');
+    assert.equal(recovered.turns, 2);
+    assert.equal(recovered.snapshotRevision, previous.revision);
+    assert.deepEqual(await f.snapshot('a'), previous);
+});
+
+test('a new fast child selection queues immediately and repeated selection reads do not resample', async t => {
+    let calls = 0;
+    const f = await fixture(t, { store: {
+        async getStats() { return STATS; }, async listAgents() { return ['a']; },
+        async getAgentStats() { calls++; return { ...STATS, turns: calls === 1 ? 2 : 9 }; },
+    } });
+    assert.equal((await f.publisher.readLocal(LOCAL, { agentId: 'a', waitForPoll: false })).status, 'unavailable');
+    const first = await waitForSnapshot(f, 'a');
+    const deadline = Date.now() + 1000;
+    while ((await f.publisher.readLocal(LOCAL, { agentId: 'a', waitForPoll: false })).status !== 'ok') {
+        if (Date.now() >= deadline) throw new Error('Selected child publication did not commit');
+        await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    for (let index = 0; index < 3; index++)
+        assert.equal((await f.publisher.readLocal(LOCAL, { agentId: 'a', waitForPoll: false })).status, 'ok');
+    // Complete another discovery cohort after the fast reads; any incorrectly
+    // queued child request would now have begun its extra collection.
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'ok');
+    assert.equal(calls, 1);
+    assert.deepEqual(await f.snapshot('a'), first);
+});
+
+for (const [change, reason] of [['duplicate', 'metadata ambiguity'], ['root', 'workspace root'],
+    ['evidence', 'workspace evidence'], ['negative', 'failed confirmation']])
+test(`child membership confirmation cannot override newer parent ${reason}`, async t => {
+    let armed = false, sampled = false, entered, release, evidence = 'initial', unavailable = false;
+    let failNextParent = false;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, {
+        ...(change === 'evidence' || change === 'negative' ? { resolveWorkspace: async binding => ({
+            workspaceRoot: binding.workspaceRoot, evidenceKey: evidence, verify: async () => !unavailable,
+        }) } : {}),
+        store: {
+            async getStats() { if (failNextParent) unavailable = true; return STATS; },
+            async listAgents() {
+                if (armed && sampled) { entered(); await blocked; }
+                return ['a'];
+            },
+            async getAgentStats() {
+                sampled = armed;
+                return { ...STATS, turns: armed ? 9 : 2 };
+            },
+        },
+    });
+    await f.publisher.start();
+    const previous = await f.snapshot('a');
+    armed = true;
+    const read = f.publisher.readLocal(LOCAL, { agentId: 'a' });
+    try {
+        await within(ready);
+        if (change === 'duplicate') {
+            const other = path.join(f.claudeData, 'claude-code-sessions', CLI, ORG);
+            await fs.mkdir(other, { recursive: true });
+            await fs.writeFile(path.join(other, `${LOCAL}.json`), JSON.stringify(f.row));
+        } else if (change === 'root') {
+            const relocated = path.join(f.root, 'relocated');
+            await fs.mkdir(relocated);
+            await f.write({ ...f.row, cwd: relocated });
+        } else if (change === 'evidence') evidence = 'replacement';
+        else failNextParent = true;
+        await within(f.publisher.readLocal(LOCAL));
+        // Even if the native proof recovers, an older confirmation must not
+        // erase the newer failed confirmation's negative marker.
+        unavailable = false;
+    } finally { release(); }
+    assert.notEqual((await within(read))?.status, 'ok');
+    const remaining = await f.snapshot('a').catch(error => {
+        if (error.code !== 'ENOENT') throw error;
+        return null;
+    });
+    if (remaining) assert.deepEqual(remaining, previous);
 });
 
 test('a child batch confirms only its target workspace and preserves unrelated parent publications', async t => {

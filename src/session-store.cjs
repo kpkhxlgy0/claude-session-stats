@@ -37,6 +37,7 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         ? [path.join(claudeHome, 'projects')]
         : [];
     const sessions = new Map();
+    const sampleProofs = new WeakMap();
     const resolveSource = createSessionSourceResolver();
     const subagents = createSubagentStore({ claudeHome, createMetrics: makeMetrics, locateSource });
     let index = new Map();
@@ -59,6 +60,70 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         }
         if (entry && entry.hasFork) stats.tps = entry.forkTps;
         return { ...stats, status, threadId };
+    }
+
+    function operationScope(context)
+    {
+        let active = true;
+        const workspaceRoot = context?.workspaceRoot, verify = context?.verify;
+        const resolveRelocation = context?.resolveRelocation;
+        const valid = () => active && !disposed && (!context
+            || context.workspaceRoot === workspaceRoot && context.verify === verify
+                && context.resolveRelocation === resolveRelocation);
+        const assert = () => { if (!valid()) throw new Error('Session operation changed'); };
+        return {
+            context: context && { workspaceRoot, verify: valid,
+                ...(typeof resolveRelocation === 'function' ? { resolveRelocation: async cwd => {
+                    assert();
+                    const evidence = await resolveRelocation.call(context, cwd);
+                    assert();
+                    return evidence;
+                } } : {}) },
+            assert,
+            async current() {
+                assert();
+                if (context && await verify.call(context) !== true) throw new Error('Session workspace unavailable');
+                assert();
+            },
+            close() { active = false; },
+        };
+    }
+
+    async function safeDirectory(directory)
+    {
+        const link = await fs.lstat(directory), target = await fs.stat(directory);
+        if (!target.isDirectory()) throw new Error('Unsafe session directory');
+        // Preserve configured directory aliases while detecting link/target replacement.
+        return JSON.stringify([link.dev, link.ino, link.birthtimeMs,
+            target.dev, target.ino, target.birthtimeMs, await fs.realpath(directory)]);
+    }
+
+    async function safeFile(file)
+    {
+        const info = await fs.lstat(file);
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error('Unsafe session file');
+        return version(info);
+    }
+
+    async function sampleProof(entry, source, operation)
+    {
+        const files = new Map(), directories = new Map();
+        const parents = new Set([entry.path, ...(source.parentPaths || [])]);
+        for (const file of parents) files.set(file, await safeFile(file));
+        if (files.get(entry.path) !== entry.version) throw Object.assign(new Error('Session sample changed'), { code: 'ESTALE' });
+        for (const directory of new Set([...roots, ...[...parents].map(file => path.dirname(file)),
+            ...(operation.context ? [operation.context.workspaceRoot] : [])]))
+            directories.set(directory, await safeDirectory(directory));
+        return { files, directories, path: entry.path, operation };
+    }
+
+    async function confirmFiles(proof)
+    {
+        // No caller callbacks here: this also runs after the final expensive proof.
+        for (const [directory, stamp] of proof.directories)
+            if (await safeDirectory(directory) !== stamp) throw new Error('Session directory changed');
+        for (const [file, stamp] of proof.files)
+            if (await safeFile(file) !== stamp) throw new Error('Session source changed');
     }
 
     function reset(entry)
@@ -297,7 +362,7 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         }
     }
 
-    async function poll(entry)
+    async function poll(entry, operation)
     {
         const forkBudget = { nodes: 0, bytes: 0 };
         for (let attempt = 0; attempt < 2; attempt++)
@@ -326,21 +391,27 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                 }
                 if (version(await fs.lstat(entry.path)) !== entry.version)
                     throw Object.assign(new Error('Session changed during sample'), { code: 'ESTALE' });
+                const proof = await sampleProof(entry, source, operation);
                 if (source.verify && !await source.verify())
                     throw Object.assign(new Error('Session source proof changed'), { code: 'ESTALE' });
                 // Missing lineage proof affects TPS only; existing counters remain usable.
-                return result(entry.id, entry.corrupt ? 'incomplete' : 'ok', entry);
+                const stats = result(entry.id, entry.corrupt ? 'incomplete' : 'ok', entry);
+                sampleProofs.set(stats, proof);
+                return stats;
             }
             catch (error)
             {
                 if (error.code !== 'ENOENT' && error.code !== 'ESTALE') throw error;
-                reset(entry);
                 if (error.code === 'ENOENT')
                 {
+                    reset(entry);
                     index.delete(entry.id);
                     entry.path = await locate(entry.id, entry.context);
                     if (!entry.path) return result(entry.id, 'not-found');
                 }
+                // An append can race the final version check. Keep the incremental
+                // cursor; read() still resets on replacement, truncation or changed
+                // prefix guards, and all source/fork proofs run again on the retry.
                 if (attempt) return result(entry.id, 'incomplete');
             }
         }
@@ -355,14 +426,10 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
             || typeof context.verify !== 'function')) return result(threadId, 'unavailable');
         const cacheKey = JSON.stringify([threadId, context?.workspaceRoot || null]);
         let entry;
-        async function current()
-        {
-            try { return !context || await context.verify() === true; }
-            catch { return false; }
-        }
+        const operation = operationScope(context);
         try
         {
-            if (!await current()) return result(threadId, 'unavailable');
+            await operation.current();
             entry = sessions.get(cacheKey);
             if (!entry)
             {
@@ -372,24 +439,48 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                     if (!idle) return result(threadId, 'unavailable');
                     sessions.delete(idle[0]);
                 }
-                entry = { id: threadId, path: null, context };
+                entry = { id: threadId, path: null, context: operation.context };
                 reset(entry);
             }
             sessions.delete(cacheKey);
             sessions.set(cacheKey, entry);
             if (!entry.inFlight)
             {
-                entry.context = context;
-                entry.inFlight = poll(entry).then(stats => disposed ? result(threadId, 'unavailable') : stats)
+                entry.context = operation.context;
+                entry.inFlight = poll(entry, operation).then(stats => disposed ? result(threadId, 'unavailable') : stats)
                     .catch(() => result(threadId, 'unavailable'))
                     .finally(() => { entry.inFlight = null; });
             }
             const stats = await entry.inFlight;
-            return !disposed && await current() ? stats : result(threadId, 'unavailable');
+            operation.assert();
+            const proof = sampleProofs.get(stats);
+            const proofs = proof ? [proof] : [];
+            if (proof)
+            {
+                if (proof.operation !== operation)
+                {
+                    // A shared reader never grants another waiter its caller binding.
+                    const source = await locateSource(threadId, operation.context);
+                    if (source?.path !== proof.path)
+                        throw new Error('Session waiter source changed');
+                    const waiterProof = await sampleProof({ path: proof.path, version: proof.files.get(proof.path) }, source, operation);
+                    if (source.verify && !await source.verify()) throw new Error('Session waiter source changed');
+                    proofs.push(waiterProof);
+                }
+                for (const sample of proofs) await confirmFiles(sample);
+            }
+            await operation.current();
+            for (const sample of proofs) await confirmFiles(sample);
+            operation.assert();
+            return stats;
         }
         catch
         {
             return result(threadId, 'unavailable');
+        }
+        finally
+        {
+            operation.close();
         }
     }
 

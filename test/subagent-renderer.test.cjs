@@ -150,6 +150,27 @@ test('multiple child panes keep independent identities and metric bars', async t
     assert.notEqual(f.selected.root.dataset.sessionStatsKey, other.root.dataset.sessionStatsKey);
 });
 
+test('resuming the selected child keeps its mounted footer when task metadata moves to a new call', async t => {
+    for (const remote of [false, true]) await t.test(remote ? 'remote' : 'local', async t => {
+        const f = fixture(t, { remote }); f.run(); await tick();
+        const bar = f.selected.root.querySelector('[data-session-stats-agent]');
+        assert.match(bar.textContent, /5 steps/);
+        const view = f.selected.root.__reactFiber$fixture.child;
+        const props = view.sibling.memoizedProps;
+        props.paneView = { ...props.paneView, callId: view.memoizedProps.view.toolUseId, isResumed: true };
+        props.task = { ...props.task, toolUseId: 'toolu_new_resume_call' };
+        f.setReply(payload => ({ ...sample, threadId: payload.sessionId, agentId: payload.agentId,
+            steps: 8, ...(remote ? { source: 'remote_control' } : {}) }));
+        f.selected.root.querySelector('.transcript').textContent = 'Resumed task';
+        for (let pass = 0; pass < 3; pass++) {
+            await tick();
+            assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), bar);
+            assert.match(bar.textContent, /8 steps/);
+            assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+        }
+    });
+});
+
 test('local and remote child bars survive long transcript growth and recover after a conflicting binding clears', async t => {
     for (const remote of [false, true]) await t.test(remote ? 'remote' : 'local', async t => {
         const f = fixture(t, { remote });
