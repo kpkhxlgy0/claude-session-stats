@@ -215,7 +215,7 @@ test('global child capacity is bounded independently from parent publication', a
 
 test('real incremental child logs publish separate samples and replay never changes their counts', async t => {
     const { createSessionStore } = require('../src/session-store.cjs');
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-agent-published-log-'));
+    const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-agent-published-log-')));
     const store = createSessionStore({ claudeHome: home });
     t.after(async () => { store.dispose(); await fs.rm(home, { recursive: true, force: true }); });
     const f = await fixture(t, { store });

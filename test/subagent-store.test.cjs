@@ -20,7 +20,7 @@ function user(fields = {}) {
 }
 function lines(...rows) { return rows.map(row => JSON.stringify(row) + '\n').join(''); }
 async function setup(t, options = {}) {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-subagent-'));
+    const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-subagent-')));
     const directory = path.join(home, 'projects', 'project');
     const subagents = path.join(directory, ID, 'subagents');
     await fs.mkdir(subagents, { recursive: true });
