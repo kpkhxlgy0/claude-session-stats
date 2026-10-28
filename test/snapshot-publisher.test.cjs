@@ -90,6 +90,166 @@ test('timer publishes changed data with no local tab read', async t => {
     });
 });
 
+test('a sample delayed by identity confirmation keeps its original collection time', async t => {
+    let time = 100000, sampled = false;
+    const f = await fixture(t, { now: () => time,
+        resolveWorkspace: async () => { if (sampled) time = 200000; return null; },
+        store: { async getStats() { sampled = true; return STATS; } } });
+    await f.publisher.start();
+    assert.equal((await f.snapshot()).generatedAt, 100000);
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
+    await f.publisher.start();
+    assert.equal((await f.snapshot()).generatedAt, 200000);
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
+});
+
+test('same-parent checks wait for the next fresh cohort instead of joining a proof already in progress', async t => {
+    let f, probing = false, blockRead = false, enteredRead, releaseRead;
+    const readReady = new Promise(resolve => { enteredRead = resolve; });
+    const blockedRead = new Promise(resolve => { releaseRead = resolve; });
+    const gates = [], events = [];
+    f = await fixture(t, { resolveWorkspace: async () => {
+        if (probing) {
+            const number = gates.length + 1;
+            events.push(`proof-${number}`);
+            await new Promise(resolve => { gates.push(resolve); });
+        }
+        return { workspaceRoot: f.workspace, evidenceKey: 'stable-proof', verify: async () => true };
+    } });
+    await f.publisher.start();
+    const originalOpen = fs.open;
+    t.mock.method(fs, 'open', async (file, ...args) => {
+        const handle = await originalOpen(file, ...args);
+        if (file !== f.destination) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...readArgs) => {
+            const result = await handle.read(...readArgs);
+            if (blockRead) {
+                blockRead = false; enteredRead(); await blockedRead;
+                events.push('snapshot-read-complete');
+            }
+            return result;
+        } };
+    });
+    const untilGate = async count => {
+        const deadline = Date.now() + 500;
+        while (gates.length < count) {
+            if (Date.now() >= deadline) throw new Error('Expected a new fresh identity proof');
+            await new Promise(resolve => setTimeout(resolve, 2));
+        }
+    };
+    probing = true; blockRead = true;
+    const first = f.publisher.readLocal(LOCAL, { waitForPoll: false });
+    let second, third;
+    try {
+        await untilGate(1);
+        second = f.publisher.readLocal(LOCAL, { waitForPoll: false });
+        third = f.publisher.readLocal(LOCAL, { waitForPoll: false });
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(gates.length, 1);
+        gates[0]();
+        await within(readReady);
+        await untilGate(2);
+        releaseRead();
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.equal(gates.length, 2);
+        gates[1]();
+        await untilGate(3);
+        assert.ok(events.indexOf('proof-2') < events.indexOf('snapshot-read-complete'));
+        assert.ok(events.indexOf('proof-3') > events.indexOf('snapshot-read-complete'));
+    } finally {
+        probing = false; releaseRead();
+        for (const release of gates) release();
+    }
+    for (const sample of await Promise.all([first, second, third])) assert.equal(sample.status, 'ok');
+});
+
+test('an unchanged sample before heartbeat performs no snapshot I/O or redundant publication proof', async t => {
+    let time = 100000, sampled = false, confirmation = false, redundantProofs = 0;
+    const f = await fixture(t, { now: () => time, resolveWorkspace: async () => {
+        if (sampled) { if (confirmation) redundantProofs++; else confirmation = true; }
+        return null;
+    }, store: { async getStats() { sampled = true; return STATS; } } });
+    await f.publisher.start();
+    const first = await f.snapshot();
+    sampled = false; confirmation = false; redundantProofs = 0;
+    let snapshotOpens = 0;
+    const originalOpen = fs.open;
+    t.mock.method(fs, 'open', async (file, ...args) => {
+        if (file === f.destination) snapshotOpens++;
+        return originalOpen(file, ...args);
+    });
+    await f.publisher.start();
+    assert.equal(snapshotOpens, 0);
+    assert.equal(redundantProofs, 0);
+    assert.deepEqual(await f.snapshot(), first);
+    const beforeRead = snapshotOpens;
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
+    assert.ok(snapshotOpens > beforeRead);
+    const beforeHeartbeat = snapshotOpens;
+    time += 10000;
+    await f.publisher.start();
+    assert.ok(snapshotOpens > beforeHeartbeat);
+    assert.equal((await f.snapshot()).generatedAt, time);
+});
+
+test('global discovery cohorts never reuse a scan begun before their caller or sampled data', async t => {
+    let probing = false, releaseSample;
+    const blockedSample = new Promise(resolve => { releaseSample = resolve; });
+    const events = [], gates = [];
+    const f = await fixture(t, { store: {
+        async getStats() {
+            if (probing) { await blockedSample; events.push('sample-complete'); }
+            return STATS;
+        },
+        async listAgents() { return []; }, async getAgentStats() { return STATS; },
+    } });
+    await f.publisher.start();
+    const sessionsRoot = path.dirname(path.dirname(path.dirname(f.metadata)));
+    const originalOpendir = fs.opendir;
+    t.mock.method(fs, 'opendir', async (directory, ...args) => {
+        if (directory === sessionsRoot && probing) {
+            events.push(`scan-${gates.length + 1}`);
+            await new Promise(resolve => { gates.push(resolve); });
+        }
+        return originalOpendir(directory, ...args);
+    });
+    const untilGate = async count => {
+        const deadline = Date.now() + 500;
+        while (gates.length < count) {
+            if (Date.now() >= deadline) throw new Error('Expected a new global identity scan');
+            await new Promise(resolve => setTimeout(resolve, 2));
+        }
+    };
+    probing = true;
+    const background = f.publisher.start();
+    let selected, prioritized;
+    try {
+        await untilGate(1);
+        selected = f.publisher.readLocal(LOCAL, { agentId: 'missing' });
+        await f.publisher.readLocal(LOCAL, { waitForPoll: false });
+        prioritized = f.publisher.start();
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(gates.length, 1);
+        gates[0]();
+        await untilGate(2);
+        releaseSample();
+        const deadline = Date.now() + 500;
+        while (!events.includes('sample-complete')) {
+            if (Date.now() >= deadline) throw new Error('Parent sampling did not finish');
+            await new Promise(resolve => setTimeout(resolve, 2));
+        }
+        assert.ok(events.indexOf('scan-2') < events.indexOf('sample-complete'));
+        gates[1]();
+        await untilGate(3);
+        assert.ok(events.indexOf('scan-3') > events.indexOf('sample-complete'));
+    } finally {
+        probing = false;
+        releaseSample();
+        for (const release of gates) release();
+        await Promise.all([background, selected, prioritized]);
+    }
+});
+
 async function within(promise, timeoutMs = 500) {
     let timer;
     try {
@@ -97,6 +257,16 @@ async function within(promise, timeoutMs = 500) {
             timer = setTimeout(() => reject(new Error('Local snapshot read waited for background collection')), timeoutMs);
         })]);
     } finally { clearTimeout(timer); }
+}
+
+async function committedLocal(f) {
+    const deadline = Date.now() + 1000;
+    for (;;) {
+        const sample = await f.publisher.readLocal(LOCAL, { waitForPoll: false });
+        if (sample?.status === 'ok') return sample;
+        if (Date.now() >= deadline) throw new Error('A fast parent did not publish independently');
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
 }
 
 const SECOND_LOCAL = 'local_11111111-1111-4111-8111-111111111111';
@@ -113,7 +283,85 @@ async function addDuplicate(f) {
     await fs.writeFile(path.join(directory, LOCAL + '.json'), JSON.stringify(f.row));
 }
 
-test('requested cold target publishes all bridges before unrelated collection, then warm polls stay global', async t => {
+test('switching the selected parent releases the old wait without blocking background parents', async t => {
+    let entered, release, selected = false, time = 100000;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { now: () => time, pollMs: 5, store: { async getStats(id) {
+        if (id === CLI) { entered(); await blocked; }
+        return { ...STATS, turns: id === SECOND_CLI && selected ? 9 : 2 };
+    } } });
+    await addUnrelated(f);
+    const thirdLocal = 'local_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    await fs.writeFile(path.join(path.dirname(f.metadata), thirdLocal + '.json'), JSON.stringify({ ...f.row,
+        sessionId: thirdLocal, cliSessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bridgeSessionIds: ['session_third'] }));
+    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
+    const starting = f.publisher.start();
+    try {
+        await within(ready);
+        const deadline = Date.now() + 500;
+        const third = path.join(f.directory, 'session_third.json');
+        while (!await fs.stat(third).then(() => true, () => false)) {
+            if (Date.now() >= deadline) throw new Error('A selected hung parent blocked unrelated background parents');
+            await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        selected = true; time += 10001;
+        await f.publisher.readLocal(SECOND_LOCAL, { waitForPoll: false });
+        const target = path.join(f.directory, 'session_unrelated.json');
+        await within((async () => {
+            while (JSON.parse(await fs.readFile(target, 'utf8')).stats.turns !== 9)
+                await new Promise(resolve => setTimeout(resolve, 5));
+        })());
+    } finally { release(); await starting; }
+});
+
+test('an older queued missing-parent prune cannot remove a newer valid publication', async t => {
+    let time = 100000, writing = false, absent = false, restored = false;
+    let enteredWrite, releaseWrite, sawMissing, sawRestored;
+    const writingReady = new Promise(resolve => { enteredWrite = resolve; });
+    const blockedWrite = new Promise(resolve => { releaseWrite = resolve; });
+    const missingReady = new Promise(resolve => { sawMissing = resolve; });
+    const restoredReady = new Promise(resolve => { sawRestored = resolve; });
+    let sample = STATS;
+    const f = await fixture(t, { now: () => time, store: {
+        async getStats() { return sample; },
+        async listAgents() { if (restored) sawRestored(); return []; },
+        async getAgentStats() { return STATS; },
+    } });
+    await f.publisher.start();
+    const originalRename = fs.rename, originalLstat = fs.lstat;
+    const sessionsRoot = path.dirname(path.dirname(path.dirname(f.metadata)));
+    let missingChecks = 0;
+    t.mock.method(fs, 'rename', async (source, destination) => {
+        if (destination === f.destination && writing) { enteredWrite(); await blockedWrite; }
+        return originalRename(source, destination);
+    });
+    t.mock.method(fs, 'lstat', async (file, ...args) => {
+        const result = await originalLstat(file, ...args);
+        if (absent && file === sessionsRoot && ++missingChecks >= 2) sawMissing();
+        return result;
+    });
+    time += 10001; sample = { ...STATS, turns: 9 }; writing = true;
+    const updating = f.publisher.start();
+    let missingRead, restoring;
+    try {
+        await within(writingReady);
+        await f.write({ ...f.row, remoteControlUserEnabled: false });
+        absent = true;
+        missingRead = f.publisher.readLocal(LOCAL, { agentId: 'unknown' });
+        await within(missingReady);
+        await new Promise(resolve => setImmediate(resolve));
+        absent = false;
+        await f.write(f.row);
+        restored = true;
+        restoring = f.publisher.start();
+        await within(restoredReady);
+    } finally { releaseWrite(); await Promise.all([updating, missingRead, restoring]); }
+    assert.equal((await f.snapshot()).stats.turns, 9);
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
+});
+
+test('requested targets publish independently on cold and warm polls while global sampling continues', async t => {
     let entered, release, block = true;
     const ready = new Promise(resolve => { entered = resolve; });
     const wait = new Promise(resolve => { release = resolve; });
@@ -139,7 +387,7 @@ test('requested cold target publishes all bridges before unrelated collection, t
     await within(ready);
     let fresh;
     try {
-        assert.equal((await within(f.publisher.readLocal(LOCAL, { waitForPoll: false }))).status, 'ok');
+        assert.equal((await committedLocal(f)).status, 'ok');
         assert.equal((await f.snapshot()).stats.turns, 2);
         const second = JSON.parse(await fs.readFile(path.join(f.directory, 'session_target_second.json'), 'utf8'));
         assert.equal(second.stats.turns, 2);
@@ -155,13 +403,13 @@ test('requested cold target publishes all bridges before unrelated collection, t
     assert.equal(discoveries, 3);
     block = false; calls.length = 0; discoveries = 0;
     await f.publisher.start();
-    assert.deepEqual(calls, [SECOND_CLI, CLI]);
+    assert.deepEqual(calls, [CLI, SECOND_CLI]);
     assert.equal(discoveries, 2);
     sample = { status: 'unavailable', usageComplete: false };
     await f.publisher.start();
     calls.length = 0; discoveries = 0;
     await f.publisher.start();
-    assert.deepEqual(calls, [SECOND_CLI, CLI]);
+    assert.deepEqual(calls, [CLI, SECOND_CLI]);
     assert.equal(discoveries, 2);
 });
 
@@ -197,7 +445,7 @@ test('the final global confirmation invalidates an early priority sample when a 
     const poll = f.publisher.start();
     await within(ready);
     try {
-        assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
+        assert.equal((await committedLocal(f)).status, 'ok');
         await addDuplicate(f);
     } finally { release(); await poll; }
     assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'unavailable');
@@ -220,6 +468,7 @@ test('final priority invalidation forgets a migrated workspace without reopening
     await within(ready);
     let oldSample;
     try {
+        await committedLocal(f);
         oldSample = await f.snapshot();
         const next = path.join(f.root, 'next-workspace');
         await fs.mkdir(next); currentRoot = next;
@@ -253,7 +502,7 @@ test('lost workspace proof after early publication stays unavailable until a fre
     const poll = f.publisher.start();
     await within(ready);
     try {
-        assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
+        assert.equal((await committedLocal(f)).status, 'ok');
         unsafe = true;
     } finally { release(); await poll; }
     assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'unavailable');
@@ -618,8 +867,8 @@ async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, sta
     });
     const originalOpen = fs.open;
     t.mock.method(fs, 'open', async (file, flags, ...args) => {
-        // The unchanged poll reads once; pause its caller's subsequent local validation.
-        if (!released && file === destination && flags === 'r' && ++reads === 2) {
+        // Pause the local validation itself; unchanged sampling no longer opens the snapshot.
+        if (!released && file === destination && flags === 'r' && ++reads === 1) {
             const pause = async () => { paused = true; armHold(); entered(); await wait; };
             if (stage === 'after-close') {
                 const handle = await originalOpen(file, flags, ...args);
@@ -632,7 +881,7 @@ async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, sta
         return originalOpen(file, flags, ...args);
     });
     t.after(release);
-    const read = f.publisher.readLocal(LOCAL);
+    const read = f.publisher.readLocal(LOCAL, { waitForPoll: false });
     const local = Promise.race([read, deadline]);
     void local.catch(() => {});
     try {

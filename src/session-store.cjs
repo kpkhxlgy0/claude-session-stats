@@ -172,7 +172,8 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         const candidates = index.get(threadId);
         if (!candidates?.length) return null;
         if (candidates.length === 1) return { path: candidates[0] };
-        return await resolveSource(threadId, candidates, context) || { incomplete: true };
+        const source = await resolveSource(threadId, candidates, context);
+        return source ? { ...source, parentPaths: [...candidates] } : { incomplete: true };
     }
 
     async function locate(threadId, context)
@@ -400,7 +401,8 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         index.clear();
     }
 
-    return { getStats, getAgentStats: subagents.getAgentStats, listAgents: subagents.listAgents, dispose };
+    return { getStats, getAgentStats: subagents.getAgentStats,
+        getAgentStatsBatch: subagents.getAgentStatsBatch, listAgents: subagents.listAgents, dispose };
 }
 
 module.exports = { createSessionStore };

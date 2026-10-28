@@ -165,6 +165,49 @@ test('fresh verified resolver results are consumed once per discovery and rechec
     assert.equal(proofs, 2);
 });
 
+test('targeted discovery scans all identities but resolves only the requested immutable binding', async t => {
+    const f = await fixture(t);
+    await f.write();
+    await f.write({ ...f.row, sessionId: OTHER, cliSessionId: ACCOUNT, bridgeSessionIds: ['session_other'] }, ACCOUNT, ORG, OTHER);
+    const target = (await discoverSnapshotBindings(f.claudeData)).find(binding => binding.localSessionId === LOCAL);
+    const resolved = [];
+    const resolveWorkspace = async binding => { resolved.push(binding.localSessionId); return null; };
+    const bindings = await discoverSnapshotBindings(f.claudeData, { resolveWorkspace, onlyBindings: [target] });
+    assert.deepEqual(bindings.map(binding => binding.localSessionId), [LOCAL]);
+    assert.deepEqual(resolved, [LOCAL]);
+    resolved.length = 0;
+    assert.deepEqual(await discoverSnapshotBindings(f.claudeData, { resolveWorkspace,
+        onlyBindings: [{ ...target, cliSessionId: ACCOUNT }] }), []);
+    assert.deepEqual(resolved, []);
+});
+
+for (const conflict of ['local', 'bridge']) test(`targeted discovery still rejects a ${conflict} conflict outside its account scope`, async t => {
+    const f = await fixture(t);
+    await f.write();
+    const [target] = await discoverSnapshotBindings(f.claudeData);
+    await f.write({ ...f.row, sessionId: conflict === 'local' ? LOCAL : OTHER,
+        bridgeSessionIds: conflict === 'bridge' ? [BRIDGE] : ['session_conflict'] }, CLI, ORG,
+        conflict === 'local' ? LOCAL : OTHER);
+    const resolved = [];
+    assert.deepEqual(await discoverSnapshotBindings(f.claudeData, { onlyBindings: [target],
+        resolveWorkspace: async binding => { resolved.push(binding); return null; } }), []);
+    assert.deepEqual(resolved, []);
+});
+
+test('targeted discovery freshly resolves a changed root instead of filtering by old workspace evidence', async t => {
+    const f = await fixture(t);
+    await f.write();
+    const [target] = await discoverSnapshotBindings(f.claudeData);
+    const moved = path.join(f.root, 'moved');
+    await fs.mkdir(moved);
+    await f.write({ ...f.row, cwd: moved });
+    let supplied;
+    const [current] = await discoverSnapshotBindings(f.claudeData, { onlyBindings: [target],
+        resolveWorkspace: async binding => { supplied = binding.workspaceRoot; return null; } });
+    assert.equal(supplied, await fs.realpath(moved));
+    assert.equal(current.workspaceRoot, await fs.realpath(moved));
+});
+
 test('fresh verified resolver results still require a valid result shape', async t => {
     const f = await fixture(t);
     await f.write();

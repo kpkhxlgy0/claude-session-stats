@@ -134,6 +134,42 @@ test('multiple child panes keep independent identities and metric bars', async t
     assert.notEqual(f.selected.root.dataset.sessionStatsKey, other.root.dataset.sessionStatsKey);
 });
 
+test('local and remote child bars survive long transcript growth and recover after a conflicting binding clears', async t => {
+    for (const remote of [false, true]) await t.test(remote ? 'remote' : 'local', async t => {
+        const f = fixture(t, { remote });
+        f.run(); await tick();
+        const firstBar = f.selected.root.querySelector('[data-session-stats-agent]');
+        assert.ok(firstBar);
+        const host = f.selected.root.__reactFiber$fixture;
+        const detail = host.child.sibling;
+        const bubble = f.doc.createElement('div'); bubble.dataset.cdsBubbleStack = '';
+        f.selected.root.querySelector('.transcript').append(bubble);
+        const presentation = { tag: 5, stateNode: bubble, return: host,
+            memoizedProps: { 'data-cds-bubble-stack': '' } };
+        bubble.__reactFiber$fixture = presentation;
+        detail.sibling = presentation;
+        let previous = presentation;
+        for (let index = 0; index < 3101; index++) {
+            const child = { tag: 0, return: previous, memoizedProps: {} };
+            previous.child = child; previous = child;
+        }
+        for (let pass = 0; pass < 3; pass++) {
+            await tick();
+            assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), firstBar);
+            assert.match(firstBar.textContent, /1 turns.*5 steps/);
+        }
+        presentation.sibling = { tag: 0, return: host, memoizedProps: {
+            ...detail.memoizedProps, paneView: { agentId: 'conflicting_agent' },
+            task: { taskId: 'conflicting_agent', toolUseId: detail.memoizedProps.openedToolUseId },
+        } };
+        await tick();
+        assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), null);
+        presentation.sibling = null;
+        await tick();
+        assert.match(f.selected.root.querySelector('[data-session-stats-agent]').textContent, /1 turns.*5 steps/);
+    });
+});
+
 test('selection switches, task lists, hidden panes and remounts remove obsolete child bars', async t => {
     const f = fixture(t); const pending = [];
     f.setReply(payload => new Promise(resolve => pending.push({ payload, resolve })));

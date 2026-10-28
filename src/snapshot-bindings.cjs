@@ -128,8 +128,16 @@ async function resolveSnapshotRelocation(binding, relocationCwd, { resolveWorksp
     return typeof proof === 'string' ? proof : null;
 }
 
-async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavailableWorkspace } = {}) {
+function snapshotBindingIdentity(binding) {
+    return JSON.stringify([binding.accountId, binding.organizationId, binding.localSessionId,
+        binding.cliSessionId, binding.bridgeSessionId, binding.metadataFile]);
+}
+
+async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavailableWorkspace,
+    onlyBindings, onIdentityScan } = {}) {
     if (typeof claudeData !== 'string' || !path.isAbsolute(claudeData)) return [];
+    if (onlyBindings !== undefined && (!Array.isArray(onlyBindings) || onlyBindings.length > MaxRecords * 128)) return [];
+    const selected = onlyBindings === undefined ? null : new Set(onlyBindings.map(snapshotBindingIdentity));
     const found = [], localCounts = new Map(), bridgeCounts = new Map();
     let directoryCount = 0, entryCount = 0, recordCount = 0;
     async function* entries(directory) {
@@ -171,9 +179,12 @@ async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavai
             }
         }
     } catch { return []; }
+    const eligible = found.filter(binding => localCounts.get(binding.localSessionId) === 1
+        && bridgeCounts.get(binding.bridgeSessionId) === 1);
+    onIdentityScan?.(eligible);
     const resolved = [];
-    for (const binding of found) {
-        if (localCounts.get(binding.localSessionId) !== 1 || bridgeCounts.get(binding.bridgeSessionId) !== 1) continue;
+    for (const binding of eligible) {
+        if (selected && !selected.has(snapshotBindingIdentity(binding))) continue;
         const current = await resolveBindingWorkspace(binding, resolveWorkspace);
         if (current) resolved.push(current);
         else onUnavailableWorkspace?.(binding.localSessionId);
@@ -181,4 +192,4 @@ async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavai
     return resolved.sort((a, b) => a.metadataFile.localeCompare(b.metadataFile)
         || a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
-module.exports = { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation };
+module.exports = { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation, snapshotBindingIdentity };

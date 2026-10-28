@@ -44,6 +44,37 @@ function createSubagentBindings() {
     function sessionMatches(ref, selected) {
         return ref?.type === selected.type && ref.id === selected.sessionId;
     }
+    function rootFamily(fiber) {
+        const seen = new Set();
+        let top = fiber;
+        while (top?.return && seen.size < MaxNodes && !seen.has(top)) {
+            seen.add(top); top = top.return;
+        }
+        return top && !top.return && top.tag === 3 ? top.stateNode : null;
+    }
+    function messagePresentation(node, root, paneFiber) {
+        const element = node.stateNode, props = node.memoizedProps;
+        if (node.tag !== 5 || element?.nodeType !== 1 || !props
+            || !(Object.hasOwn(props, 'data-cds-bubble-stack') && element.matches('[data-cds-bubble-stack]')
+                || props['data-cds'] === 'AssistantMessage' && element.getAttribute('data-cds') === 'AssistantMessage')
+            || !root.contains(element)
+            || element.closest('[data-pane-root]') !== root) return false;
+        const keys = Object.getOwnPropertyNames(element).filter(key => key.startsWith('__reactFiber$'));
+        if (keys.length !== 1) return false;
+        const host = element[keys[0]];
+        if (host !== node && host !== node.alternate || host?.tag !== 5 || host.stateNode !== element
+            || host !== node && host.alternate !== node) return false;
+        const family = rootFamily(paneFiber);
+        if (!family || rootFamily(host) !== family) return false;
+        const alternate = paneFiber.alternate?.tag === 5 && paneFiber.alternate.stateNode === root
+            && paneFiber.alternate.alternate === paneFiber ? paneFiber.alternate : null;
+        const seen = new Set();
+        let parent = node.return;
+        while (parent && parent !== paneFiber && parent !== alternate && seen.size < MaxNodes && !seen.has(parent)) {
+            seen.add(parent); parent = parent.return;
+        }
+        return parent === paneFiber || alternate !== null && parent === alternate && rootFamily(alternate) === family;
+    }
     function resolveSubagent(root, win) {
         try {
             const selected = route(win);
@@ -65,6 +96,8 @@ function createSubagentBindings() {
                         && Object.hasOwn(props, 'sessionRef')) views.push(props);
                     if (Object.hasOwn(props, 'openedToolUseId') && props.paneView) details.push(props);
                 }
+                // Bubble descendants render message bodies; their sibling controls own pane identity.
+                if (messagePresentation(node, root, fiber)) continue;
                 // A pane's siblings belong to its parent; only descend through this pane's own children.
                 for (let child = node.child; child; child = child.sibling) {
                     if (stack.length + seen.size >= MaxNodes || stack.includes(child)) return null;

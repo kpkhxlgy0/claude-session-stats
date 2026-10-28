@@ -5,6 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const { createSessionStore } = require('../src/session-store.cjs');
+const { createSubagentStore } = require('../src/subagent-store.cjs');
+const { createMetrics } = require('../src/metrics.cjs');
 const ID = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const AGENT = 'a123456';
@@ -116,7 +118,7 @@ test('directory listing is deterministic, direct-only, and fails instead of trun
 
 test('agent cache eviction cannot carry one agents totals into another', async t => {
     const { store, write } = await setup(t);
-    for (let i = 0; i < 33; i++) {
+    for (let i = 0; i < 257; i++) {
         const agentId = `agent-${i}`;
         await write(agentId, lines(assistant('response', i, { agentId })));
         assert.equal((await store.getAgentStats(ID, agentId)).totalTokens, 100 + i);
@@ -231,7 +233,7 @@ test('child replacement during final workspace confirmation discards the complet
     const file = await write();
     let checks = 0;
     const context = { workspaceRoot: home, verify: async () => {
-        if (++checks === 4) await fs.writeFile(file, lines(user(), assistant('replacement', 99)));
+        if (++checks === 2) await fs.writeFile(file, lines(user(), assistant('replacement', 99)));
         return true;
     } };
     const stats = await store.getAgentStats(ID, AGENT, context);
@@ -244,9 +246,340 @@ test('discovery changes during its final workspace proof never return a partial 
     await write();
     let checks = 0;
     const context = { workspaceRoot: home, verify: async () => {
-        if (++checks === 3) await write('new-agent', lines(user({ agentId: 'new-agent' })));
+        if (++checks === 2) await write('new-agent', lines(user({ agentId: 'new-agent' })));
         return true;
     } };
     await assert.rejects(store.listAgents(ID, context), /changed/);
     assert.deepEqual(await store.listAgents(ID, context), [AGENT, 'new-agent']);
+});
+
+test('a bounded child batch shares one parent location and pre/post source proof', async t => {
+    const { home, parent, write } = await setup(t);
+    const agents = Array.from({ length: 8 }, (_, i) => `batch-${i}`);
+    for (const agent of agents) await write(agent, lines(assistant(agent, 40, { agentId: agent })));
+    let locations = 0, proofs = 0;
+    const store = createSubagentStore({ claudeHome: home,
+        createMetrics: (sessionId, agentId) => createMetrics({ sessionId, agentId }),
+        locateSource: async () => { locations++; return { path: parent, verify: async () => { proofs++; return true; } }; } });
+    t.after(() => store.dispose());
+    const samples = await store.getAgentStatsBatch(ID, agents);
+    assert.deepEqual(samples.map(stats => [stats.agentId, stats.status, stats.totalTokens]),
+        agents.map(agent => [agent, 'ok', 140]));
+    assert.equal(locations, 1);
+    assert.equal(proofs, 2);
+});
+
+test('child batches preserve duplicate positions, isolate bad children, and reject oversized requests before I/O', async t => {
+    const { store, write } = await setup(t);
+    await write();
+    await write('bad', '{bad}\n');
+    const samples = await store.getAgentStatsBatch(ID, [AGENT, 'bad', AGENT, '../unsafe', 'missing']);
+    assert.deepEqual(samples.map(stats => stats.status), ['ok', 'incomplete', 'ok', 'unavailable', 'not-found']);
+    assert.deepEqual(samples[0], samples[2]);
+    assert.equal(samples[1].totalTokens, 0);
+    assert.deepEqual(await store.getAgentStatsBatch('../parent', []), []);
+    assert.equal((await store.getAgentStatsBatch('../parent', [AGENT]))[0].status, 'unavailable');
+    for (const invalid of [undefined, null, 'agents', {}]) await assert.rejects(store.getAgentStatsBatch(ID, invalid), TypeError);
+    await assert.rejects(store.getAgentStatsBatch(ID, Array(9).fill(AGENT)), RangeError);
+});
+
+test('a changed earlier child is rejected at batch completion while an unaffected sibling stays usable', async t => {
+    const nativeFs = require('node:fs');
+    let first, change = true;
+    const { store, write } = await setup(t, { createMetrics: (sessionId, agentId) => {
+        const metrics = createMetrics({ sessionId, agentId });
+        return { snapshot: metrics.snapshot, ingest: row => {
+            metrics.ingest(row);
+            if (agentId === 'second' && change) {
+                change = false;
+                nativeFs.writeFileSync(first, lines(user(), assistant('replacement', 99)));
+            }
+        } };
+    } });
+    first = await write();
+    await write('second', lines(assistant('second', 5, { agentId: 'second' })));
+    const samples = await store.getAgentStatsBatch(ID, [AGENT, 'second']);
+    assert.equal(samples[0].status, 'unavailable'); assert.equal(samples[0].totalTokens, 0);
+    assert.equal(samples[1].status, 'ok'); assert.equal(samples[1].totalTokens, 105);
+    assert.equal((await store.getAgentStats(ID, AGENT)).totalTokens, 199);
+});
+
+test('parent appends during a child batch invalidate every child without retaining tentative metrics', async t => {
+    const nativeFs = require('node:fs');
+    let parent, mutate = true;
+    const { store, write, parent: parentFile } = await setup(t, { createMetrics: (sessionId, agentId) => {
+        const metrics = createMetrics({ sessionId, agentId });
+        return { snapshot: metrics.snapshot, ingest: row => {
+            metrics.ingest(row);
+            if (mutate) nativeFs.appendFileSync(parent, lines({ type: 'metadata' }));
+        } };
+    } });
+    parent = parentFile;
+    await write(); await write('second', lines(assistant('second', 5, { agentId: 'second' })));
+    const samples = await store.getAgentStatsBatch(ID, [AGENT, 'second']);
+    assert.deepEqual(samples.map(stats => [stats.status, stats.totalTokens]), [['incomplete', 0], ['incomplete', 0]]);
+    mutate = false;
+    assert.deepEqual((await store.getAgentStatsBatch(ID, [AGENT, 'second'])).map(stats => stats.totalTokens), [140, 105]);
+});
+
+test('workspace changes during ingestion and dispose during late proof completion cannot publish a batch', async t => {
+    let valid = true;
+    const fixture = await setup(t, { createMetrics: (sessionId, agentId) => {
+        const metrics = createMetrics({ sessionId, agentId });
+        return { snapshot: metrics.snapshot, ingest: row => { metrics.ingest(row); valid = false; } };
+    } });
+    await fixture.write();
+    const context = { workspaceRoot: fixture.home, verify: async () => valid };
+    assert.equal((await fixture.store.getAgentStatsBatch(ID, [AGENT], context))[0].status, 'unavailable');
+    let verifyCount = 0, begin, release;
+    const started = new Promise(resolve => { begin = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const store = createSubagentStore({ claudeHome: fixture.home,
+        createMetrics: (sessionId, agentId) => createMetrics({ sessionId, agentId }),
+        locateSource: async () => ({ path: fixture.parent, verify: async () => {
+            if (++verifyCount === 2) { begin(); await gate; }
+            return true;
+        } }) });
+    t.after(() => store.dispose());
+    const pending = store.getAgentStatsBatch(ID, [AGENT]);
+    await started; store.dispose(); release();
+    assert.equal((await pending)[0].status, 'unavailable');
+    assert.equal((await store.getAgentStatsBatch(ID, [AGENT]))[0].status, 'unavailable');
+});
+
+test('the child cache retains both active families instead of rereading beyond thirty-two agents', async t => {
+    const ingested = new Map();
+    const { store, write } = await setup(t, { createMetrics: (sessionId, agentId) => {
+        const metrics = createMetrics({ sessionId, agentId });
+        return { snapshot: metrics.snapshot, ingest: row => {
+            ingested.set(agentId, (ingested.get(agentId) || 0) + 1); metrics.ingest(row);
+        } };
+    } });
+    const agents = Array.from({ length: 57 }, (_, i) => `retained-${i}`);
+    for (const agent of agents) await write(agent, lines(assistant(agent, 40, { agentId: agent })));
+    for (let pass = 0; pass < 2; pass++) for (let start = 0; start < agents.length; start += 8) {
+        const samples = await store.getAgentStatsBatch(ID, agents.slice(start, start + 8));
+        assert.ok(samples.every(stats => stats.status === 'ok' && stats.totalTokens === 140));
+    }
+    assert.ok([...ingested.values()].every(count => count === 1));
+    assert.equal(ingested.size, 57);
+});
+
+test('idle incomplete rows have an aggregate cache budget while completed metrics remain incremental', async t => {
+    const created = new Map();
+    const { store, write } = await setup(t, { createMetrics: (sessionId, agentId) => {
+        created.set(agentId, (created.get(agentId) || 0) + 1);
+        return createMetrics({ sessionId, agentId });
+    } });
+    const agents = ['partial-a', 'partial-b', 'partial-c'];
+    const partial = '{"unfinished":"' + 'x'.repeat(6 * 1024 * 1024);
+    for (const agent of agents) await write(agent, lines(assistant(agent, 40, { agentId: agent })) + partial);
+    assert.ok((await store.getAgentStatsBatch(ID, agents)).every(stats => stats.totalTokens === 140));
+    assert.equal(created.get(agents[0]), 1);
+    assert.equal((await store.getAgentStats(ID, agents[0])).totalTokens, 140);
+    assert.equal(created.get(agents[0]), 2);
+});
+
+test('overlapping batch and single reads share the same child reader without sharing caller proof', { timeout: 5000 }, async t => {
+    const { store, write, subagents } = await setup(t);
+    const file = await write();
+    await write('second', lines(assistant('second', 5, { agentId: 'second' })));
+    let opened, release;
+    const started = new Promise(resolve => { opened = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const open = fs.open, realpath = fs.realpath;
+    let opens = 0, directoryChecks = 0;
+    t.mock.method(fs, 'open', async (target, ...args) => {
+        const handle = await open(target, ...args);
+        if (target === file) { opens++; opened(); await gate; }
+        return handle;
+    });
+    t.mock.method(fs, 'realpath', async (...args) => {
+        const resolved = await realpath(...args);
+        if (args[0] === subagents && ++directoryChecks === 2) setImmediate(release);
+        return resolved;
+    });
+    const batch = store.getAgentStatsBatch(ID, [AGENT, 'second']);
+    await started;
+    const single = store.getAgentStats(ID, AGENT);
+    const [samples, sample] = await Promise.all([batch, single]);
+    assert.equal(opens, 1);
+    assert.deepEqual(samples[0], sample);
+    assert.deepEqual(samples.map(stats => stats.totalTokens), [140, 105]);
+});
+
+test('one parent waiting for child I/O does not block a different parent batch', { timeout: 5000 }, async t => {
+    const { store, write, directory } = await setup(t);
+    const file = await write();
+    const otherDirectory = path.join(directory, OTHER, 'subagents');
+    await fs.mkdir(otherDirectory, { recursive: true });
+    await fs.writeFile(path.join(directory, `${OTHER}.jsonl`), lines({ type: 'metadata' }));
+    await fs.writeFile(path.join(otherDirectory, `agent-${AGENT}.jsonl`),
+        lines(assistant('other-parent', 5, { sessionId: OTHER })));
+    let opened, release;
+    const started = new Promise(resolve => { opened = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const open = fs.open;
+    t.mock.method(fs, 'open', async (target, ...args) => {
+        const handle = await open(target, ...args);
+        if (target === file) { opened(); await gate; }
+        return handle;
+    });
+    const blocked = store.getAgentStatsBatch(ID, [AGENT]);
+    await started;
+    try {
+        const other = await store.getAgentStatsBatch(OTHER, [AGENT]);
+        assert.equal(other[0].status, 'ok'); assert.equal(other[0].totalTokens, 105);
+    }
+    finally { release(); }
+    assert.equal((await blocked)[0].totalTokens, 140);
+});
+
+test('a replaced child directory cannot combine old-family and new-family metrics', async t => {
+    const { store, write, subagents, home } = await setup(t);
+    await write(); await write('second', lines(assistant('second', 5, { agentId: 'second' })));
+    let checks = 0;
+    const context = { workspaceRoot: home, verify: async () => {
+        if (++checks === 2) {
+            await fs.rename(subagents, path.join(home, 'previous-subagents'));
+            await fs.mkdir(subagents);
+            await write(AGENT, lines(assistant('new-first', 99)));
+            await write('second', lines(assistant('new-second', 105, { agentId: 'second' })));
+        }
+        return true;
+    } };
+    const samples = await store.getAgentStatsBatch(ID, [AGENT, 'second'], context);
+    assert.deepEqual(samples.map(stats => [stats.status, stats.totalTokens]), [['ok', 199], ['ok', 205]]);
+});
+
+test('dispose during the final child version check rejects the late completed batch', { timeout: 5000 }, async t => {
+    const { store, write } = await setup(t);
+    const file = await write();
+    let begin, release, checks = 0;
+    const started = new Promise(resolve => { begin = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const realpath = fs.realpath;
+    t.mock.method(fs, 'realpath', async (...args) => {
+        const resolved = await realpath(...args);
+        if (args[0] === file && ++checks === 3) { begin(); await gate; }
+        return resolved;
+    });
+    const pending = store.getAgentStatsBatch(ID, [AGENT]);
+    await started; store.dispose(); release();
+    const samples = await pending;
+    assert.equal(samples[0].status, 'unavailable'); assert.equal(samples[0].totalTokens, 0);
+});
+
+test('batch and discovery use only fresh operation boundary context proofs even for duplicate sources', async t => {
+    for (const duplicate of [false, true]) {
+        const { store, write, home, parent } = await setup(t);
+        const agents = Array.from({ length: 8 }, (_, i) => `boundary-${i}`);
+        for (const agent of agents) await write(agent, lines(assistant(agent, 40, { agentId: agent })));
+        if (duplicate) {
+            const prefix = lines({ type: 'relocated', sessionId: ID, relocatedCwd: home });
+            await fs.writeFile(parent, prefix);
+            const other = path.join(home, 'projects', 'other');
+            const children = path.join(other, ID, 'subagents');
+            await fs.mkdir(children, { recursive: true });
+            await fs.writeFile(path.join(other, `${ID}.jsonl`), prefix + lines({ type: 'metadata' }));
+            for (const agent of agents) await fs.writeFile(path.join(children, `agent-${agent}.jsonl`),
+                lines(assistant(agent, 55, { agentId: agent })));
+        }
+        let checks = 0;
+        const context = { workspaceRoot: home, verify: async () => { checks++; return true; } };
+        for (const action of ['cold', 'warm', 'discovery']) {
+            checks = 0;
+            if (action === 'discovery') assert.deepEqual(await store.listAgents(ID, context), agents);
+            else assert.ok((await store.getAgentStatsBatch(ID, agents, context))
+                .every(stats => stats.status === 'ok' && stats.totalTokens === (duplicate ? 155 : 140)));
+            assert.equal(checks, 2, `${duplicate ? 'duplicate' : 'unique'} ${action}`);
+        }
+    }
+});
+
+test('operation contexts expire after success or failure and cannot poison the next source lookup', async t => {
+    const { home, parent, write } = await setup(t);
+    await write();
+    const contexts = [];
+    let fail = false;
+    const store = createSubagentStore({ claudeHome: home,
+        createMetrics: (sessionId, agentId) => createMetrics({ sessionId, agentId }),
+        locateSource: async (_id, context) => {
+            contexts.push(context);
+            if (fail) throw new Error('lookup failed');
+            return { path: parent, verify: () => context.verify() };
+        } });
+    t.after(() => store.dispose());
+    const context = { workspaceRoot: home, verify: async () => true };
+    assert.equal((await store.getAgentStatsBatch(ID, [AGENT], context))[0].status, 'ok');
+    assert.notEqual(contexts[0], context);
+    assert.equal(await contexts[0].verify(), false);
+    fail = true;
+    assert.equal((await store.getAgentStatsBatch(ID, [AGENT], context))[0].status, 'unavailable');
+    assert.equal(await contexts[1].verify(), false);
+    fail = false;
+    assert.deepEqual(await store.listAgents(ID, context), [AGENT]);
+    assert.equal(await contexts[2].verify(), false);
+    assert.equal(await contexts[0].verify(), false);
+});
+
+test('replacing a workspace root or verification function during the operation invalidates its sample', async t => {
+    for (const field of ['workspaceRoot', 'verify', 'resolveRelocation']) {
+        let context;
+        const { store, write, home } = await setup(t, { createMetrics: (sessionId, agentId) => {
+            const metrics = createMetrics({ sessionId, agentId });
+            return { snapshot: metrics.snapshot, ingest: row => {
+                metrics.ingest(row);
+                context[field] = field === 'workspaceRoot' ? path.join(home, 'other') : async () => true;
+            } };
+        } });
+        await write();
+        context = { workspaceRoot: home, verify: async () => true, resolveRelocation: async () => null };
+        const stats = (await store.getAgentStatsBatch(ID, [AGENT], context))[0];
+        assert.equal(stats.status, 'unavailable', field); assert.equal(stats.totalTokens, 0);
+    }
+});
+
+test('a source confirmation that changes the external binding cannot pass the final operation boundary', async t => {
+    for (const action of ['batch', 'discovery']) {
+        const { home, parent, write } = await setup(t);
+        await write();
+        let valid = true, sourceChecks = 0;
+        const store = createSubagentStore({ claudeHome: home,
+            createMetrics: (sessionId, agentId) => createMetrics({ sessionId, agentId }),
+            locateSource: async () => ({ path: parent, verify: async () => {
+                if (++sourceChecks === 2) valid = false;
+                return true;
+            } }) });
+        t.after(() => store.dispose());
+        const context = { workspaceRoot: home, verify: async () => valid };
+        if (action === 'discovery') await assert.rejects(store.listAgents(ID, context));
+        else assert.equal((await store.getAgentStatsBatch(ID, [AGENT], context))[0].status, 'unavailable');
+    }
+});
+
+test('parent and duplicate peer versions are rechecked after the final binding callback', async t => {
+    for (const duplicate of [false, true]) for (const action of ['batch', 'discovery']) {
+        const { store, write, home, parent } = await setup(t);
+        await write();
+        if (duplicate) {
+            const prefix = lines({ type: 'relocated', sessionId: ID, relocatedCwd: home });
+            await fs.writeFile(parent, prefix);
+            const other = path.join(home, 'projects', 'other');
+            const children = path.join(other, ID, 'subagents');
+            await fs.mkdir(children, { recursive: true });
+            await fs.writeFile(path.join(other, `${ID}.jsonl`), prefix + lines({ type: 'metadata' }));
+            await fs.writeFile(path.join(children, `agent-${AGENT}.jsonl`), lines(user(), assistant()));
+        }
+        let checks = 0;
+        const context = { workspaceRoot: home, verify: async () => {
+            if (++checks % 2 === 0) await fs.appendFile(parent, lines({ type: 'metadata', changed: checks }));
+            return true;
+        } };
+        if (action === 'discovery') await assert.rejects(store.listAgents(ID, context));
+        else assert.notEqual((await store.getAgentStatsBatch(ID, [AGENT], context))[0].status, 'ok');
+    }
 });
