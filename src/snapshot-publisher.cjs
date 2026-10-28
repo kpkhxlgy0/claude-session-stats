@@ -3,7 +3,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { createSnapshotProtocol } = require('./snapshot.cjs');
-const { discoverSnapshotBindings, recheckSnapshotBinding } = require('./snapshot-bindings.cjs');
+const { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation } = require('./snapshot-bindings.cjs');
 const { isLocalId } = require('./session-map.cjs');
 
 function fileIdentity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
@@ -234,7 +234,12 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             const key = sourceKey(binding);
             if (!samples.has(key)) {
                 try { samples.set(key, await store.getStats(binding.cliSessionId, binding.workspaceEvidence ? {
-                    workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch) } : undefined)); }
+                    workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch),
+                    resolveRelocation: async cwd => {
+                        if (stopped || runEpoch !== epoch) return null;
+                        const proof = await resolveSnapshotRelocation(binding, cwd, { resolveWorkspace });
+                        return !stopped && runEpoch === epoch ? proof : null;
+                    } } : undefined)); }
                 catch { samples.set(key, null); }
             }
         }

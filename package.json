@@ -1,6 +1,6 @@
 {
   "name": "claude-session-stats",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "description": "Local and Remote Control session statistics for Claude++",
   "license": "MIT",

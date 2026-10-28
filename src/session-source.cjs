@@ -12,7 +12,7 @@ function samePath(left, right) {
 }
 
 function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 1024,
-    maxCandidates = 8, maxCacheEntries = 32 } = {}) {
+    maxCandidates = 8, maxCacheEntries = 32, maxRelocations = 4 } = {}) {
     const cache = new Map();
 
     async function safeDirectory(directory) {
@@ -35,6 +35,8 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
         try {
             if (await context.verify() !== true || await safeDirectory(context.workspaceRoot) !== proof.workspaceIdentity)
                 return false;
+            if (proof.relocation && (typeof context.resolveRelocation !== 'function'
+                || await context.resolveRelocation(proof.relocation.cwd) !== proof.relocation.evidence)) return false;
             for (const [file, stamp] of proof.versions)
                 if (version(await safeFile(file)) !== stamp) return false;
             return await safeDirectory(context.workspaceRoot) === proof.workspaceIdentity;
@@ -65,8 +67,8 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                 throw new Error('Session source size limit');
             sources.sort((a, b) => b.size - a.size);
             const longest = sources[0];
-            // Equal maxima offer no strict extension and remain ambiguous.
-            if (longest.size === sources[1].size) return null;
+            // Files are already path-sorted: equal maxima select one deterministic
+            // path only after every byte has been proven identical below.
             const left = Buffer.alloc(ChunkBytes), right = Buffer.alloc(ChunkBytes);
             for (const source of sources.slice(1)) {
                 const end = Buffer.alloc(1);
@@ -79,7 +81,8 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     if (!expected.equals(actual)) throw new Error('Divergent session sources');
                 }
             }
-            let matched = false, pending = Buffer.alloc(0);
+            let matched = false, pending = Buffer.alloc(0), relocation;
+            const checkedRelocations = new Set();
             const buffer = Buffer.alloc(ChunkBytes);
             for (let offset = 0; offset < longest.size && !matched; offset += ChunkBytes) {
                 const chunk = await read(longest.handle, buffer, Math.min(ChunkBytes, longest.size - offset), offset);
@@ -94,13 +97,25 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     const row = JSON.parse(line.toString('utf8'));
                     if (row?.type === 'relocated' && row.sessionId === sessionId
                         && typeof row.relocatedCwd === 'string' && path.isAbsolute(row.relocatedCwd)) {
-                        if (samePath(path.resolve(row.relocatedCwd), context.workspaceRoot)) { matched = true; break; }
+                        const cwd = path.resolve(row.relocatedCwd);
+                        if (samePath(cwd, context.workspaceRoot)) { matched = true; break; }
+                        const key = process.platform === 'win32' ? cwd.toLowerCase() : cwd;
+                        if (typeof context.resolveRelocation === 'function' && !checkedRelocations.has(key)) {
+                            if (checkedRelocations.size >= maxRelocations) throw new Error('Session source relocation limit');
+                            checkedRelocations.add(key);
+                            const evidence = await context.resolveRelocation(row.relocatedCwd);
+                            if (typeof evidence === 'string' && evidence.length && evidence.length <= 16384) {
+                                relocation = { cwd: row.relocatedCwd, evidence };
+                                matched = true;
+                                break;
+                            }
+                        }
                     }
                     start = newline + 1;
                 }
             }
             if (!matched) return null;
-            const proof = { path: longest.file, workspaceIdentity,
+            const proof = { path: longest.file, workspaceIdentity, relocation,
                 versions: new Map(sources.map(source => [source.file, source.stamp])) };
             for (const source of sources)
                 if (version(await source.handle.stat()) !== source.stamp) return null;

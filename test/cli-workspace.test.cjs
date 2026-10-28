@@ -194,7 +194,8 @@ test('entered, exited and switched registered worktrees follow fresh CLI cwd', a
     await f.write({ cwd: f.desktop });
     assert.equal(await entered.verify(), false);
     const exited = await f.resolver(f.binding);
-    assert.equal(exited, null);
+    assert.equal(exited?.workspaceRoot, await fs.realpath(f.desktop));
+    assert.equal(await exited.verify(), true);
     await f.write({ cwd: f.second });
     assert.equal((await f.resolver(f.binding))?.workspaceRoot, await fs.realpath(f.second));
 });
@@ -207,7 +208,6 @@ test('ordinary non-Git cwd and its real child remain valid without Git proof', a
     for (const cwd of [f.desktop, child]) {
         await f.write({ cwd });
         const resolved = await f.resolver(f.binding);
-        if (cwd === f.desktop) { assert.equal(resolved, null); continue; }
         assert.equal(resolved?.workspaceRoot, await fs.realpath(cwd));
         assert.equal(await resolved.verify(), true);
     }
@@ -420,13 +420,88 @@ test('a missing registry directory is an ordinary fallback without reading key f
     assert.equal(await f.resolver(f.binding), null);
 });
 
-test('moved directories require present exact Desktop host and bridge identities', async t => {
+test('moved directories require the exact Desktop host identity even when bridge is omitted', async t => {
     const f = await fixture(t);
-    for (const change of [{ hostSessionId: undefined }, { bridgeSessionId: undefined },
+    for (const change of [{ hostSessionId: undefined },
         { hostSessionId: undefined, bridgeSessionId: undefined }]) {
         await f.write(change);
         assert.deepEqual(await f.resolver(f.binding), { unavailable: true });
     }
+});
+
+test('new registries may omit bridge while host, CLI and process identity remain exact', async t => {
+    const f = await fixture(t);
+    for (const cwd of [f.active, f.desktop]) {
+        await f.write({ cwd, bridgeSessionId: undefined });
+        const resolved = await f.resolver(f.binding);
+        assert.equal(resolved?.workspaceRoot, await fs.realpath(cwd));
+        assert.equal(await resolved.verify(), true);
+        await f.write({ cwd, bridgeSessionId: 'session_conflict' });
+        assert.equal(await resolved.verify(), false);
+        assert.deepEqual(await f.resolver(f.binding), { unavailable: true });
+    }
+});
+
+test('returned-root relocation proof only accepts a fresh registered related workspace', async t => {
+    const f = await fixture(t);
+    await f.write({ cwd: f.desktop, bridgeSessionId: undefined });
+    assert.equal(typeof f.resolver.resolveRelocationVerified, 'function');
+    const root = await f.resolver.resolveVerified(f.binding);
+    const history = await f.resolver.resolveRelocationVerified(f.binding, f.active);
+    assert.equal(history.workspaceRoot, await fs.realpath(f.desktop));
+    assert.equal(history.evidenceKey, root.evidenceKey);
+    assert.equal(typeof history.relocationEvidence, 'string');
+    assert.deepEqual(await f.resolver.resolveRelocationVerified(f.binding, f.foreign), { unavailable: true });
+    f.setRegistered([f.desktop]);
+    assert.deepEqual(await f.resolver.resolveRelocationVerified(f.binding, f.active), { unavailable: true });
+    f.setRegistered([f.desktop, f.active]);
+    f.processes.set(101, { alive: true, procStart: '134375438415690103' });
+    assert.deepEqual(await f.resolver.resolveRelocationVerified(f.binding, f.active), { unavailable: true });
+});
+
+test('historical directory replacement during proof cannot confirm a relocation', async t => {
+    const f = await fixture(t);
+    await f.write({ cwd: f.desktop, bridgeSessionId: undefined });
+    let replaced = false;
+    const resolver = createCliWorkspaceResolver({ claudeHome: f.claudeHome, platform: 'win32',
+        hostname: 'fixture-host', getProcessIdentities: async () => f.processes,
+        execFile: async (command, args, options, callback) => {
+            if (!replaced && args.includes('worktree')) {
+                replaced = true;
+                await fs.rename(f.active, f.active + '-old');
+                await fs.mkdir(f.active);
+            }
+            f.execFile(command, args, options, callback);
+        } });
+    assert.equal(typeof resolver.resolveRelocationVerified, 'function');
+    assert.deepEqual(await resolver.resolveRelocationVerified(f.binding, f.active), { unavailable: true });
+});
+
+test('historical UNC and Windows device paths are rejected before any filesystem probe', async t => {
+    const targets = ['\\\\unavailable-server\\share\\history', '//unavailable-server/share/history',
+        '\\/unavailable-server/share/history', '/\\unavailable-server/share/history',
+        '\\\\?\\C:\\history', '//?/C:/history', '\\\\.\\pipe\\history', '//./pipe/history',
+        '\\??\\C:\\history', '\\Device\\Mup\\unavailable-server\\share\\history'];
+    const unsafe = new Set(targets.map(value => path.resolve(value)));
+    const probes = [];
+    const guardedFs = { ...fs, lstat: async file => {
+        probes.push(file);
+        if (unsafe.has(file)) throw Object.assign(new Error('Remote/device path must not be probed'), { code: 'ENOENT' });
+        return fs.lstat(file);
+    }, realpath: async file => {
+        probes.push(file);
+        if (unsafe.has(file)) throw new Error('Remote/device path must not be probed');
+        return fs.realpath(file);
+    } };
+    const f = await fixture(t, { fs: guardedFs });
+    await f.write({ cwd: f.desktop, bridgeSessionId: undefined });
+    for (const cwd of targets) {
+        probes.length = 0;
+        assert.deepEqual(await f.resolver.resolveRelocationVerified(f.binding, cwd), { unavailable: true });
+        assert.deepEqual(probes, [], cwd);
+    }
+    assert.equal((await f.resolver.resolveRelocationVerified(f.binding, f.active)).workspaceRoot,
+        await fs.realpath(f.desktop));
 });
 
 test('nested foreign and unregistered worktrees cannot bypass Git association as Desktop children', async t => {

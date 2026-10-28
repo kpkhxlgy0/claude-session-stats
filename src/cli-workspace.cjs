@@ -175,7 +175,7 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             activeTop.path, activeTop.identity];
     }
 
-    async function inspect(binding) {
+    async function inspect(binding, relocationCwd) {
         if (typeof claudeHome !== 'string' || !path.isAbsolute(claudeHome)) return null;
         let matched = false;
         try {
@@ -183,11 +183,14 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             if (!first.found.length) return null;
             matched = true;
             const desktop = await directory(binding.workspaceRoot);
-            // Keeping the existing canonical Desktop root does not re-anchor access.
-            if (first.found.length === 1 && samePath((await directory(first.found[0].cwd)).path, desktop.path))
-                return null;
+            // Legacy same-root records still support ordinary single-log reads, but
+            // cannot establish identity proof for relocated duplicate transcripts.
+            if (first.found.length === 1 && samePath((await directory(first.found[0].cwd)).path, desktop.path)
+                && ['hostSessionId', 'procStart', 'pidDomain', 'startedAt'].some(key => first.found[0][key] === undefined))
+                return relocationCwd === undefined ? null : { unavailable: true };
             for (const row of first.found) {
-                if (row.hostSessionId !== binding.localSessionId || row.bridgeSessionId !== binding.bridgeSessionId
+                if (row.hostSessionId !== binding.localSessionId
+                    || row.bridgeSessionId !== undefined && row.bridgeSessionId !== binding.bridgeSessionId
                     || typeof row.procStart !== 'string' || !/^[0-9]{1,32}$/.test(row.procStart)
                     || row.pidDomain !== domain || !Number.isSafeInteger(row.startedAt) || row.startedAt <= 0)
                     return { unavailable: true };
@@ -207,16 +210,25 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             const row = live[0];
             const active = await directory(row.cwd);
             const git = await association(desktop, active);
+            let relocation, relocationGit;
+            if (relocationCwd !== undefined) {
+                relocation = samePath(relocationCwd, active.path) ? active
+                    : samePath(relocationCwd, desktop.path) ? desktop : await directory(relocationCwd);
+                relocationGit = relocation === active ? git : await association(desktop, relocation);
+            }
             const second = await scan(binding);
             const candidates = records => records.map(record => record.semantic).sort().join('\n');
             if (candidates(first.found) !== candidates(second.found)
                 || first.home.identity !== second.home.identity || first.sessions.identity !== second.sessions.identity
                 || desktop.identity !== (await directory(desktop.path)).identity
-                || active.identity !== (await directory(active.path)).identity) return { unavailable: true };
-            return { workspaceRoot: active.path, evidenceKey: JSON.stringify([
+                || active.identity !== (await directory(active.path)).identity
+                || relocation && relocation.identity !== (await directory(relocation.path)).identity) return { unavailable: true };
+            const evidenceKey = JSON.stringify([
                 binding.accountId, binding.organizationId, binding.localSessionId, binding.cliSessionId,
                 binding.bridgeSessionId, binding.metadataFile, first.home.path, first.home.identity,
-                first.sessions.identity, row.semantic, active.path, active.identity, git]) };
+                first.sessions.identity, row.semantic, active.path, active.identity, git]);
+            return { workspaceRoot: active.path, evidenceKey, ...(relocation ? {
+                relocationEvidence: JSON.stringify([relocation.path, relocation.identity, relocationGit]) } : {}) };
         } catch (error) {
             // Absence of the registry is ordinary. A missing workspace after a match is unsafe.
             if (!matched && error.code === 'ENOENT') {
@@ -237,6 +249,10 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
     }
     // Each call owns a complete fresh proof, including its final registry/root recheck.
     resolveWorkspace.resolveVerified = inspect;
+    // Historical markers must not initiate network or device namespace probes.
+    resolveWorkspace.resolveRelocationVerified = (binding, cwd) => typeof cwd === 'string' && path.isAbsolute(cwd)
+        && !/^(?:[\\/]{2}|[\\/](?:\?\?|device)[\\/])/i.test(cwd)
+        ? inspect(binding, cwd) : Promise.resolve({ unavailable: true });
     return resolveWorkspace;
 }
 

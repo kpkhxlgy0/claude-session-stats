@@ -63,17 +63,23 @@ async function recordBindings(record, { localSessionId, accountId, organizationI
         organizationId: organizationId.toLowerCase(), bridgeSessionId, workspaceRoot, metadataFile }));
 }
 
-async function resolveBindingWorkspace(binding, resolveWorkspace) {
+async function resolveBindingWorkspace(binding, resolveWorkspace, relocationCwd) {
     if (!resolveWorkspace) return binding;
     try {
-        const verified = typeof resolveWorkspace.resolveVerified === 'function';
-        const resolved = verified ? await resolveWorkspace.resolveVerified(binding) : await resolveWorkspace(binding);
+        const history = relocationCwd !== undefined;
+        if (history && typeof resolveWorkspace.resolveRelocationVerified !== 'function') return null;
+        const verified = history || typeof resolveWorkspace.resolveVerified === 'function';
+        const resolved = history ? await resolveWorkspace.resolveRelocationVerified(binding, relocationCwd)
+            : verified ? await resolveWorkspace.resolveVerified(binding) : await resolveWorkspace(binding);
         if (resolved === null) return binding;
         if (!resolved || typeof resolved !== 'object' || Array.isArray(resolved)
             || resolved.unavailable || typeof resolved.workspaceRoot !== 'string'
             || !path.isAbsolute(resolved.workspaceRoot) || typeof resolved.evidenceKey !== 'string'
             || !resolved.evidenceKey.length || resolved.evidenceKey.length > 16384) return null;
-        if (verified) return { ...binding, workspaceRoot: resolved.workspaceRoot, workspaceEvidence: resolved.evidenceKey };
+        if (history && (typeof resolved.relocationEvidence !== 'string' || !resolved.relocationEvidence.length
+            || resolved.relocationEvidence.length > 16384)) return null;
+        if (verified) return { ...binding, workspaceRoot: resolved.workspaceRoot, workspaceEvidence: resolved.evidenceKey,
+            ...(history ? { relocationEvidence: resolved.relocationEvidence } : {}) };
         if (typeof resolved.verify !== 'function') return null;
         const root = await fs.realpath(resolved.workspaceRoot);
         const before = await safeDirectory(root);
@@ -83,7 +89,7 @@ async function resolveBindingWorkspace(binding, resolveWorkspace) {
     } catch { return null; }
 }
 
-async function recheckSnapshotBinding(binding, { resolveWorkspace } = {}) {
+async function inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd } = {}) {
     try {
         const org = path.dirname(binding.metadataFile);
         const account = path.dirname(org);
@@ -99,14 +105,27 @@ async function recheckSnapshotBinding(binding, { resolveWorkspace } = {}) {
         for (const base of candidates) {
             if (['accountId', 'organizationId', 'localSessionId', 'cliSessionId', 'bridgeSessionId', 'metadataFile']
                 .some(key => base[key] !== binding[key])) continue;
-            const candidate = await resolveBindingWorkspace(base, resolveWorkspace);
+            const resolved = await resolveBindingWorkspace(base, resolveWorkspace, relocationCwd);
+            if (!resolved) continue;
+            const { relocationEvidence, ...candidate } = resolved;
             if (candidate && Object.keys(candidate).length === Object.keys(binding).length
-                && Object.keys(candidate).every(key => candidate[key] === binding[key])) matched = true;
+                && Object.keys(candidate).every(key => candidate[key] === binding[key]))
+                matched = relocationCwd === undefined ? true : relocationEvidence;
         }
         for (let index = 0; index < directories.length; index++)
             if (!sameFile(identities[index], await safeDirectory(directories[index]))) return false;
-        return matched && sameVersion(read.info, await fs.lstat(binding.metadataFile));
+        return sameVersion(read.info, await fs.lstat(binding.metadataFile)) ? matched : false;
     } catch { return false; }
+}
+
+async function recheckSnapshotBinding(binding, options) {
+    return await inspectSnapshotBinding(binding, options) === true;
+}
+
+async function resolveSnapshotRelocation(binding, relocationCwd, { resolveWorkspace } = {}) {
+    if (typeof relocationCwd !== 'string' || !path.isAbsolute(relocationCwd)) return null;
+    const proof = await inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd });
+    return typeof proof === 'string' ? proof : null;
 }
 
 async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavailableWorkspace } = {}) {
@@ -162,4 +181,4 @@ async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavai
     return resolved.sort((a, b) => a.metadataFile.localeCompare(b.metadataFile)
         || a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
-module.exports = { discoverSnapshotBindings, recheckSnapshotBinding };
+module.exports = { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation };

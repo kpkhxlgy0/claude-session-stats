@@ -158,3 +158,53 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
     assert.equal(invalid.status, 'unavailable');
     assert.equal(invalid.tps, null);
 });
+
+for (const returned of [true, false]) test(`bridge-less registry publishes proven relocated copies (returned=${returned})`, async t => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-registry-copies-')));
+    const workspace = path.join(root, 'workspace');
+    const worktree = path.join(workspace, '.claude', 'worktrees', 'presentation');
+    const common = path.join(workspace, '.git');
+    const claudeHome = path.join(root, 'config'), claudeData = path.join(root, 'desktop');
+    const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, LOCAL + '.json');
+    const registry = path.join(claudeHome, 'sessions', '101.json');
+    const first = path.join(claudeHome, 'projects', 'original', CLI + '.jsonl');
+    const second = path.join(claudeHome, 'projects', 'worktree-copy', CLI + '.jsonl');
+    for (const directory of [worktree, common, ...[metadata, registry, first, second].map(path.dirname)])
+        await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(worktree, '.git'), 'gitdir: fixture-only');
+    await fs.writeFile(metadata, JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
+        cwd: workspace, bridgeSessionIds: [BRIDGE] }));
+    const row = { pid: 101, sessionId: CLI, hostSessionId: LOCAL, cwd: returned ? workspace : worktree,
+        startedAt: 1000, procStart: '123456', pidDomain: 'win32:fixture-host' };
+    await fs.writeFile(registry, JSON.stringify(row));
+    const prefix = turn('m1', 0, 40) + JSON.stringify({ type: 'relocated', sessionId: CLI, relocatedCwd: worktree }) + '\n';
+    await fs.writeFile(second, prefix);
+    await fs.writeFile(first, prefix + (returned ? turn('m2', 20, 60) : ''));
+    let registered = true;
+    const resolveWorkspace = createCliWorkspaceResolver({ claudeHome, platform: 'win32', hostname: 'fixture-host',
+        processCacheMs: 0, getProcessIdentities: async () => new Map([[101, { alive: true, procStart: '123456' }]]),
+        execFile: (_command, args, _options, callback) => {
+            if (args.includes('worktree')) return callback(null,
+                `worktree ${workspace}\0\0${registered ? `worktree ${worktree}\0\0` : ''}`, '');
+            const top = args[1] === worktree ? worktree : workspace;
+            callback(null, `${common}\n${top}\n`, '');
+        } });
+    const store = createSessionStore({ claudeHome });
+    const publisher = createSnapshotPublisher({ claudeData, store, resolveWorkspace, pollMs: 600000 });
+    t.after(async () => { await publisher.stop(); store.dispose(); await fs.rm(root, { recursive: true, force: true }); });
+    await publisher.start();
+    const local = await publisher.readLocal(LOCAL);
+    assert.equal(local.status, 'ok');
+    assert.equal(local.totalTokens, returned ? 300 : 140);
+    assert.equal(local.steps, returned ? 2 : 1);
+    assert.equal(local.tps, returned ? 5 : 4);
+    const active = returned ? workspace : worktree;
+    assert.equal(JSON.parse(await fs.readFile(path.join(active, relative), 'utf8')).stats.totalTokens, returned ? 300 : 140);
+    if (returned) {
+        registered = false;
+        assert.notEqual((await publisher.readLocal(LOCAL)).status, 'ok');
+    } else {
+        await fs.writeFile(registry, JSON.stringify({ ...row, bridgeSessionId: 'session_conflict' }));
+        assert.equal((await publisher.readLocal(LOCAL)).status, 'unavailable');
+    }
+});
