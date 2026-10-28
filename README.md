@@ -19,7 +19,7 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-版本：[v0.6.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.6.1)。
+版本：[v0.6.2](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.6.2)。
 
 快照数据格式保持不变。使用工作树目录同步修复时，**运行端和接收端都需使用 v0.5.1 或更新版本**；更早的接收端仍使用启动目录锚点，无法保证进入工作树后的快照读取。
 
