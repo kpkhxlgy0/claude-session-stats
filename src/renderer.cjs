@@ -174,13 +174,23 @@ function startRenderer(api, options = {}) {
         [data-session-stats] .session-stats-group { flex-shrink: 0; pointer-events: auto; }
         [data-session-stats] .session-stats-group:first-child { margin-left: auto; }
         [data-session-stats] .session-stats-group:last-child { margin-right: auto; }
+        ${TaskPaneSelector}[data-session-stats-footer] { box-sizing: border-box; padding-bottom: 24px; }
         [data-session-stats-agent] { position: absolute; left: 16px; right: 16px; bottom: 2px; }
     `;
     doc.head.append(style);
 
     function remove() { entry?.bar.remove(); entry = null; }
+    function mountAgent(current) {
+        current.root.dataset.sessionStatsFooter = '';
+        if (!current.bar.isConnected) current.root.append(current.bar);
+    }
+    function unmountAgent(current) {
+        current.bar.remove(); delete current.root.dataset.sessionStatsFooter;
+    }
     function removeAgent(root) {
-        agentEntries.get(root)?.bar.remove(); agentEntries.delete(root);
+        const current = agentEntries.get(root);
+        if (current) unmountAgent(current);
+        agentEntries.delete(root);
     }
     function forgetPane(root) {
         removeAgent(root);
@@ -231,13 +241,13 @@ function startRenderer(api, options = {}) {
             if (current.remote && (!matches || stats.source !== 'remote_control'
                 || !(stats.status === 'ok' || stats.status === 'unavailable'
                     && Object.hasOwn(SnapshotUnavailable, stats.unavailableReason)))) {
-                current.bar.remove(); return;
+                unmountAgent(current); return;
             }
             render(current, matches ? stats : null); positionAgent(current);
-            if (!current.bar.isConnected) current.root.append(current.bar);
+            mountAgent(current);
         } catch {
             if (isCurrentAgent(current, epoch, revision)) {
-                if (current.remote) current.bar.remove();
+                if (current.remote) unmountAgent(current);
                 else render(current, null);
             }
         } finally {
@@ -279,7 +289,7 @@ function startRenderer(api, options = {}) {
                     current = { ...makeBar(doc, bound.remote, bound.agentId), root, key,
                         sessionId: bound.sessionId, agentId: bound.agentId, remote: bound.remote, inflight: false };
                     agentEntries.set(root, current);
-                    if (!current.remote) { render(current, null); root.append(current.bar); }
+                    if (!current.remote) { render(current, null); mountAgent(current); }
                 }
                 current.revision = revision;
                 positionAgent(current); void refreshAgent(current);

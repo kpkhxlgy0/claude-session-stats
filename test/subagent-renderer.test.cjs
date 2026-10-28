@@ -16,6 +16,9 @@ function fixture(t, { remote = false, parent = false, childEditor = false } = {}
         { url: `https://claude.ai/${remote ? 'code' : 'epitaxy'}/${sessionId}` });
     t.after(() => dom.window.close());
     const doc = dom.window.document, calls = [], bindings = createSubagentBindings();
+    const hostStyle = doc.createElement('style');
+    hostStyle.textContent = '.task-pane { padding-bottom: 0; box-sizing: content-box; }';
+    doc.head.append(hostStyle);
     function bounds(node) {
         const rect = { left: 20, top: 200, right: 620, bottom: 600, width: 600, height: 400 };
         node.getClientRects = () => [rect]; node.getBoundingClientRect = () => rect;
@@ -31,9 +34,13 @@ function fixture(t, { remote = false, parent = false, childEditor = false } = {}
     function pane(agentId = 'agent_A-1') {
         const root = doc.createElement('section');
         root.dataset.paneRoot = ''; root.dataset.perfScreen = 'tasks'; root.style.position = 'relative';
-        root.innerHTML = '<div class="transcript">Selected subagent</div>';
+        root.className = 'task-pane';
+        root.style.display = 'flex'; root.style.flexDirection = 'column'; root.style.height = '400px';
+        root.innerHTML = '<header style="height:45px;flex-shrink:0">Task</header>'
+            + '<div class="content" style="flex:1;min-height:0;overflow:hidden">'
+            + '<div class="transcript" style="height:100%;overflow:auto">Selected subagent</div></div>';
         doc.querySelector('main').append(root); bounds(root);
-        if (childEditor) addComposer(root);
+        if (childEditor) addComposer(root.querySelector('.content'));
         const host = { tag: 5, stateNode: root, memoizedProps: {} };
         const fiberRoot = { tag: 3, stateNode: {}, child: host }; fiberRoot.stateNode.current = fiberRoot;
         host.return = fiberRoot; root.__reactFiber$fixture = host;
@@ -72,7 +79,7 @@ function fixture(t, { remote = false, parent = false, childEditor = false } = {}
         setReply(value) { reply = value; } };
 }
 
-test('local selected child renders independently without a composer in a zero-space pane overlay', async t => {
+test('local selected child reserves a fixed footer below its flex transcript without a composer', async t => {
     const f = fixture(t); const before = f.selected.root.style.cssText;
     f.run(); await tick();
     const bar = f.selected.root.querySelector('[data-session-stats-agent]');
@@ -86,6 +93,9 @@ test('local selected child renders independently without a composer in a zero-sp
     assert.equal(style.left, '16px'); assert.equal(style.right, '16px');
     assert.equal(style.margin, '0px'); assert.equal(style.padding, '0px');
     assert.equal(f.selected.root.style.cssText, before);
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).boxSizing, 'border-box');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root.querySelector('.content')).flex, '1 1 0%');
     assert.equal(f.dom.window.getComputedStyle(bar.firstChild).marginLeft, 'auto');
     assert.equal(f.dom.window.getComputedStyle(bar.lastChild).marginRight, 'auto');
     assert.deepEqual(f.calls.find(call => call[0] === 'agent-stats'),
@@ -101,6 +111,8 @@ test('child editors do not hide the parent composer statistics or create a secon
     assert.match(f.doc.body.querySelector('[data-session-stats]:not([data-session-stats-agent])').textContent, /9 turns/);
     assert.match(f.selected.root.querySelector('[data-session-stats-agent]').textContent, /1 turns/);
     assert.equal(f.parentForm.outerHTML, before);
+    assert.equal(f.parentForm.hasAttribute('data-session-stats-footer'), false);
+    assert.equal(f.parentForm.parentElement.hasAttribute('data-session-stats-footer'), false);
 });
 
 test('remote child metrics require matching session, exact agent and Remote Control source', async t => {
@@ -115,13 +127,17 @@ test('remote child metrics require matching session, exact agent and Remote Cont
             source: 'remote_control', ...change }));
         await tick();
         assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), null);
+        assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '0px');
     }
+    f.setReply(() => Promise.reject(new Error('Disconnected'))); await tick();
+    assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
     f.setReply(payload => ({ status: 'unavailable', threadId: payload.sessionId, agentId: payload.agentId,
         source: 'remote_control', unavailableReason: 'snapshot-missing' }));
     await tick();
     const bar = f.selected.root.querySelector('[data-session-stats-agent]');
     assert.match(bar.textContent, /— turns.*— steps.*— tok\/s/);
     assert.match(bar.title, /Session Stats/);
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
 });
 
 test('multiple child panes keep independent identities and metric bars', async t => {
@@ -136,6 +152,7 @@ test('multiple child panes keep independent identities and metric bars', async t
 
 test('selection switches, task lists, hidden panes and remounts remove obsolete child bars', async t => {
     const f = fixture(t); const pending = [];
+    f.doc.querySelector('style').textContent = '.task-pane { padding-bottom: 6px; box-sizing: content-box; }';
     f.setReply(payload => new Promise(resolve => pending.push({ payload, resolve })));
     f.run(); await tick();
     assert.equal(pending[0].payload.agentId, 'agent_A-1');
@@ -148,12 +165,20 @@ test('selection switches, task lists, hidden panes and remounts remove obsolete 
     assert.match(f.selected.root.querySelector('[data-session-stats-agent]').textContent, /8 steps/);
     f.selected.select(null); await tick();
     assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), null);
+    assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '6px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).boxSizing, 'content-box');
     f.selected.select('agent_C'); await tick();
     assert.ok(f.selected.root.querySelector('[data-session-stats-agent]'));
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
     f.selected.root.hidden = true; await tick();
     assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), null);
     assert.equal(f.selected.root.hasAttribute('data-session-stats-key'), false);
+    assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
+    f.selected.root.hidden = false; await tick();
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
     f.selected.root.remove(); const replacement = f.pane('agent_D'); await tick();
+    assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
     assert.ok(replacement.root.querySelector('[data-session-stats-agent]'));
     assert.equal(f.doc.querySelectorAll('[data-session-stats-agent]').length, 1);
 });
@@ -175,11 +200,16 @@ test('late binding replies cannot remount a closed or route-changed pane', async
 
 test('stopping removes child bars and keys and ignores pending metric replies', async t => {
     const f = fixture(t, { remote: true }); let settle;
-    f.setReply(() => new Promise(resolve => { settle = resolve; }));
     const controller = f.run(); await tick();
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    f.setReply(() => new Promise(resolve => { settle = resolve; }));
+    await tick();
     const oldKey = f.selected.root.dataset.sessionStatsKey;
     controller.stop();
     assert.equal(f.selected.root.hasAttribute('data-session-stats-key'), false);
+    assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '0px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).boxSizing, 'content-box');
     settle({ ...sample, threadId: REMOTE, agentId: 'agent_A-1', source: 'remote_control' });
     await tick();
     assert.equal(f.doc.querySelector('[data-session-stats]'), null);
