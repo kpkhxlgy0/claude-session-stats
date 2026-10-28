@@ -633,3 +633,35 @@ test('pending request fallbacks stay excluded until their explicit message ident
     assert.equal(completed.tps, 204); // (40 + 2000) tokens / (2 + 8) seconds.
     assert.equal(completed.steps, 2); assert.equal(completed.outputTokens, 2040);
 });
+
+test('explicit agent metrics include only the exact parent sidechain and retain deduplication and TPS', () =>
+{
+    const metrics = createMetrics({ sessionId: 'session-1', agentId: 'agent-1' });
+    const scope = { agentId: 'agent-1', isSidechain: true };
+    for (const fields of [
+        { ...scope, sessionId: 'other' }, { ...scope, sessionId: undefined },
+        { ...scope, agentId: 'other' }, { ...scope, agentId: undefined },
+        { ...scope, isSidechain: false }, { ...scope, isSidechain: undefined }
+    ])
+    {
+        metrics.ingest(user('foreign', 'prompt', fields));
+        metrics.ingest(assistant('foreign', completeUsage({ output_tokens: 999 }), fields));
+    }
+    metrics.ingest(user('own', 'prompt', { ...scope, timestamp: '2026-01-01T00:00:00Z' }));
+    metrics.ingest(assistant('own', completeUsage(), { ...scope, timestamp: '2026-01-01T00:00:02Z' }));
+    metrics.ingest(assistant('own', completeUsage({ output_tokens: 60 }),
+        { ...scope, timestamp: '2026-01-01T00:00:03Z' }));
+    assert.deepEqual(metrics.snapshot(), {
+        turns: 1, steps: 1, totalTokens: 160, inputTokens: 100, outputTokens: 60,
+        cachedInputTokens: 70, cacheHit: 0.7, tps: 20, usageComplete: true
+    });
+});
+
+test('agent mode cannot learn a missing parent identity from incoming records', () =>
+{
+    const metrics = createMetrics({ agentId: 'agent-1' });
+    metrics.ingest(user('foreign', 'prompt', { agentId: 'agent-1', isSidechain: true }));
+    metrics.ingest(assistant('foreign', completeUsage(), { agentId: 'agent-1', isSidechain: true }));
+    assert.equal(metrics.snapshot().turns, 0);
+    assert.equal(metrics.snapshot().steps, null);
+});

@@ -135,7 +135,7 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
         outputTokens: 6, cachedInputTokens: 0, cacheHit: 0, tps: 3, usageComplete: true };
     let read;
     const controller = startMain({ manifest: { id: 'com.kpk.session-stats' },
-        ipc: { handle(_name, handler) { read = handler; } }, log: { info() {} } }, {
+        ipc: { handle(name, handler) { if (name === 'stats') read = handler; } }, log: { info() {} } }, {
         claudeData, claudeHome, resolveWorkspace, store: { getStats: async () => sample, dispose() {} },
         ipcMain: { handle() {}, removeHandler() {} } });
     t.after(async () => { await controller.stop(); await fs.rm(root, { recursive: true, force: true }); });

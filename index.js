@@ -3,6 +3,8 @@
 const renderer = (() => { const module = { exports: {} };
 'use strict';
 
+const TaskPaneSelector = '[data-pane-root][data-perf-screen="tasks"]';
+
 function parseSessionId(rawUrl) {
     try {
         const url = new URL(rawUrl);
@@ -29,7 +31,7 @@ function isVisible(element, win) {
 function findComposer(win) {
     const editors = [...win.document.querySelectorAll(
         '.ProseMirror[contenteditable], [contenteditable="true"][role="textbox"], textarea')]
-        .filter(node => isVisible(node, win));
+        .filter(node => !node.closest(TaskPaneSelector) && isVisible(node, win));
     if (editors.length !== 1) return null;
     const editor = editors[0];
     // 只在当前编辑器附近寻找输入框和操作按钮的共同容器，避免把整个会话作为挂载点。
@@ -98,11 +100,12 @@ const SnapshotUnavailable = {
     'source-unavailable': '运行端会话日志暂不可用或不完整',
 };
 
-function makeBar(doc, remote) {
+function makeBar(doc, remote, agentId) {
     const bar = doc.createElement('div');
     bar.dataset.sessionStats = '';
     bar.setAttribute('role', 'group');
-    bar.setAttribute('aria-label', '会话统计');
+    bar.setAttribute('aria-label', agentId ? '子代理统计' : '会话统计');
+    if (agentId) bar.dataset.sessionStatsAgent = agentId;
     const fields = {};
     for (const names of [['turns', 'steps', 'tps'], ['tokens', 'cache']]) {
         const group = doc.createElement('span');
@@ -114,10 +117,11 @@ function makeBar(doc, remote) {
         }
         bar.append(group);
     }
-    const scope = remote ? '当前 Remote Control 会话' : '当前主会话';
+    const scope = agentId ? '当前选中子代理' : remote ? '当前 Remote Control 会话' : '当前主会话';
     fields.turns.title = `${scope}的用户轮次，按 promptId/uuid 去重，排除工具返回和系统注入消息`;
     fields.steps.title = `${scope}的模型响应次数，按消息 ID 去重；不等于工具调用次数`;
-    fields.tps.title = '整个会话平均 TPS（估算）：包含 fork 继承的已验证历史；有效响应样本的输出 tokens 总和 ÷ 对应耗时总和；'
+    fields.tps.title = (agentId ? '当前子代理平均 TPS（估算）：' : '整个会话平均 TPS（估算）：包含 fork 继承的已验证历史；')
+        + '有效响应样本的输出 tokens 总和 ÷ 对应耗时总和；'
         + (remote ? '由运行端原始会话日志计算，通过 RC 读取同一统计快照；同步可能有数秒延迟。' : '以已确认日志为范围。')
         + '耗时从用户输入或工具返回计至响应记录，包含首 Token 等待和网络耗时。'
         + '新输入、工具执行和后续生成期间保留已有平均值；缺少有效样本时显示 —。';
@@ -136,7 +140,7 @@ function render(entry, stats) {
         if (entry.fields[name].textContent !== value) entry.fields[name].textContent = value;
     const pending = entry.remote ? SnapshotUnavailable[stats?.unavailableReason] ?? SnapshotUnavailable.pending
         : stats?.status === 'incomplete' ? '日志包含不完整记录，等待可验证的用量数据'
-        : '等待当前会话的本地统计数据';
+        : entry.agentId ? '等待当前子代理的本地统计数据' : '等待当前会话的本地统计数据';
     entry.bar.title = stats?.status === 'ok'
         ? (Number.isSafeInteger(stats.snapshotGeneratedAt)
             ? `共享统计快照，更新于 ${new Date(stats.snapshotGeneratedAt).toLocaleTimeString()}` : '') : pending;
@@ -152,6 +156,15 @@ function startRenderer(api, options = {}) {
     const doc = win.document;
     let entry = null;
     const remoteRequests = new WeakMap();
+    const agentEntries = new Map();
+    const paneKeys = new Map();
+    const paneRevisions = new WeakMap();
+    const agentRequests = new WeakMap();
+    const keyPrefix = `ss_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    let nextKey = 0;
+    let childRevision = 0;
+    let childSessionId = null;
+    let bindingsPending = false;
     let stopped = false;
     let scheduled = null;
     const style = doc.createElement('style');
@@ -164,10 +177,122 @@ function startRenderer(api, options = {}) {
         [data-session-stats] .session-stats-group { flex-shrink: 0; pointer-events: auto; }
         [data-session-stats] .session-stats-group:first-child { margin-left: auto; }
         [data-session-stats] .session-stats-group:last-child { margin-right: auto; }
+        [data-session-stats-agent] { position: absolute; left: 16px; right: 16px; bottom: 2px; }
     `;
     doc.head.append(style);
 
     function remove() { entry?.bar.remove(); entry = null; }
+    function removeAgent(root) {
+        agentEntries.get(root)?.bar.remove(); agentEntries.delete(root);
+    }
+    function forgetPane(root) {
+        removeAgent(root);
+        if (root.dataset.sessionStatsKey === paneKeys.get(root)) delete root.dataset.sessionStatsKey;
+        paneKeys.delete(root);
+    }
+    function currentPanes(sessionId) {
+        if (sessionId !== childSessionId) {
+            childSessionId = sessionId; childRevision++;
+            for (const root of agentEntries.keys()) removeAgent(root);
+        }
+        const roots = new Set(sessionId && doc.visibilityState !== 'hidden'
+            ? [...doc.querySelectorAll(TaskPaneSelector)].filter(root => isVisible(root, win)) : []);
+        if (roots.size > 64) roots.clear();
+        for (const root of paneKeys.keys()) if (!roots.has(root)) forgetPane(root);
+        for (const root of roots) {
+            if (!paneKeys.has(root)) {
+                paneKeys.set(root, `${keyPrefix}_${++nextKey}`); paneRevisions.set(root, 0);
+            }
+            if (root.dataset.sessionStatsKey !== paneKeys.get(root)) root.dataset.sessionStatsKey = paneKeys.get(root);
+        }
+        return roots;
+    }
+    function isCurrentAgent(current, epoch, revision) {
+        return !stopped && agentEntries.get(current.root) === current && childRevision === epoch
+            && current.revision === revision && paneRevisions.get(current.root) === revision
+            && doc.visibilityState !== 'hidden'
+            && parseSessionId(win.location.href) === current.sessionId && current.root.matches(TaskPaneSelector)
+            && current.root.dataset.sessionStatsKey === current.key && isVisible(current.root, win);
+    }
+    function positionAgent(current) {
+        current.bar.style.color = win.getComputedStyle(current.root).color;
+    }
+    async function refreshAgent(current) {
+        if (current.inflight) return;
+        const identity = `${current.sessionId}:${current.agentId}`;
+        let pending = agentRequests.get(current.root);
+        if (pending?.has(identity)) return;
+        if (!pending) agentRequests.set(current.root, pending = new Set());
+        pending.add(identity); current.inflight = true;
+        const epoch = childRevision;
+        const revision = current.revision;
+        try {
+            const stats = await api.ipc.invoke(current.remote ? 'remote-agent-stats' : 'agent-stats',
+                current.remote ? { key: current.key } : { sessionId: current.sessionId, agentId: current.agentId });
+            if (!isCurrentAgent(current, epoch, revision)) return;
+            const matches = stats?.threadId === current.sessionId && stats.agentId === current.agentId;
+            if (current.remote && (!matches || stats.source !== 'remote_control'
+                || !(stats.status === 'ok' || stats.status === 'unavailable'
+                    && Object.hasOwn(SnapshotUnavailable, stats.unavailableReason)))) {
+                current.bar.remove(); return;
+            }
+            render(current, matches ? stats : null); positionAgent(current);
+            if (!current.bar.isConnected) current.root.append(current.bar);
+        } catch {
+            if (isCurrentAgent(current, epoch, revision)) {
+                if (current.remote) current.bar.remove();
+                else render(current, null);
+            }
+        } finally {
+            current.inflight = false; pending.delete(identity);
+            if (!pending.size) agentRequests.delete(current.root);
+        }
+    }
+    async function reconcileAgents(sessionId) {
+        const roots = currentPanes(sessionId);
+        if (!roots.size || bindingsPending) return;
+        const epoch = childRevision;
+        const requested = new Map([...roots].map(root => [paneKeys.get(root),
+            { root, revision: paneRevisions.get(root) }]));
+        bindingsPending = true;
+        try {
+            const rows = await api.ipc.invoke('agent-bindings');
+            if (stopped || epoch !== childRevision || sessionId !== parseSessionId(win.location.href)
+                || doc.visibilityState === 'hidden') return;
+            const found = new Map(), duplicates = new Set();
+            if (Array.isArray(rows) && rows.length <= 64) for (const row of rows) {
+                const bound = row?.bound;
+                if (!requested.has(row?.key) || !bound || bound.sessionId !== sessionId
+                    || bound.remote !== sessionId.startsWith('session_') || typeof bound.agentId !== 'string'
+                    || !/^[A-Za-z0-9_-]{1,64}$/.test(bound.agentId)) continue;
+                if (found.has(row.key)) duplicates.add(row.key);
+                found.set(row.key, bound);
+            }
+            for (const [key, { root, revision }] of requested) {
+                if (paneKeys.get(root) !== key || paneRevisions.get(root) !== revision) continue;
+                if (root.dataset.sessionStatsKey !== key || !root.matches(TaskPaneSelector) || !isVisible(root, win)) {
+                    forgetPane(root); continue;
+                }
+                const bound = duplicates.has(key) ? null : found.get(key);
+                if (!bound) { removeAgent(root); continue; }
+                let current = agentEntries.get(root);
+                if (!current || current.sessionId !== bound.sessionId || current.agentId !== bound.agentId
+                    || current.remote !== bound.remote) {
+                    removeAgent(root);
+                    current = { ...makeBar(doc, bound.remote, bound.agentId), root, key,
+                        sessionId: bound.sessionId, agentId: bound.agentId, remote: bound.remote, inflight: false };
+                    agentEntries.set(root, current);
+                    if (!current.remote) { render(current, null); root.append(current.bar); }
+                }
+                current.revision = revision;
+                positionAgent(current); void refreshAgent(current);
+            }
+        } catch {
+            if (!stopped && epoch === childRevision)
+                for (const [key, { root, revision }] of requested)
+                    if (paneKeys.get(root) === key && paneRevisions.get(root) === revision) removeAgent(root);
+        } finally { bindingsPending = false; }
+    }
     function position(current) {
         const bounds = footerBounds(current.root, win);
         current.bar.style.color = win.getComputedStyle(current.root).color;
@@ -218,6 +343,7 @@ function startRenderer(api, options = {}) {
         scheduled = null;
         if (stopped) return;
         const sessionId = parseSessionId(win.location.href);
+        void reconcileAgents(sessionId);
         const root = sessionId && doc.visibilityState !== 'hidden' ? findComposer(win) : null;
         if (!sessionId || !root) { remove(); return; }
         if (!entry || entry.sessionId !== sessionId || entry.root !== root) {
@@ -230,23 +356,44 @@ function startRenderer(api, options = {}) {
     function schedule() {
         if (!stopped && scheduled === null) scheduled = win.setTimeout(reconcile, options.debounceMs ?? 100);
     }
+    function invalidate() { childRevision++; schedule(); }
+    function invalidatePanes(mutation) {
+        const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
+        const pane = target?.closest('[data-pane-root]');
+        for (const root of paneKeys.keys()) {
+            const changed = pane === root || (mutation.type === 'attributes' ? target?.contains(root)
+                : [...mutation.addedNodes, ...mutation.removedNodes].some(node => node.nodeType === 1
+                    && node.contains(root)));
+            if (changed) paneRevisions.set(root, paneRevisions.get(root) + 1);
+        }
+    }
     const observer = new win.MutationObserver(mutations => {
-        if (mutations.some(m => !m.target.closest?.('[data-session-stats]')
-            && !m.target.parentElement?.closest('[data-session-stats]'))) schedule();
+        const relevant = mutations.filter(m => !m.target.closest?.('[data-session-stats]')
+            && !m.target.parentElement?.closest('[data-session-stats]')
+            && !(m.type === 'childList' && [...m.addedNodes, ...m.removedNodes].length
+                && [...m.addedNodes, ...m.removedNodes].every(node => node.nodeType === 1
+                    && node.matches('[data-session-stats]'))));
+        for (const mutation of relevant) invalidatePanes(mutation);
+        if (relevant.length) schedule();
     });
     observer.observe(doc.documentElement, { childList: true, subtree: true, attributes: true,
-        attributeFilter: ['hidden', 'inert', 'aria-hidden', 'contenteditable', 'class'] });
-    for (const event of ['popstate', 'hashchange', 'resize', 'scroll']) win.addEventListener(event, schedule, true);
-    doc.addEventListener('visibilitychange', schedule);
+        attributeFilter: ['hidden', 'inert', 'aria-hidden', 'contenteditable', 'class', 'style',
+            'data-pane-root', 'data-perf-screen'] });
+    for (const event of ['popstate', 'hashchange']) win.addEventListener(event, invalidate, true);
+    for (const event of ['resize', 'scroll']) win.addEventListener(event, schedule, true);
+    doc.addEventListener('visibilitychange', invalidate);
     const timer = win.setInterval(reconcile, options.pollMs ?? 1000);
     reconcile();
     return { stop() {
         if (stopped) return;
         stopped = true; observer.disconnect(); win.clearInterval(timer);
         if (scheduled !== null) win.clearTimeout(scheduled);
-        for (const event of ['popstate', 'hashchange', 'resize', 'scroll']) win.removeEventListener(event, schedule, true);
-        doc.removeEventListener('visibilitychange', schedule);
-        remove(); style.remove();
+        for (const event of ['popstate', 'hashchange']) win.removeEventListener(event, invalidate, true);
+        for (const event of ['resize', 'scroll']) win.removeEventListener(event, schedule, true);
+        doc.removeEventListener('visibilitychange', invalidate);
+        remove();
+        for (const root of paneKeys.keys()) forgetPane(root);
+        style.remove();
     } };
 }
 

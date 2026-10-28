@@ -1,8 +1,8 @@
 {
   "id": "com.kpk.session-stats",
   "name": "Session Stats",
-  "version": "0.5.3",
-  "description": "Turns, model steps, estimated TPS, token usage and cache hit, synchronized through runner snapshots for Remote Control sessions.",
+  "version": "0.6.0",
+  "description": "Session and selected-subagent statistics with estimated TPS, token usage and cache hit, synchronized through Remote Control snapshots.",
   "author": "KPK",
   "githubRepo": "kpkhxlgy0/claude-session-stats",
   "homepage": "https://github.com/kpkhxlgy0/claude-session-stats",

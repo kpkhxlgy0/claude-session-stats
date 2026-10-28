@@ -30,7 +30,8 @@ function fixture(t, options = {}) {
     let onFetch = null, onReply = value => value;
     const requests = [];
     function snapshot() {
-        return createSnapshotProtocol().makeSnapshot({ bridgeSessionId: ID, organizationId: ORG }, STATS,
+        return createSnapshotProtocol().makeSnapshot({ bridgeSessionId: ID, organizationId: ORG,
+            ...(options.sampleAgentId ? { agentId: options.sampleAgentId } : {}) }, STATS,
             { publisherId: PUBLISHER, revision, now: generatedAt });
     }
     win.fetch = async (url, init) => {
@@ -47,7 +48,8 @@ function fixture(t, options = {}) {
         if (!request.url.pathname.endsWith('/events')) return response(detail);
         if (request.url.searchParams.get('sort_order') === 'desc') return response({ data: [], resume_cursor: '10' });
         return response({ data: [event(onReply({ type: 'control_response', response: { request_id: requestId,
-            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: PATH } } }), 12)], resume_cursor: '12' });
+            subtype: 'success', response: { contents: JSON.stringify(snapshot()),
+                absPath: createSnapshotProtocol().snapshotPath(ID, options.sampleAgentId) } } }), 12)], resume_cursor: '12' });
     };
     const reader = createRemoteReader(win, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0,
         responsePollMs: 1, timeoutMs: 100, now: () => clock, ...options });
@@ -78,6 +80,63 @@ test('reads the fixed workspace snapshot through one correlated control request 
         assert.equal(init.redirect, 'error'); assert.equal(init.cache, 'no-store');
     }
     assert.doesNotMatch(JSON.stringify(result), /contents|absPath|organizationId|producer|read_file|request_id/);
+});
+
+test('selected child reads only its own bounded snapshot and returns agent identity', async t => {
+    const agentId = 'aa6fe20fa9956750a';
+    const f = fixture(t, { sampleAgentId: agentId,
+        resolveAgent: () => ({ sessionId: ID, agentId, remote: true }) });
+    const result = await f.reader.read();
+    assert.equal(result?.agentId, agentId);
+    assert.equal(result?.tps, 20);
+    const post = f.requests.find(request => request.init.method === 'POST');
+    assert.equal(JSON.parse(post.init.body).events[0].payload.request.path,
+        `.claude/session-stats/${ID}.agent-${agentId}.json`);
+});
+
+test('a visible task-pane editor cannot suppress either parent or child snapshot reads', async t => {
+    for (const agentId of [undefined, 'a123abc']) {
+        const f = fixture(t, { sampleAgentId: agentId, ...(agentId ? {
+            resolveAgent: () => ({ sessionId: ID, agentId, remote: true }),
+        } : {}) });
+        const pane = f.win.document.createElement('div');
+        pane.dataset.paneRoot = ''; pane.dataset.perfScreen = 'tasks';
+        const editor = f.win.document.createElement('textarea');
+        editor.getClientRects = () => [{width:100,height:20}];
+        pane.append(editor); f.win.document.body.append(pane);
+        const result = await f.reader.read();
+        assert.equal(result?.tps, 20);
+        assert.equal(result?.agentId, agentId);
+        assert.ok(f.requests.some(request => request.init.method === 'POST'));
+    }
+});
+
+test('missing, local, unsafe and foreign-parent child selections never request snapshots', async t => {
+    let selected = null;
+    const f = fixture(t, { resolveAgent: () => selected });
+    for (selected of [null, { sessionId: ID, agentId: '../bad', remote: true },
+        { sessionId: ID, agentId: 'a123abc', remote: false },
+        { sessionId: 'session_other', agentId: 'a123abc', remote: true }]) {
+        assert.equal(await f.reader.read(), null);
+    }
+    assert.equal(f.requests.length, 0);
+});
+
+test('child selection change invalidates a pending read and cannot display another child snapshot', async t => {
+    const agentId = 'a123abc';
+    let selected = { sessionId: ID, agentId, remote: true }, release;
+    const f = fixture(t, { sampleAgentId: agentId, resolveAgent: () => selected });
+    f.setFetch(({url,requestId,snapshot}) => url.searchParams.get('sort_order') === 'asc'
+        ? new Promise(resolve => { release = () => resolve(response({ data: [event({ type: 'control_response',
+            response: { request_id: requestId, subtype: 'success', response: {
+                contents: JSON.stringify(snapshot()), absPath: createSnapshotProtocol().snapshotPath(ID, agentId),
+            } } }, 12)], resume_cursor: '12' })); }) : undefined);
+    const pending = f.reader.read();
+    await waitFor(() => release);
+    selected = { ...selected, agentId: 'a456def' };
+    release();
+    assert.equal(await pending, null);
+    assert.equal(f.reader.peek(), null);
 });
 
 test('cloud, shared, mismatched, unconnected and ambiguous identities cannot read the snapshot', async t => {
@@ -303,6 +362,33 @@ test('serialized bridge returns pending at 750ms, finishes in the page and clean
     const reader = f.win[Symbol.for('claudepp.session-stats.slow-owner')];
     assert.equal((await reader.read()).tps, 20); assert.equal(timers.size, 0);
     vm.runInContext(cleanupScript, context); assert.equal(f.win[Symbol.for('claudepp.session-stats.slow-owner')], undefined);
+});
+
+test('serialized child reader derives identity from the selected pane and rejects arbitrary script input', async t => {
+    const vm = require('node:vm'), agentId = 'a123abc';
+    const f = fixture(t, { sampleAgentId: agentId });
+    const pane = f.win.document.createElement('div');
+    pane.dataset.paneRoot = ''; pane.dataset.perfScreen = 'tasks'; pane.dataset.sessionStatsKey = 'pane-1';
+    pane.getClientRects = () => [{ width: 200, height: 400 }]; f.win.document.body.append(pane);
+    const top = { tag: 3, stateNode: {} }; top.stateNode.current = top;
+    const ref = { id: ID, type: 'bridge' };
+    const host = { stateNode: pane, memoizedProps: {}, return: top };
+    host.child = { memoizedProps: { view: { kind: 'subagent', toolUseId: 'tool_1' }, sessionRef: ref }, return: host };
+    host.child.child = { memoizedProps: { openedToolUseId: 'tool_1', sessionRef: ref,
+        paneView: { agentId }, task: { taskId: agentId, toolUseId: 'tool_1' } }, return: host.child };
+    pane.__reactFiber$test = host;
+    f.setReply(reply => { const sample = JSON.parse(reply.response.response.contents);
+        sample.generatedAt = Date.now(); reply.response.response.contents = JSON.stringify(sample); return reply; });
+    const scripts = buildRemoteScripts('child-owner');
+    assert.equal(typeof scripts.agentScript, 'function');
+    for (const key of [null, '', 'pane-1);window.secret', 'x'.repeat(129)]) assert.equal(scripts.agentScript(key), null);
+    const context = vm.createContext({ window: f.win, URL, URLSearchParams, AbortController, setTimeout, clearTimeout });
+    const result = await vm.runInContext(scripts.agentScript('pane-1'), context);
+    assert.equal(result?.agentId, agentId); assert.equal(result?.tps, 20);
+    pane.remove();
+    assert.equal(await vm.runInContext(scripts.agentScript('pane-1'), context), null);
+    vm.runInContext(scripts.cleanupScript, context);
+    assert.equal(f.win[Symbol.for('claudepp.session-stats.child-owner')], undefined);
 });
 test('current-directory snapshot requests do not use the fixed launch-root anchor', async t => {
     const f = fixture(t);

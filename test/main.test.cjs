@@ -8,7 +8,7 @@ function fixture(extra = {}) {
     let handler, disposed = false;
     const calls = [];
     const api = { manifest: { id: 'com.kpk.session-stats' },
-        ipc: { handle(name, fn) { assert.equal(name, 'stats'); handler = fn; } }, log: { info() {} } };
+        ipc: { handle(name, fn) { if (name === 'stats') handler = fn; } }, log: { info() {} } };
     const options = { claudeData: 'unused', claudeHome: 'unused', ipcMain: { handle() {}, removeHandler() {} },
         publisher: { start() {}, readLocal: async () => null, stop() {} },
         resolveSession: async (_, id) => id === LOCAL ? CLI : null,

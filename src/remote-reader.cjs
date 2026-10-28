@@ -22,6 +22,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         const editors = [...win.document.querySelectorAll(
             '.ProseMirror[contenteditable], [contenteditable="true"][role="textbox"], textarea')]
             .filter(node => node.getClientRects().length
+                && !node.closest('[data-pane-root][data-perf-screen="tasks"]')
                 && !node.closest('[hidden],[inert],[aria-hidden="true"],dialog,[role="dialog"],[role="menu"]'));
         if (editors.length !== 1) return null;
         const orgs = new Set();
@@ -45,9 +46,18 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             }
             break;
         }
-        return orgs.size === 1 ? { threadId: match[1], org: [...orgs][0] } : null;
+        if (orgs.size !== 1) return null;
+        const bound = { threadId: match[1], org: [...orgs][0] };
+        if (options.resolveAgent) {
+            let selected;
+            try { selected = options.resolveAgent(); } catch { return null; }
+            const agentId = protocol.normalizeAgentId(selected?.agentId);
+            if (!agentId || selected?.sessionId !== bound.threadId || selected.remote !== true) return null;
+            bound.agentId = agentId;
+        }
+        return bound;
     }
-    const same = (a, b) => a && b && a.threadId === b.threadId && a.org === b.org;
+    const same = (a, b) => a && b && a.threadId === b.threadId && a.org === b.org && a.agentId === b.agentId;
     function cancel() { state?.controller?.abort(); state = null; }
     function valid(current) {
         if (stopped || current !== state) return false;
@@ -56,6 +66,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
     }
     function unavailable(current, reason) {
         return { threadId: current.bound.threadId, source: 'remote_control', status: 'unavailable',
+            ...(current.bound.agentId ? { agentId: current.bound.agentId } : {}),
             turns: null, steps: null, totalTokens: null, inputTokens: null, outputTokens: null,
             cachedInputTokens: null, cacheHit: null, tps: null, usageComplete: false, unavailableReason: reason };
     }
@@ -90,7 +101,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             || file.encoding !== undefined && file.encoding !== 'utf-8' || !samePath(file.absPath, expectedPath))
             throw failure('snapshot-invalid');
         const parsed = protocol.parseSnapshot(file.contents, { bridgeSessionId: current.bound.threadId,
-            organizationId: current.bound.org, now: now() });
+            organizationId: current.bound.org, agentId: current.bound.agentId, now: now() });
         if (!parsed.ok) throw failure(`snapshot-${parsed.reason}`);
         const sample = parsed.snapshot, previous = current.accepted;
         const serialized = JSON.stringify(sample);
@@ -108,6 +119,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         current.accepted = sample; current.acceptedText = serialized;
         if (sample.stats.status !== 'ok') throw failure('source-unavailable');
         return { ...sample.stats, threadId: current.bound.threadId, source: 'remote_control',
+            ...(current.bound.agentId ? { agentId: current.bound.agentId } : {}),
             snapshotGeneratedAt: sample.generatedAt, snapshotRevision: sample.revision,
             snapshotPublisherId: sample.publisherId };
     }
@@ -175,7 +187,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             current.trusted = true;
             if ((session.connection_status ?? detail.connection_status) !== 'connected') throw failure('offline');
             if (!current.result) current.result = unavailable(current, 'pending');
-            const path = protocol.snapshotPath(current.bound.threadId);
+            const path = protocol.snapshotPath(current.bound.threadId, current.bound.agentId);
             if (!path) throw failure('snapshot-invalid');
             const initial = readPage(await request(`${base}/events?${new URLSearchParams({ limit: '1', sort_order: 'desc' })}`), 0, true);
             let cursor = initial.cursor;
@@ -241,20 +253,50 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
 
 function buildRemoteScripts(owner) {
     const fs = require('node:fs');
+    const { createSubagentBindings } = require('./subagent-binding.cjs');
     const key = JSON.stringify(`claudepp.session-stats.${owner}`);
     const protocol = fs.readFileSync(require.resolve('./snapshot.cjs'), 'utf8');
-    return {
-        script: `(() => { const key = Symbol.for(${key});
+    function scriptFor(paneKey) {
+        return `(() => { const key = Symbol.for(${key});
             if (!window[key]) {
                 const protocol = (() => { const module = { exports: {} }; ${protocol}\nreturn module.exports; })();
-                window[key] = (${createRemoteReader.toString()})(window, protocol.createSnapshotProtocol);
+                const makeReader = ${createRemoteReader.toString()};
+                const bindings = (${createSubagentBindings.toString()})();
+                const parent = makeReader(window, protocol.createSnapshotProtocol), agents = new Map();
+                window[key] = { read: () => parent.read(), peek: () => parent.peek(),
+                    forAgent(paneKey) {
+                        const selected = bindings.readBindings(window);
+                        for (const [id, reader] of agents) if (!selected.some(item => item.key === id)) {
+                            reader.stop(); agents.delete(id);
+                        }
+                        if (!selected.some(item => item.key === paneKey && item.bound?.remote)) return null;
+                        let reader = agents.get(paneKey);
+                        if (!reader) {
+                            if (agents.size >= 8) { const id = agents.keys().next().value;
+                                agents.get(id).stop(); agents.delete(id); }
+                            reader = makeReader(window, protocol.createSnapshotProtocol, {
+                                resolveAgent: () => bindings.readBindings(window).find(item => item.key === paneKey)?.bound,
+                            });
+                            agents.set(paneKey, reader);
+                        }
+                        return reader;
+                    },
+                    stop() { parent.stop(); for (const reader of agents.values()) reader.stop(); agents.clear(); },
+                };
             }
-            const reader = window[key];
+            const reader = ${paneKey === undefined ? 'window[key]' : `window[key].forAgent(${JSON.stringify(paneKey)})`};
+            if (!reader) return null;
             let timer;
             return Promise.race([reader.read(), new Promise(resolve => {
                 timer = setTimeout(() => resolve(reader.peek()), 750);
             })]).finally(() => clearTimeout(timer));
-        })()`,
+        })()`;
+    }
+    return {
+        script: scriptFor(),
+        agentScript(paneKey) {
+            return typeof paneKey === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(paneKey) ? scriptFor(paneKey) : null;
+        },
         cleanupScript: `(() => { const key = Symbol.for(${key}); window[key]?.stop(); delete window[key]; })()`,
     };
 }

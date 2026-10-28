@@ -5,17 +5,25 @@ const { randomUUID } = require('node:crypto');
 const { createSnapshotProtocol } = require('./snapshot.cjs');
 const { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation } = require('./snapshot-bindings.cjs');
 const { isLocalId } = require('./session-map.cjs');
+const MaxAgentsPerParent = 128;
+const MaxChildBindings = 4096;
 
 function fileIdentity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
 function bindingKey(binding) {
     return JSON.stringify([binding.accountId, binding.organizationId, binding.localSessionId,
         binding.cliSessionId, binding.bridgeSessionId, binding.workspaceRoot, binding.metadataFile,
-        binding.workspaceEvidence ?? null]);
+        binding.workspaceEvidence ?? null, binding.agentId ?? null]);
 }
 
 function sourceKey(binding) {
     return JSON.stringify([binding.accountId, binding.organizationId, binding.cliSessionId,
-        binding.workspaceRoot, binding.workspaceEvidence ?? null]);
+        binding.workspaceRoot, binding.workspaceEvidence ?? null, binding.agentId ?? null]);
+}
+
+function parentBinding(binding) {
+    if (binding.agentId === undefined) return binding;
+    const { agentId, ...parent } = binding;
+    return parent;
 }
 
 function containsPath(root, candidate) {
@@ -60,11 +68,13 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     const protectedRoots = resolveProtectedRoots(installationRoot, watchedTweaksRoot);
     let publicationRevision = 0;
     let requestedLocalId;
+    let requestedAgentId;
     let timer, pending, stopPending, stopped = false, started = false, completedPoll = false, epoch = 0;
 
-    function unavailable(localSessionId) {
+    function unavailable(localSessionId, agentId) {
         return { ...protocol.projectStats({ status: 'unavailable', usageComplete: false }),
-            threadId: localSessionId, snapshotUnavailableReason: 'publish-failed' };
+            threadId: localSessionId, ...(agentId !== undefined ? { agentId } : {}),
+            snapshotUnavailableReason: 'publish-failed' };
     }
 
     async function directoryInfo(directory) {
@@ -121,7 +131,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             let generatedAt;
             try { generatedAt = JSON.parse(text)?.generatedAt; } catch { /* strict protocol rejects below */ }
             const parsed = protocol.parseSnapshot(text, { bridgeSessionId: binding.bridgeSessionId,
-                organizationId: binding.organizationId, now: generatedAt });
+                organizationId: binding.organizationId, agentId: binding.agentId, now: generatedAt });
             if (!parsed.ok) throw new Error('Unknown snapshot destination ownership');
             return { snapshot: parsed.snapshot, identity: fileIdentity(info) };
         } finally { await handle.close(); }
@@ -153,14 +163,14 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
 
     async function current(binding, runEpoch) {
         if (stopped || epoch !== runEpoch) return false;
-        const matches = await recheckSnapshotBinding(binding, { resolveWorkspace });
+        const matches = await recheckSnapshotBinding(parentBinding(binding), { resolveWorkspace });
         return !stopped && epoch === runEpoch && matches;
     }
 
     async function publish(binding, snapshot, runEpoch) {
         const expected = await directories(binding, true);
         const directory = expected.at(-1)[0];
-        const destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId));
+        const destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
         await ensureIgnore(directory);
         const before = await readDestination(destination, binding);
         if (!await current(binding, runEpoch)) throw new Error('Snapshot identity changed');
@@ -218,14 +228,52 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                         && candidate.organizationId === state.binding.organizationId
                         && candidate.localSessionId === state.binding.localSessionId
                         && candidate.cliSessionId === state.binding.cliSessionId
-                        && candidate.bridgeSessionId === state.binding.bridgeSessionId);
+                        && candidate.bridgeSessionId === state.binding.bridgeSessionId
+                        && candidate.agentId === state.binding.agentId);
                     if (state.binding.workspaceEvidence || replacement?.workspaceEvidence) {
                         // Forget moved/unverifiable destinations; never use their payload as migration input.
                         ownFiles.delete(state.destination);
-                    } else await removeOwn(state.destination, state.binding);
+                    } else {
+                        await removeOwn(state.destination, state.binding);
+                        ownFiles.delete(state.destination);
+                    }
                 }
             }
         }
+    }
+
+    function sourceContext(binding, runEpoch) {
+        return binding.workspaceEvidence ? {
+            workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch),
+            resolveRelocation: async cwd => {
+                if (stopped || runEpoch !== epoch) return null;
+                const proof = await resolveSnapshotRelocation(parentBinding(binding), cwd, { resolveWorkspace });
+                return !stopped && runEpoch === epoch ? proof : null;
+            } } : undefined;
+    }
+
+    async function expandBindings(parents, runEpoch) {
+        if (typeof store.listAgents !== 'function' || typeof store.getAgentStats !== 'function') return parents;
+        const result = [...parents], sources = new Map();
+        let children = 0;
+        for (const binding of parents) {
+            if (stopped || runEpoch !== epoch || children >= MaxChildBindings) break;
+            const key = sourceKey(binding);
+            if (!sources.has(key)) {
+                let ids = [];
+                try {
+                    const listed = await store.listAgents(binding.cliSessionId, sourceContext(binding, runEpoch));
+                    if (Array.isArray(listed) && listed.length <= MaxAgentsPerParent
+                        && [...listed].every(id => protocol.normalizeAgentId(id))) ids = [...new Set(listed)];
+                } catch { /* A child discovery failure never invalidates its parent sample. */ }
+                sources.set(key, ids);
+            }
+            const ids = sources.get(key);
+            if (children + ids.length > MaxChildBindings) continue;
+            for (const agentId of ids) result.push({ ...binding, agentId });
+            children += ids.length;
+        }
+        return result;
     }
 
     async function collect(bindings, samples, runEpoch) {
@@ -233,13 +281,12 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             if (stopped || runEpoch !== epoch) return;
             const key = sourceKey(binding);
             if (!samples.has(key)) {
-                try { samples.set(key, await store.getStats(binding.cliSessionId, binding.workspaceEvidence ? {
-                    workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch),
-                    resolveRelocation: async cwd => {
-                        if (stopped || runEpoch !== epoch) return null;
-                        const proof = await resolveSnapshotRelocation(binding, cwd, { resolveWorkspace });
-                        return !stopped && runEpoch === epoch ? proof : null;
-                    } } : undefined)); }
+                try {
+                    const context = sourceContext(binding, runEpoch);
+                    samples.set(key, binding.agentId === undefined
+                        ? await store.getStats(binding.cliSessionId, context)
+                        : await store.getAgentStats(binding.cliSessionId, binding.agentId, context));
+                }
                 catch { samples.set(key, null); }
             }
         }
@@ -276,7 +323,8 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 publicationRevision = snapshot.revision;
                 state.publication = { snapshot, finished: new Promise(resolve => { finishPublication = resolve; }) };
                 state.snapshot = await publish(binding, snapshot, runEpoch);
-                state.destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId));
+                state.destination = path.join(binding.workspaceRoot,
+                    protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
                 published.push(binding);
             } catch {
                 state.snapshot = null;
@@ -291,8 +339,9 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     async function poll() {
         const runEpoch = epoch;
         const blocked = new Set();
-        const bindings = await discoverSnapshotBindings(claudeData, { resolveWorkspace,
+        const parents = await discoverSnapshotBindings(claudeData, { resolveWorkspace,
             onUnavailableWorkspace: id => blocked.add(id) });
+        const bindings = await expandBindings(parents, runEpoch);
         if (stopped || runEpoch !== epoch) return;
         unavailableWorkspaces = blocked;
         await pruneStates(bindings);
@@ -300,7 +349,8 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             const key = bindingKey(binding);
             if (!states.has(key)) states.set(key, { binding, snapshot: null });
         }
-        const requested = bindings.filter(binding => binding.localSessionId === requestedLocalId);
+        const requested = bindings.filter(binding => binding.localSessionId === requestedLocalId
+            && binding.agentId === requestedAgentId);
         const ready = requested.some(binding => {
             const snapshot = states.get(bindingKey(binding)).snapshot;
             return snapshot && protocol.parseSnapshot(JSON.stringify(snapshot),
@@ -316,7 +366,8 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             await collect(batches[index], samples, runEpoch);
             if (stopped || runEpoch !== epoch) return;
             // Every batch uses global confirmation, including bindings sampled in an earlier batch.
-            const confirmedBindings = await discoverSnapshotBindings(claudeData, { resolveWorkspace });
+            const confirmedParents = await discoverSnapshotBindings(claudeData, { resolveWorkspace });
+            const confirmedBindings = await expandBindings(confirmedParents, runEpoch);
             if (stopped || runEpoch !== epoch) return;
             if (index > 0) await pruneStates(confirmedBindings, earlyPublished);
             const published = await publishBatch(batches[index], samples, new Set(confirmedBindings.map(bindingKey)), runEpoch);
@@ -344,17 +395,19 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         return queuePoll();
     }
 
-    async function readLocal(localSessionId, { waitForPoll = true } = {}) {
+    async function readLocal(localSessionId, { agentId, waitForPoll = true } = {}) {
         if (!isLocalId(localSessionId)) return null;
-        if (stopped) return unavailable(localSessionId);
-        if (!waitForPoll) requestedLocalId = localSessionId.toLowerCase();
+        if (agentId !== undefined && !protocol.normalizeAgentId(agentId)) return null;
+        if (stopped) return unavailable(localSessionId, agentId);
+        if (!waitForPoll) { requestedLocalId = localSessionId.toLowerCase(); requestedAgentId = agentId; }
         if (waitForPoll) await queuePoll();
-        if (stopped) return unavailable(localSessionId);
-        const bound = [...states.values()].filter(state => state.binding.localSessionId === localSessionId.toLowerCase());
+        if (stopped) return unavailable(localSessionId, agentId);
+        const local = [...states.values()].filter(state => state.binding.localSessionId === localSessionId.toLowerCase());
+        const bound = local.filter(state => state.binding.agentId === agentId);
         if (!bound.length) return !completedPoll || unavailableWorkspaces.has(localSessionId.toLowerCase())
-            ? unavailable(localSessionId) : null;
+            || agentId !== undefined && local.length ? unavailable(localSessionId, agentId) : null;
         const state = bound.find(candidate => candidate.snapshot);
-        if (!state) return unavailable(localSessionId);
+        if (!state) return unavailable(localSessionId, agentId);
         const runEpoch = epoch, key = bindingKey(state.binding);
         const active = () => !stopped && epoch === runEpoch && states.get(key) === state && state.snapshot;
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -383,17 +436,18 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     && snapshot.stats.status === 'ok' && latest.stats.status === 'ok') sample = snapshot;
                 else throw new Error('Published snapshot changed');
                 const parsed = protocol.parseSnapshot(JSON.stringify(sample), { bridgeSessionId: state.binding.bridgeSessionId,
-                    organizationId: state.binding.organizationId, now: now() });
+                    organizationId: state.binding.organizationId, agentId, now: now() });
                 if (!parsed.ok) throw new Error('Published snapshot expired');
                 return { ...sample.stats, threadId: localSessionId, snapshotGeneratedAt: sample.generatedAt,
-                    snapshotRevision: sample.revision, snapshotPublisherId: sample.publisherId };
+                    snapshotRevision: sample.revision, snapshotPublisherId: sample.publisherId,
+                    ...(agentId !== undefined ? { agentId } : {}) };
             } catch (error) {
                 // Atomic replacement can cross lstat/open/read. Retry only this file-identity race;
                 // each attempt must still match a committed sample and recheck the binding.
                 if (error.code === 'SNAPSHOT_DESTINATION_CHANGED' && attempt < 2 && active()) continue;
                 // File cleanup belongs to serialized poll/stop paths, never an older read.
                 if (state.snapshot === snapshot) state.snapshot = null;
-                return unavailable(localSessionId);
+                return unavailable(localSessionId, agentId);
             }
         }
     }

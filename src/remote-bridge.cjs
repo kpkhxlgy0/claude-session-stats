@@ -45,14 +45,15 @@ function projectStats(value) {
     };
 }
 
-function createRemoteBridge({ ipcMain, manifestId, script, cleanupScript, onReady = () => {}, timeoutMs = 3000 }) {
-    const channel = `claudepp:${manifestId}:remote-stats`;
+function createRemoteBridge({ ipcMain, manifestId, script, cleanupScript, onReady = () => {}, timeoutMs = 3000,
+    channelName = 'remote-stats', project = projectStats }) {
+    const channel = `claudepp:${manifestId}:${channelName}`;
     const pending = new Set();
     const frames = new Map();
     let stopped = false;
     const readyFrames = new WeakSet();
-    ipcMain.handle(channel, event => {
-        let sender, frame, url;
+    ipcMain.handle(channel, (event, argument) => {
+        let sender, frame, url, source;
         try {
             if (stopped) return null;
             sender = event.sender;
@@ -60,6 +61,8 @@ function createRemoteBridge({ ipcMain, manifestId, script, cleanupScript, onRead
             if (!frame || frame !== sender.mainFrame) return null;
             url = frame.url;
             if (!isTrustedUrl(url)) return null;
+            source = typeof script === 'function' ? script(argument) : script;
+            if (typeof source !== 'string' || !source.length) return null;
         } catch { return null; }
         if (typeof cleanupScript === 'string' && cleanupScript.length) frames.set(frame, sender);
         return new Promise(resolve => {
@@ -74,12 +77,12 @@ function createRemoteBridge({ ipcMain, manifestId, script, cleanupScript, onRead
             const timer = setTimeout(() => finish(null), timeoutMs);
             pending.add(finish);
             try {
-                Promise.resolve(frame.executeJavaScript(script)).then(value => {
+                Promise.resolve(frame.executeJavaScript(source)).then(value => {
                     if (settled) return;
                     try {
                         if (stopped || event.sender !== sender || event.senderFrame !== frame
                             || sender.mainFrame !== frame || frame.url !== url) return finish(null);
-                        const stats = projectStats(value);
+                        const stats = project(value);
                         if (stats && stats.turns !== null && !readyFrames.has(frame)) {
                             readyFrames.add(frame); onReady(stats);
                         }
@@ -104,4 +107,4 @@ function createRemoteBridge({ ipcMain, manifestId, script, cleanupScript, onRead
     } };
 }
 
-module.exports = { createRemoteBridge };
+module.exports = { createRemoteBridge, projectStats };

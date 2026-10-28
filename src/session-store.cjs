@@ -5,6 +5,7 @@ const path = require('node:path');
 const { createSessionHistory } = require('./session-history.cjs');
 const { createForkHistory, version } = require('./fork-history.cjs');
 const { createSessionSourceResolver } = require('./session-source.cjs');
+const { createSubagentStore } = require('./subagent-store.cjs');
 
 const UuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SessionPattern = /^([0-9a-f-]{36})\.jsonl$/i;
@@ -30,12 +31,14 @@ const EmptyStats = Object.freeze({
 
 function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
 {
-    const makeMetrics = createMetrics || ((sessionId) => require('./metrics.cjs').createMetrics({ sessionId }));
+    const makeMetrics = createMetrics
+        || ((sessionId, agentId) => require('./metrics.cjs').createMetrics({ sessionId, agentId }));
     const roots = typeof claudeHome === 'string' && claudeHome.length
         ? [path.join(claudeHome, 'projects')]
         : [];
     const sessions = new Map();
     const resolveSource = createSessionSourceResolver();
+    const subagents = createSubagentStore({ claudeHome, createMetrics: makeMetrics, locateSource });
     let index = new Map();
     let indexAt = -Infinity;
     let indexPending;
@@ -169,7 +172,7 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         const candidates = index.get(threadId);
         if (!candidates?.length) return null;
         if (candidates.length === 1) return { path: candidates[0] };
-        return resolveSource(threadId, candidates, context);
+        return await resolveSource(threadId, candidates, context) || { incomplete: true };
     }
 
     async function locate(threadId, context)
@@ -393,10 +396,11 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
     {
         disposed = true;
         sessions.clear();
+        subagents.dispose();
         index.clear();
     }
 
-    return { getStats, dispose };
+    return { getStats, getAgentStats: subagents.getAgentStats, listAgents: subagents.listAgents, dispose };
 }
 
 module.exports = { createSessionStore };

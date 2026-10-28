@@ -72,8 +72,10 @@ function mergeUsage(target, source)
     }
 }
 
-function createMetrics({ sessionId } = {})
+function createMetrics({ sessionId, agentId } = {})
 {
+    const agentMode = agentId !== undefined;
+    const currentAgentId = identifier(agentId);
     const turns = new Set();
     const userAliases = new Map();
     const responses = new Map();
@@ -85,6 +87,8 @@ function createMetrics({ sessionId } = {})
     function acceptsSession(row)
     {
         const incomingId = identifier(row.sessionId);
+        if (agentMode) return currentSessionId !== null && currentAgentId !== null
+            && incomingId === currentSessionId && row.agentId === currentAgentId && row.isSidechain === true;
         if (!incomingId) return true;
         if (!currentSessionId) currentSessionId = incomingId;
         return incomingId === currentSessionId;
@@ -135,7 +139,7 @@ function createMetrics({ sessionId } = {})
     // 返回 true 表示新输入，供远程读取器同步结束上一段响应流。
     function ingest(row)
     {
-        if (!isRecord(row) || !isRecord(row.message) || row.isMeta || row.isSidechain
+        if (!isRecord(row) || !isRecord(row.message) || row.isMeta || (!agentMode && row.isSidechain)
             || row.isCompactSummary || row.isSynthetic || row.isApiErrorMessage) return;
         const message = row.message;
         if (row.type === 'user' && message.role === 'user')

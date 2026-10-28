@@ -74,7 +74,7 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         };
         const receiver = createRemoteReader(dom.window, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0, responsePollMs: 0 });
         const api = { manifest: { id: 'com.kpk.session-stats' }, log: { info() {} },
-            ipc: { handle(name, fn) { assert.equal(name, 'stats'); handler = fn; } } };
+            ipc: { handle(name, fn) { if (name === 'stats') handler = fn; } } };
         const options = { claudeData, claudeHome, ipcMain: { handle() {}, removeHandler() {} } };
         t.after(async () => { receiver.stop(); dom.window.close(); await controller?.stop(); await fs.rm(root, { recursive: true }); });
         controller = startMain(api, options);
