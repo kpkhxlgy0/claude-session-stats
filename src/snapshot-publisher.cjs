@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const { createSnapshotProtocol } = require('./snapshot.cjs');
 const { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation,
     snapshotBindingIdentity } = require('./snapshot-bindings.cjs');
@@ -13,6 +13,13 @@ const MaxAgentBatch = 8;
 const MaxConcurrentPublications = 4;
 
 function fileIdentity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
+function fileVersion(info) { return `${fileIdentity(info)}:${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.nlink}`; }
+function destinationChanged() {
+    return Object.assign(new Error('Snapshot destination changed'), { code: 'SNAPSHOT_DESTINATION_CHANGED' });
+}
+function sameDestination(before, after) {
+    return before?.version === after?.version && (!before?.corrupt || after?.corrupt?.equals(before.corrupt));
+}
 function bindingKey(binding) {
     return JSON.stringify([binding.accountId, binding.organizationId, binding.localSessionId,
         binding.cliSessionId, binding.bridgeSessionId, binding.workspaceRoot, binding.metadataFile,
@@ -172,30 +179,94 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             if (await directoryInfo(directory) !== identity) throw new Error('Snapshot directory changed');
     }
 
-    async function readDestination(file, binding) {
+    async function readFileProof(file) {
         let info;
         try { info = await fs.lstat(file); }
         catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-        if (!info.isFile() || info.isSymbolicLink() || info.size > protocol.maxBytes)
+        if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > protocol.maxBytes)
             throw new Error('Unsafe snapshot destination');
         const handle = await fs.open(file, 'r');
         try {
             const opened = await handle.stat();
-            if (!opened.isFile() || fileIdentity(opened) !== fileIdentity(info))
-                throw Object.assign(new Error('Snapshot destination changed'), { code: 'SNAPSHOT_DESTINATION_CHANGED' });
+            if (!opened.isFile() || fileVersion(opened) !== fileVersion(info)) throw destinationChanged();
             const buffer = Buffer.alloc(protocol.maxBytes + 1);
             const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
             if (bytesRead > protocol.maxBytes) throw new Error('Unsafe snapshot destination');
-            if (fileIdentity(await fs.lstat(file)) !== fileIdentity(info))
-                throw Object.assign(new Error('Snapshot destination changed'), { code: 'SNAPSHOT_DESTINATION_CHANGED' });
-            const text = buffer.subarray(0, bytesRead).toString('utf8');
-            let generatedAt;
-            try { generatedAt = JSON.parse(text)?.generatedAt; } catch { /* strict protocol rejects below */ }
-            const parsed = protocol.parseSnapshot(text, { bridgeSessionId: binding.bridgeSessionId,
-                organizationId: binding.organizationId, agentId: binding.agentId, now: generatedAt });
-            if (!parsed.ok) throw new Error('Unknown snapshot destination ownership');
-            return { snapshot: parsed.snapshot, identity: fileIdentity(info) };
+            const final = await fs.lstat(file);
+            if (bytesRead !== info.size || fileVersion(await handle.stat()) !== fileVersion(info)
+                || !final.isFile() || final.isSymbolicLink() || fileVersion(final) !== fileVersion(info))
+                throw destinationChanged();
+            return { bytes: buffer.subarray(0, bytesRead), identity: fileIdentity(info), version: fileVersion(info) };
         } finally { await handle.close(); }
+    }
+
+    async function readDestination(file, binding, allowCorrupt = false) {
+        const proof = await readFileProof(file);
+        if (!proof) return null;
+        let text, value;
+        try {
+            text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(proof.bytes);
+            value = JSON.parse(text);
+        } catch {
+            if (allowCorrupt) return { corrupt: proof.bytes, identity: proof.identity, version: proof.version };
+            throw new Error('Unknown snapshot destination ownership');
+        }
+        const parsed = protocol.parseSnapshot(text, { bridgeSessionId: binding.bridgeSessionId,
+            organizationId: binding.organizationId, agentId: binding.agentId, now: value?.generatedAt });
+        if (!parsed.ok) throw new Error('Unknown snapshot destination ownership');
+        return { snapshot: parsed.snapshot, identity: proof.identity, version: proof.version };
+    }
+
+    async function backupCorrupt(destination, before, expected) {
+        const directory = path.join(expected.at(-1)[0], 'corrupt-backups');
+        await confirmDirectories(expected);
+        try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+        const guarded = [...expected, [directory, await directoryInfo(directory)]];
+        await confirmDirectories(guarded);
+        const digest = createHash('sha256').update(before.corrupt).digest('hex');
+        const backup = path.join(directory, `${path.basename(destination)}.corrupt-${digest}.bak`);
+        let handle, createdIdentity, createdWriteComplete = false;
+        try {
+            try {
+                try {
+                    handle = await fs.open(backup, 'wx', 0o600);
+                    createdIdentity = fileIdentity(await handle.stat());
+                } catch (error) {
+                    if (error.code !== 'EEXIST') throw error;
+                    const existing = await readFileProof(backup);
+                    await confirmDirectories(guarded);
+                    if (!existing?.bytes.equals(before.corrupt)) throw new Error('Unknown corrupt snapshot backup');
+                    handle = await fs.open(backup, 'r+');
+                    if (fileVersion(await handle.stat()) !== existing.version) throw destinationChanged();
+                }
+                await confirmDirectories(guarded);
+                const opened = await handle.stat(), current = await fs.lstat(backup);
+                if (!opened.isFile() || opened.nlink !== 1 || current.isSymbolicLink()
+                    || fileVersion(opened) !== fileVersion(current)) throw destinationChanged();
+                if (createdIdentity) { await handle.writeFile(before.corrupt); createdWriteComplete = true; }
+                await confirmDirectories(guarded);
+                await handle.sync();
+                await confirmDirectories(guarded);
+            } finally { await handle?.close(); }
+            const saved = await readFileProof(backup);
+            await confirmDirectories(guarded);
+            if (!saved?.bytes.equals(before.corrupt)) throw new Error('Corrupt snapshot backup changed');
+            return guarded;
+        } catch (error) {
+            // Only our own incomplete creation may be removed. Existing conflicts
+            // and complete copies survive errors so a later refresh can reuse them.
+            if (createdIdentity && !createdWriteComplete) try {
+                await confirmDirectories(guarded);
+                const partial = await readFileProof(backup);
+                if (partial?.identity === createdIdentity && partial.bytes.length < before.corrupt.length
+                    && before.corrupt.subarray(0, partial.bytes.length).equals(partial.bytes)) {
+                    await confirmDirectories(guarded);
+                    const current = await fs.lstat(backup);
+                    if (!current.isSymbolicLink() && fileVersion(current) === partial.version) await fs.unlink(backup);
+                }
+            } catch { /* Preserve unproven or unsafe backup state. */ }
+            throw error;
+        }
     }
 
     async function ensureIgnore(directory) {
@@ -218,7 +289,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             if (existing?.snapshot.publisherId !== publisherId.toLowerCase()) return;
             await confirmDirectories(expected);
             const current = await fs.lstat(file);
-            if (fileIdentity(current) === existing.identity && !current.isSymbolicLink()) await fs.unlink(file);
+            if (fileVersion(current) === existing.version && !current.isSymbolicLink()) await fs.unlink(file);
         } catch { /* Never remove unknown or unsafe state. */ }
     }
 
@@ -257,24 +328,34 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     }
 
     async function publish(binding, snapshot, runEpoch) {
-        const expected = await directories(binding, true);
+        let expected = await directories(binding, true);
         const directory = expected.at(-1)[0];
         const destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
         await ensureIgnore(directory);
-        const before = await readDestination(destination, binding);
-        if (!await current(binding, runEpoch)) throw new Error('Snapshot identity changed');
-        await confirmDirectories(expected);
+        const before = await readDestination(destination, binding, snapshot.stats.status === 'ok');
         const temporary = path.join(directory, `.${binding.bridgeSessionId}.${publisherId}.${randomUUID()}.tmp`);
         let handle;
         try {
+            if (!await current(binding, runEpoch)) throw new Error('Snapshot identity changed');
+            await confirmDirectories(expected);
+            if (before?.corrupt) {
+                if (!await stillOwned(binding, runEpoch)) throw new Error('Snapshot identity changed');
+                expected = await backupCorrupt(destination, before, expected);
+                if (!await stillOwned(binding, runEpoch)) throw new Error('Snapshot identity changed');
+                await confirmDirectories(expected);
+                if (!sameDestination(before, await readDestination(destination, binding, true))) throw destinationChanged();
+            }
             handle = await fs.open(temporary, 'wx', 0o600);
             ownTemps.add(temporary);
             await handle.writeFile(JSON.stringify(snapshot) + '\n', 'utf8');
+            if (before?.corrupt) await handle.sync();
             await handle.close(); handle = null;
-            if (!await current(binding, runEpoch)) throw new Error('Snapshot identity changed');
+            if (!await (before?.corrupt ? stillOwned(binding, runEpoch) : current(binding, runEpoch)))
+                throw new Error('Snapshot identity changed');
             await confirmDirectories(expected);
-            const after = await readDestination(destination, binding);
-            if (before?.identity !== after?.identity) throw new Error('Snapshot destination changed');
+            const after = await readDestination(destination, binding, !!before?.corrupt);
+            if (!sameDestination(before, after)) throw destinationChanged();
+            await confirmDirectories(expected);
             for (let attempt = 0; ; attempt++) {
                 if (stopped || epoch !== runEpoch) throw new Error('Snapshot publisher stopped');
                 try { await fs.rename(temporary, destination); break; }
@@ -283,10 +364,12 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)
                         || attempt >= 6) throw error;
                     await new Promise(resolve => setTimeout(resolve, 5 * (attempt + 1)));
-                    if (!await current(binding, runEpoch)) throw new Error('Snapshot identity changed');
+                    if (!await (before?.corrupt ? stillOwned(binding, runEpoch) : current(binding, runEpoch)))
+                        throw new Error('Snapshot identity changed');
                     await confirmDirectories(expected);
-                    const latest = await readDestination(destination, binding);
-                    if (before?.identity !== latest?.identity) throw new Error('Snapshot destination changed');
+                    const latest = await readDestination(destination, binding, !!before?.corrupt);
+                    if (!sameDestination(before, latest)) throw destinationChanged();
+                    await confirmDirectories(expected);
                 }
             }
             ownTemps.delete(temporary);
@@ -296,6 +379,10 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 throw new Error('Snapshot identity changed');
             }
             return snapshot;
+        } catch (error) {
+            // Recovery failure must preserve even a concurrently repaired destination.
+            if (before?.corrupt) error.preserveDestination = true;
+            throw error;
         } finally {
             await handle?.close();
             if (ownTemps.delete(temporary)) {
@@ -524,9 +611,9 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     state.destination = path.join(binding.workspaceRoot,
                         protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
                     published.push(binding);
-                } catch {
+                } catch (error) {
                     state.snapshot = null;
-                    if (state.destination) await removeOwn(state.destination, binding);
+                    if (state.destination && !error.preserveDestination) await removeOwn(state.destination, binding);
                 } finally {
                     if (finishPublication) { state.publication = null; finishPublication(); }
                 }
