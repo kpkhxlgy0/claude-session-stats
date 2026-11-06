@@ -14,7 +14,7 @@ const CHILD = '22222222-2222-4222-8222-222222222222';
 const ORG = '33333333-3333-4333-8333-333333333333';
 const ACCOUNT = '44444444-4444-4444-8444-444444444444';
 const BRIDGE = 'session_ForkIntegration';
-const relative = '.claude/session-stats/' + BRIDGE + '.json';
+const remotePath = '~/.claude-plusplus/session-stats/' + BRIDGE + '.json';
 const timestamp = seconds => new Date(Date.UTC(2026, 9, 24) + seconds * 1000).toISOString();
 function turn(sessionId, id, start, elapsed, output, parentUuid = null) {
     return [{ type: 'user', sessionId, uuid: 'user-' + id, parentUuid, timestamp: timestamp(start),
@@ -29,8 +29,11 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
     test(mode + ' fork includes inherited TPS in the production main and same RC snapshot after continuation and restart', async t => {
         const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-fork-integration-')));
         const claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config'), workspace = path.join(root, 'workspace');
+        const userHome = path.join(root, 'home');
+        const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
         const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG), logs = path.join(claudeHome, 'projects', 'fixture');
-        await Promise.all([fs.mkdir(metadata, { recursive: true }), fs.mkdir(logs, { recursive: true }), fs.mkdir(workspace)]);
+        await Promise.all([fs.mkdir(metadata, { recursive: true }), fs.mkdir(logs, { recursive: true }),
+            fs.mkdir(workspace), fs.mkdir(userHome)]);
         const parentMetadata = path.join(metadata, 'local_' + PARENT + '.json');
         await fs.writeFile(parentMetadata, JSON.stringify({ sessionId: 'local_' + PARENT, cliSessionId: PARENT, cwd: workspace }));
         await fs.writeFile(path.join(metadata, 'local_' + CHILD + '.json'), JSON.stringify({
@@ -61,11 +64,11 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
                 assert.equal(url.pathname, '/v1/code/sessions/' + BRIDGE + '/events');
                 if (init.method === 'POST') {
                     const request = JSON.parse(init.body).events[0].payload;
-                    assert.deepEqual(request.request, { subtype: 'read_file', path: relative, max_bytes: 16384,
+                    assert.deepEqual(request.request, { subtype: 'read_file', path: remotePath, max_bytes: 16384,
                         encoding: 'utf-8' });
-                    const contents = await fs.readFile(path.join(workspace, relative), 'utf8');
+                    const contents = await fs.readFile(destination, 'utf8');
                     events.push({ sequence_num: ++sequence, payload: { type: 'control_response', response: {
-                        request_id: request.request_id, subtype: 'success', response: { contents, absPath: relative } } } });
+                        request_id: request.request_id, subtype: 'success', response: { contents, absPath: destination } } } });
                     body = {};
                 } else body = { data: url.searchParams.get('sort_order') === 'desc' ? events.slice(-1)
                     : events.filter(e => e.sequence_num > Number(url.searchParams.get('cursor') ?? 0)), resume_cursor: String(sequence) };
@@ -75,7 +78,7 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         const receiver = createRemoteReader(dom.window, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0, responsePollMs: 0 });
         const api = { manifest: { id: 'com.kpk.session-stats' }, log: { info() {} },
             ipc: { handle(name, fn) { if (name === 'stats') handler = fn; } } };
-        const options = { claudeData, claudeHome, ipcMain: { handle() {}, removeHandler() {} } };
+        const options = { claudeData, claudeHome, userHome, ipcMain: { handle() {}, removeHandler() {} } };
         t.after(async () => { receiver.stop(); dom.window.close(); await controller?.stop(); await fs.rm(root, { recursive: true }); });
         controller = startMain(api, options);
         const fields = ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheHit',
@@ -93,6 +96,8 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
             assert.equal(local.tps, expected);
             assert.equal(remote.status, 'ok');
             for (const field of fields) assert.equal(remote[field], local[field], field);
+            await assert.rejects(fs.stat(path.join(workspace, '.claude', 'session-stats')), { code: 'ENOENT' });
+            assert.equal(JSON.parse(await fs.readFile(destination, 'utf8')).stats.tps, expected);
             return local;
         }
         const initial = await compare(200);

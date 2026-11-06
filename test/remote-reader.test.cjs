@@ -7,7 +7,10 @@ const { createRemoteReader, buildRemoteScripts } = require('../src/remote-reader
 const ID = 'session_Test123';
 const ORG = '11111111-1111-4111-8111-111111111111';
 const PUBLISHER = '22222222-2222-4222-8222-222222222222';
-const PATH = '.claude/session-stats/session_Test123.json';
+const PATH = '~/.claude-plusplus/session-stats/session_Test123.json';
+const ABS_PATH = '/home/runner/.claude-plusplus/session-stats/session_Test123.json';
+const absolutePath = agentId => agentId === undefined ? ABS_PATH
+    : `/home/runner/.claude-plusplus/session-stats/session_Test123.agent-${agentId}.json`;
 const STATS = { turns: 7, steps: 13, totalTokens: 1400, inputTokens: 1000, outputTokens: 400,
     cachedInputTokens: 700, cacheHit: .7, tps: 20, usageComplete: true, status: 'ok' };
 const NOW = Date.parse('2026-10-24T00:00:00Z');
@@ -49,7 +52,7 @@ function fixture(t, options = {}) {
         if (request.url.searchParams.get('sort_order') === 'desc') return response({ data: [], resume_cursor: '10' });
         return response({ data: [event(onReply({ type: 'control_response', response: { request_id: requestId,
             subtype: 'success', response: { contents: JSON.stringify(snapshot()),
-                absPath: createSnapshotProtocol().snapshotPath(ID, options.sampleAgentId) } } }), 12)], resume_cursor: '12' });
+                absPath: absolutePath(options.sampleAgentId) } } }), 12)], resume_cursor: '12' });
     };
     const reader = createRemoteReader(win, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0,
         responsePollMs: 1, timeoutMs: 100, now: () => clock, ...options });
@@ -59,7 +62,7 @@ function fixture(t, options = {}) {
         advance(ms) { clock += ms; }, setSample(value, at = clock) { revision = value; generatedAt = at; } };
 }
 
-test('reads the fixed workspace snapshot through one correlated control request and exports only its aggregates', async t => {
+test('reads the fixed home snapshot through one correlated control request and exports only its aggregates', async t => {
     const f = fixture(t); const result = await f.reader.read();
     assert.deepEqual(result, { ...STATS, threadId: ID, source: 'remote_control',
         snapshotGeneratedAt: NOW, snapshotRevision: 1, snapshotPublisherId: PUBLISHER });
@@ -91,7 +94,7 @@ test('selected child reads only its own bounded snapshot and returns agent ident
     assert.equal(result?.tps, 20);
     const post = f.requests.find(request => request.init.method === 'POST');
     assert.equal(JSON.parse(post.init.body).events[0].payload.request.path,
-        `.claude/session-stats/${ID}.agent-${agentId}.json`);
+        `~/.claude-plusplus/session-stats/${ID}.agent-${agentId}.json`);
 });
 
 test('a visible task-pane editor cannot suppress either parent or child snapshot reads', async t => {
@@ -129,7 +132,7 @@ test('child selection change invalidates a pending read and cannot display anoth
     f.setFetch(({url,requestId,snapshot}) => url.searchParams.get('sort_order') === 'asc'
         ? new Promise(resolve => { release = () => resolve(response({ data: [event({ type: 'control_response',
             response: { request_id: requestId, subtype: 'success', response: {
-                contents: JSON.stringify(snapshot()), absPath: createSnapshotProtocol().snapshotPath(ID, agentId),
+                contents: JSON.stringify(snapshot()), absPath: absolutePath(agentId),
             } } }, 12)], resume_cursor: '12' })); }) : undefined);
     const pending = f.reader.read();
     await waitFor(() => release);
@@ -161,7 +164,7 @@ test('synchronized messages and unrelated or pre-cursor responses never supply u
         if (init.method !== 'GET' || url.searchParams.get('sort_order') !== 'asc') return;
         polls++;
         const payload = { type: 'control_response', response: { request_id: requestId,
-            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: PATH } } };
+            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: ABS_PATH } } };
         if (polls === 1) return response({ data: [
             event(payload, 10), event({ ...payload, response: { ...payload.response, request_id: 'old-request' } }, 11),
             event({ type: 'user', uuid: 'prompt', message: { role: 'user', content: 'private prompt' } }, 12),
@@ -174,7 +177,8 @@ test('synchronized messages and unrelated or pre-cursor responses never supply u
 });
 
 test('matching denied, missing and unsupported replies return unavailable without estimated numbers', async t => {
-    for (const [error, reason] of [['read denied: file', 'snapshot-denied'], ['ENOENT', 'snapshot-missing'],
+    for (const [error, reason] of [['read denied: file', 'snapshot-denied'],
+        ['EACCES: no such file or directory', 'snapshot-denied'], ['ENOENT', 'snapshot-missing'],
         ['Unsupported control request: read_file', 'snapshot-unsupported']]) {
         const f = fixture(t);
         f.setReply(value => ({ ...value, response: { request_id: value.response.request_id, subtype: 'error', error } }));
@@ -189,7 +193,7 @@ test('invalid file envelopes and malformed snapshots fail closed', async t => {
         value => ({ ...value, truncated: true }), value => ({ ...value, encoding: 'base64' }),
         value => ({ ...value, anchor: 'workspace_root' }), value => ({ ...value, anchor: 'cwd' }),
         value => ({ ...value, absPath: '.claude/session-stats/session_Other.json' }),
-        value => ({ ...value, absPath: `/workspace/../${PATH}` }),
+        value => ({ ...value, absPath: '/home/runner/../.claude-plusplus/session-stats/session_Test123.json' }),
         value => ({ ...value, contents: 'x'.repeat(16385) }), value => ({ ...value, contents: '😀'.repeat(5000) }),
         value => ({ ...value, contents: '{' }),
         value => ({ ...value, contents: JSON.stringify({ ...JSON.parse(value.contents), privatePrompt: 'must reject' }) }),
@@ -203,11 +207,44 @@ test('invalid file envelopes and malformed snapshots fail closed', async t => {
     }
 });
 
-test('canonical absolute file paths can identify only the same workspace-anchored snapshot', async t => {
-    const f = fixture(t);
-    f.setReply(value => ({ ...value, response: { ...value.response,
-        response: { ...value.response.response, absPath: `C:\\work\\project\\${PATH.replaceAll('/', '\\')}` } } }));
-    assert.equal((await f.reader.read()).totalTokens, 1400);
+test('matches the native bridge request-path echo and canonical expanded OS home paths', async t => {
+    for (const absPath of [PATH, ABS_PATH, '/Users/runner/.claude-plusplus/session-stats/session_Test123.json',
+        '/root/.claude-plusplus/session-stats/session_Test123.json',
+        'C:\\Users\\Runner\\.claude-plusplus\\session-stats\\session_Test123.json',
+        'D:/Custom Home/Runner/.claude-plusplus/session-stats/session_Test123.json']) {
+        const f = fixture(t);
+        f.setReply(value => ({ ...value, response: { ...value.response,
+            response: { ...value.response.response, absPath } } }));
+        assert.equal((await f.reader.read()).totalTokens, 1400, absPath);
+    }
+});
+
+test('home snapshot responses reject different tilde paths, relative, traversal, device and network paths', async t => {
+    const suffix = '.claude-plusplus/session-stats/session_Test123.json';
+    for (const absPath of [`~other/${suffix}`, `~/../${suffix}`, PATH.replace(ID, 'session_Other'), suffix, `.claude/session-stats/${ID}.json`,
+        `/home/runner/.claude/session-stats/${ID}.json`, `/${suffix}`, `C:/${suffix}`,
+        `/home/runner/../${suffix}`, `/home/runner/./${suffix}`, `/home//runner/${suffix}`,
+        `/home/runner/../../home/runner/${suffix}`, `/home/runner/%2e%2e/${suffix}`,
+        `/home/runner/~/${suffix}`, `//home/runner/${suffix}`, `//server/share/${suffix}`,
+        `C:Users/runner/${suffix}`, `\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
+        `\\\\server\\share\\${suffix.replaceAll('/', '\\')}`,
+        `\\\\?\\C:\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
+        `\\\\.\\C:\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
+        `\\??\\C:\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
+        `/C:/Users/runner/${suffix}`, `C:/D:/Users/runner/${suffix}`,
+        `C:/Users/runner:stream/${suffix}`, `C:/Users/CON/${suffix}`, `C:/Users/runner./${suffix}`,
+        `C:/Users/runner /${suffix}`, `/home/runner\\other/${suffix}`,
+        `/home/runner/.claude-plusplus/session-stats-other/${ID}.json`,
+        `/home/runner/.claude-plusplus/session-stats/${ID}.agent-other.json`,
+        `/home/runner/.claude-plusplus/session-stats/${ID}.json/extra`]) {
+        const f = fixture(t);
+        f.setReply(value => ({ ...value, response: { ...value.response,
+            response: { ...value.response.response, absPath } } }));
+        const result = await f.reader.read();
+        assert.equal(result.unavailableReason, 'snapshot-invalid', absPath);
+        assert.equal(result.tps, null, absPath);
+        assert.equal(f.requests.filter(request => request.init.method === 'POST').length, 1, absPath);
+    }
 });
 
 test('wrong snapshot identity, stale and future samples remain unavailable', async t => {
@@ -238,7 +275,7 @@ test('cache expires while an RPC is pending and concurrent reads share its one r
     f.setFetch(({ url, requestId, snapshot }) => url.searchParams.get('sort_order') === 'asc'
         ? new Promise(resolve => { release = () => resolve(response({ data: [event({ type: 'control_response',
             response: { request_id: requestId, subtype: 'success', response: { contents: JSON.stringify(snapshot()),
-                absPath: PATH } } }, 12)], resume_cursor: '12' })); }) : undefined);
+                absPath: ABS_PATH } } }, 12)], resume_cursor: '12' })); }) : undefined);
     const first = f.reader.read(), second = f.reader.read(); assert.equal(first, second);
     await waitFor(() => release);
     assert.equal(f.reader.peek().tps, 20); f.advance(1001);
@@ -358,7 +395,7 @@ test('serialized bridge returns pending at 750ms, finishes in the page and clean
     const posted = JSON.parse(f.requests.find(request => request.init.method === 'POST').init.body).events[0].payload;
     const sample = f.snapshot(); sample.generatedAt = Date.now();
     release(response({ data: [event({ type: 'control_response', response: { request_id: posted.request_id,
-        subtype: 'success', response: { contents: JSON.stringify(sample), absPath: PATH } } }, 12)], resume_cursor: '12' }));
+        subtype: 'success', response: { contents: JSON.stringify(sample), absPath: ABS_PATH } } }, 12)], resume_cursor: '12' }));
     const reader = f.win[Symbol.for('claudepp.session-stats.slow-owner')];
     assert.equal((await reader.read()).tps, 20); assert.equal(timers.size, 0);
     vm.runInContext(cleanupScript, context); assert.equal(f.win[Symbol.for('claudepp.session-stats.slow-owner')], undefined);
@@ -390,7 +427,7 @@ test('serialized child reader derives identity from the selected pane and reject
     vm.runInContext(scripts.cleanupScript, context);
     assert.equal(f.win[Symbol.for('claudepp.session-stats.child-owner')], undefined);
 });
-test('current-directory snapshot requests do not use the fixed launch-root anchor', async t => {
+test('home snapshot requests do not use a current-directory or launch-root anchor', async t => {
     const f = fixture(t);
     f.setReply(value => {
         delete value.response.response.anchor;
@@ -405,7 +442,7 @@ test('current-directory snapshot requests do not use the fixed launch-root ancho
         { subtype: 'read_file', path: PATH, max_bytes: 16384, encoding: 'utf-8' });
 });
 
-test('a denied current-directory read never tries another path, anchor or data source', async t => {
+test('a denied home read never tries another path, anchor or data source', async t => {
     const f = fixture(t);
     f.setReply(value => ({ ...value, response: { request_id: value.response.request_id,
         subtype: 'error', error: 'read denied: ' + PATH } }));

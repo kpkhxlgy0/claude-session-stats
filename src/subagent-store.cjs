@@ -51,9 +51,10 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
         let active = true;
         const workspaceRoot = context?.workspaceRoot, verify = context?.verify;
         const resolveRelocation = context?.resolveRelocation;
+        const resolveAssistantTip = context?.resolveAssistantTip;
         const valid = () => active && !disposed && Boolean(root) && (!context
             || context.workspaceRoot === workspaceRoot && context.verify === verify
-                && context.resolveRelocation === resolveRelocation);
+                && context.resolveRelocation === resolveRelocation && context.resolveAssistantTip === resolveAssistantTip);
         // Nested source checks keep validating files and relocation evidence. The expensive
         // caller binding proof brackets this one operation instead of each nested check.
         return {
@@ -62,6 +63,11 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
                     if (!valid()) return null;
                     const evidence = await resolveRelocation.call(context, cwd);
                     return valid() ? evidence : null;
+                } } : {}),
+                ...(typeof resolveAssistantTip === 'function' ? { resolveAssistantTip: async () => {
+                    if (!valid()) return null;
+                    const tip = await resolveAssistantTip.call(context);
+                    return valid() ? tip : null;
                 } } : {}) },
             assert() { if (!valid()) throw new Error('Subagent operation changed'); },
             close() { active = false; },
@@ -98,6 +104,12 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
             if (await safeDirectory(directory) !== stamp) throw stale();
         for (const [file, stamp] of proof.parentVersions)
             if (version(await safeFile(file)) !== stamp) throw stale();
+    }
+
+    async function confirmAssistantTip(proof, context)
+    {
+        if (proof?.source.assistantTip && (typeof context?.resolveAssistantTip !== 'function'
+            || await context.resolveAssistantTip() !== proof.source.assistantTip)) throw stale();
     }
 
     async function locate(id, context)
@@ -334,6 +346,7 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
                 if (proof) await confirm(proof);
                 await current(context);
                 operation.assert();
+                await confirmAssistantTip(proof, operation.context);
                 if (proof) await confirmFiles(proof);
                 if (!proof?.directory) { operation.assert(); return failed('not-found'); }
                 for (const [agent, sampled] of samples) {
@@ -398,6 +411,7 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
             if (proof) await confirm(proof);
             await current(context);
             operation.assert();
+            await confirmAssistantTip(proof, operation.context);
             if (proof) await confirmFiles(proof);
             if (proof?.directory && version(await fs.lstat(proof.directory)) !== before) throw stale();
             operation.assert();

@@ -20,7 +20,9 @@ async function fixture(t, options = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-publisher-')));
     const claudeData = path.join(root, 'desktop');
     const workspace = path.join(root, 'workspace');
+    const userHome = path.join(root, 'home');
     await fs.mkdir(workspace);
+    await fs.mkdir(userHome);
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, `${LOCAL}.json`);
     await fs.mkdir(path.dirname(metadata), { recursive: true });
     const row = { sessionId: LOCAL, cliSessionId: CLI, cwd: workspace, bridgeSessionIds: [BRIDGE] };
@@ -28,15 +30,15 @@ async function fixture(t, options = {}) {
     await write(row);
     let stats = { ...STATS, private: 'do not export', threadId: CLI };
     let clock = 100000;
-    const publisherOptions = typeof options === 'function' ? await options({ root, claudeData, workspace }) : options;
+    const publisherOptions = typeof options === 'function' ? await options({ root, claudeData, workspace, userHome }) : options;
     const store = publisherOptions.store || { async getStats(id) { assert.equal(id, CLI); return stats; } };
-    const publisher = createSnapshotPublisher({ claudeData, store, now: () => clock,
+    const publisher = createSnapshotPublisher({ claudeData, userHome, store, now: () => clock,
         pollMs: 100000, publisherId: PUBLISHER, ...publisherOptions });
     t.after(async () => { await publisher.stop(); await fs.rm(root, { recursive: true, force: true }); });
-    const directory = path.join(workspace, '.claude', 'session-stats');
+    const directory = path.join(publisherOptions.userHome ?? userHome, '.claude-plusplus', 'session-stats');
     const destination = path.join(directory, `${BRIDGE}.json`);
     const snapshot = async () => JSON.parse(await fs.readFile(destination, 'utf8'));
-    return { root, claudeData, workspace, metadata, row, write, publisher, directory,
+    return { root, claudeData, workspace, userHome, metadata, row, write, publisher, directory,
         destination, snapshot, setStats(value) { stats = value; }, setClock(value) { clock = value; } };
 }
 
@@ -56,8 +58,42 @@ test('background publication writes allowlisted stats and local reads return the
     const encoded = JSON.stringify(snapshot);
     for (const privateValue of [f.workspace, CLI, LOCAL, ACCOUNT, 'do not export'])
         assert.equal(encoded.includes(privateValue), false);
-    assert.equal(await fs.readFile(path.join(f.directory, '.gitignore'), 'utf8'), '*\n');
+    assert.equal(await fs.stat(path.join(f.directory, '.gitignore')).then(() => true, () => false), false);
+    assert.equal(await fs.stat(path.join(f.workspace, '.claude')).then(() => true, () => false), false);
     assert.equal(await fs.stat(path.join(f.workspace, '.gitignore')).then(() => true, () => false), false);
+});
+
+test('device I/O failure exposes only a verified, fresh local sample until publication recovers', async t => {
+    const f = await fixture(t);
+    let failure = true;
+    const rename = fs.rename;
+    t.mock.method(fs, 'rename', async (from, to) => {
+        if (failure && to === f.destination) throw Object.assign(new Error('Device unavailable'), { code: 'EIO' });
+        return rename(from, to);
+    });
+    const local = await f.publisher.readLocal(LOCAL);
+    assert.deepEqual(local, { ...STATS, threadId: LOCAL, snapshotSync: 'local-only' });
+    await assert.rejects(f.snapshot(), { code: 'ENOENT' });
+    await f.publisher.readLocal(LOCAL, { waitForPoll: false }); // Register selection before the clock jumps.
+    await f.publisher.start();
+    f.setClock(131000);
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
+    failure = false;
+    const shared = await f.publisher.readLocal(LOCAL);
+    const disk = await f.snapshot();
+    assert.equal(shared.snapshotRevision, disk.revision);
+    assert.deepEqual(disk.stats, STATS);
+    assert.equal(shared.snapshotSync, undefined);
+});
+
+test('a local-only sample cannot survive loss of its Desktop binding', async t => {
+    const f = await fixture(t);
+    const rename = fs.rename;
+    t.mock.method(fs, 'rename', (from, to) => to === f.destination
+        ? Promise.reject(Object.assign(new Error('Read-only volume'), { code: 'EROFS' })) : rename(from, to));
+    assert.equal((await f.publisher.readLocal(LOCAL)).snapshotSync, 'local-only');
+    await f.write({ ...f.row, cliSessionId: OTHER_PUBLISHER });
+    assert.notEqual((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'ok');
 });
 
 test('unchanged polls preserve the sample until heartbeat and changed metrics publish a new revision', async t => {
@@ -463,7 +499,7 @@ test('the final global confirmation invalidates an early priority sample when a 
     await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
 });
 
-test('final priority invalidation forgets a migrated workspace without reopening its old snapshot', async t => {
+test('final priority invalidation cleans user storage without reopening the migrated workspace snapshot', async t => {
     let currentRoot, entered, release;
     const ready = new Promise(resolve => { entered = resolve; });
     const wait = new Promise(resolve => { release = resolve; });
@@ -481,20 +517,23 @@ test('final priority invalidation forgets a migrated workspace without reopening
     try {
         await committedLocal(f);
         oldSample = await f.snapshot();
+        const legacy = path.join(f.workspace, '.claude', 'session-stats', `${BRIDGE}.json`);
+        await fs.mkdir(path.dirname(legacy), { recursive: true }); await fs.writeFile(legacy, JSON.stringify(oldSample));
         const next = path.join(f.root, 'next-workspace');
         await fs.mkdir(next); currentRoot = next;
         const originalOpen = fs.open;
         const guarded = t.mock.method(fs, 'open', async (file, ...args) => {
-            if (file === f.destination) throw new Error('Old workspace must not be read');
+            if (file === legacy) throw new Error('Old workspace must not be read');
             return originalOpen(file, ...args);
         });
         release(); await poll;
         assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'unavailable');
         await f.publisher.stop();
-        assert.equal(guarded.mock.calls.some(call => call.arguments[0] === f.destination), false);
+        assert.equal(guarded.mock.calls.some(call => call.arguments[0] === legacy), false);
         guarded.mock.restore();
+        assert.deepEqual(JSON.parse(await fs.readFile(legacy, 'utf8')), oldSample);
     } finally { release(); await poll; }
-    assert.deepEqual(await f.snapshot(), oldSample);
+    await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
 });
 
 test('lost workspace proof after early publication stays unavailable until a fresh discovery recovers', async t => {
@@ -704,7 +743,7 @@ test('Windows rename lock exhaustion returns no metrics and recovers after the l
         const recovered = await f.publisher.readLocal(LOCAL);
         for (const [field, value] of Object.entries({ ...STATS, turns: 4 })) assert.equal(recovered[field], value, field);
         assert.deepEqual((await f.snapshot()).stats, { ...STATS, turns: 4 });
-        assert.deepEqual((await fs.readdir(f.directory)).sort(), ['.gitignore', `${BRIDGE}.json`]);
+        assert.deepEqual((await fs.readdir(f.directory)).sort(), [`${BRIDGE}.json`]);
     });
 
 test('refuses unknown destination ownership and preserves unrelated project files', async t => {
@@ -722,14 +761,54 @@ test('refuses unknown destination ownership and preserves unrelated project file
     assert.equal(await fs.readFile(path.join(f.directory, 'keep.txt'), 'utf8'), 'keep');
 });
 
-test('refuses directory junctions below the workspace without writing outside it', async t => {
+test('refuses directory junctions below the user home without writing outside it', async t => {
     const f = await fixture(t);
     const outside = path.join(f.root, 'outside');
     await fs.mkdir(outside);
-    await fs.symlink(outside, path.join(f.workspace, '.claude'), 'junction');
+    await fs.symlink(outside, path.join(f.userHome, '.claude-plusplus'), 'junction');
     await f.publisher.start();
     assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable');
     assert.deepEqual(await fs.readdir(outside), []);
+});
+
+test('a linked session-stats directory cannot redirect generated files into a project', async t => {
+    const f = await fixture(t);
+    await fs.mkdir(path.dirname(f.directory));
+    await fs.symlink(f.workspace, f.directory, 'junction');
+    await f.publisher.start();
+    assert.equal((await f.publisher.readLocal(LOCAL)).snapshotUnavailableReason, 'publish-failed');
+    assert.deepEqual(await fs.readdir(f.workspace), []);
+});
+
+for (const level of ['home', 'state-root', 'session-stats'])
+test(`${level} replaced during a snapshot write cannot redirect publication or cleanup into a project`, async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const original = await f.snapshot();
+    const directory = level === 'home' ? f.userHome : level === 'state-root' ? path.dirname(f.directory) : f.directory;
+    const moved = path.join(f.root, 'moved-storage');
+    const open = fs.open;
+    let replaced = false;
+    t.mock.method(fs, 'open', async (file, flags, ...args) => {
+        const handle = await open(file, flags, ...args);
+        if (!replaced && path.dirname(file) === f.directory && flags === 'wx') {
+            const close = handle.close.bind(handle);
+            handle.close = async () => {
+                await close();
+                replaced = true;
+                await fs.rename(directory, moved);
+                await fs.symlink(f.workspace, directory, 'junction');
+            };
+        }
+        return handle;
+    });
+    f.setClock(110000); f.setStats({ ...STATS, turns: 9 });
+    await f.publisher.start();
+    await f.publisher.stop();
+    assert.equal(replaced, true);
+    assert.deepEqual(await fs.readdir(f.workspace), []);
+    const relative = path.relative(directory, f.destination);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(moved, relative), 'utf8')), original);
 });
 
 test('invalid statistics fail closed and remove only this publisher previous snapshot', async t => {
@@ -850,6 +929,36 @@ test('stop removes its snapshots and temporary files while retaining existing ig
     assert.equal(await fs.readFile(path.join(f.directory, '.gitignore'), 'utf8'), '# project-owned rule\n*.json\n');
 });
 
+test('stop preserves a newer same-publisher snapshot that this binding did not commit', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const replacement = { ...await f.snapshot(), revision: 999, stats: { ...STATS, turns: 99 } };
+    await fs.writeFile(f.destination, JSON.stringify(replacement));
+    await f.publisher.stop();
+    assert.deepEqual(await f.snapshot(), replacement);
+});
+
+test('publication and stop leave legacy workspace snapshots and ignore rules byte-for-byte intact', async t => {
+    const f = await fixture(t), legacy = path.join(f.workspace, '.claude', 'session-stats');
+    await fs.mkdir(legacy, { recursive: true });
+    const original = Buffer.from('legacy unknown snapshot\0'), ignore = '# existing workspace rules\n*.json\n';
+    await fs.writeFile(path.join(legacy, `${BRIDGE}.json`), original);
+    await fs.writeFile(path.join(legacy, '.gitignore'), ignore);
+    const open = fs.open;
+    const guard = t.mock.method(fs, 'open', async (file, ...args) => {
+        if (path.dirname(file) === legacy) throw new Error('Legacy project files must not be opened');
+        return open(file, ...args);
+    });
+    await f.publisher.start();
+    assert.deepEqual((await f.snapshot()).stats, STATS);
+    await f.publisher.stop();
+    guard.mock.restore();
+    assert.deepEqual(await fs.readFile(path.join(legacy, `${BRIDGE}.json`)), original);
+    assert.equal(await fs.readFile(path.join(legacy, '.gitignore'), 'utf8'), ignore);
+    assert.deepEqual((await fs.readdir(legacy)).sort(), ['.gitignore', `${BRIDGE}.json`]);
+    assert.deepEqual(await fs.readdir(f.directory), []);
+});
+
 test('wrong-organization snapshots are never overwritten or removed', async t => {
     const f = await fixture(t);
     await f.publisher.start();
@@ -861,7 +970,7 @@ test('wrong-organization snapshots are never overwritten or removed', async t =>
     assert.deepEqual(await f.snapshot(), wrong);
 });
 
-test('publishes only in Desktop workspace_root when worktreePath, cwd and originCwd differ', async t => {
+test('different Desktop workspace paths publish only in fixed user storage', async t => {
     const f = await fixture(t);
     const original = path.join(f.root, 'original-repository');
     const active = path.join(f.root, 'active-workspace');
@@ -869,9 +978,8 @@ test('publishes only in Desktop workspace_root when worktreePath, cwd and origin
     await fs.mkdir(active);
     await f.write({ ...f.row, originCwd: original, worktreePath: active });
     await f.publisher.start();
-    const file = path.join(active, '.claude', 'session-stats', `${BRIDGE}.json`);
-    assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')).stats, STATS);
-    for (const unused of [original, f.workspace])
+    assert.deepEqual((await f.snapshot()).stats, STATS);
+    for (const unused of [original, active, f.workspace])
         assert.equal(await fs.stat(path.join(unused, '.claude')).then(() => true, () => false), false);
 });
 
@@ -935,14 +1043,13 @@ async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, sta
     return { local, release };
 }
 
-test('delayed validation matches the canonical snapshot through an aliased workspace path', async t => {
+test('a workspace alias never redirects the fixed snapshot destination', async t => {
     const f = await fixture(t);
     const alias = path.join(f.root, 'workspace-alias');
     await fs.symlink(f.workspace, alias, 'junction');
     await f.write({ ...f.row, cwd: alias });
-    f.destination = path.join(alias, '.claude', 'session-stats', `${BRIDGE}.json`);
     await f.publisher.start();
-    assert.notEqual(f.destination, await fs.realpath(f.destination));
+    assert.equal(f.destination, await fs.realpath(f.destination));
     const paused = await pauseLocalValidation(t, f);
     f.setStats({ ...STATS, turns: 4 });
     let newer;
@@ -1155,20 +1262,25 @@ test('identity changes invalidate delayed local validation before it can return 
     assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
 });
 
-test('installation roots and overlapping managed snapshot directories are excluded before any generated write', async t => {
-    for (const location of ['workspace', 'ancestor', 'managed-parent', 'managed-child', 'installation-junction']) {
+test('user storage overlapping a workspace is rejected before any generated write', async t => {
+    for (const location of ['home-is-workspace', 'home-in-workspace', 'workspace-is-storage', 'workspace-in-storage', 'home-junction']) {
         await t.test(location, async t => {
             const f = await fixture(t, async ({ root, workspace }) => {
-                let installationRoot = workspace;
-                if (location === 'ancestor') installationRoot = root;
-                if (location === 'managed-parent') installationRoot = path.join(workspace, '.claude');
-                if (location === 'managed-child') installationRoot = path.join(workspace, '.claude', 'session-stats', 'installed');
-                if (location === 'installation-junction') {
-                    installationRoot = path.join(root, 'installed-link');
-                    await fs.symlink(workspace, installationRoot, 'junction');
-                } else await fs.mkdir(installationRoot, { recursive: true });
-                return { installationRoot };
+                if (location === 'home-is-workspace') return { userHome: workspace };
+                if (location === 'home-in-workspace') {
+                    const userHome = path.join(workspace, 'home'); await fs.mkdir(userHome);
+                    return { userHome };
+                }
+                if (location === 'home-junction') {
+                    const userHome = path.join(root, 'home-alias'); await fs.symlink(workspace, userHome, 'junction');
+                    return { userHome };
+                }
+                return {};
             });
+            if (location.startsWith('workspace-')) {
+                const workspace = location === 'workspace-is-storage' ? f.directory : path.join(f.directory, 'project');
+                await fs.mkdir(workspace, { recursive: true }); await f.write({ ...f.row, cwd: workspace });
+            }
             await f.publisher.start();
             const result = await f.publisher.readLocal(LOCAL);
             assert.equal(result.status, 'unavailable');
@@ -1179,38 +1291,66 @@ test('installation roots and overlapping managed snapshot directories are exclud
     }
 });
 
-test('watched tweak roots and their immediate installed junction targets cannot trigger snapshot reload loops', async t => {
-    for (const kind of ['watch-root', 'installed-target', 'nested-target', 'environment-root']) {
-        await t.test(kind, async t => {
-            const f = await fixture(t, async ({ root, workspace }) => {
-                const userRoot = path.join(root, 'user-root');
-                const watchedTweaksRoot = kind === 'watch-root' ? workspace : path.join(userRoot, 'tweaks');
-                await fs.mkdir(watchedTweaksRoot, { recursive: true });
-                if (kind !== 'watch-root') await fs.symlink(workspace, path.join(watchedTweaksRoot, 'installed'), 'junction');
-                if (kind === 'environment-root') {
-                    const old = process.env.CLAUDE_PLUSPLUS_USER_ROOT;
-                    process.env.CLAUDE_PLUSPLUS_USER_ROOT = userRoot;
-                    t.after(() => { if (old === undefined) delete process.env.CLAUDE_PLUSPLUS_USER_ROOT;
-                        else process.env.CLAUDE_PLUSPLUS_USER_ROOT = old; });
-                    return {};
-                }
-                return { watchedTweaksRoot };
-            });
-            let destination = f.destination;
-            if (kind === 'nested-target') {
-                const nested = path.join(f.workspace, 'nested');
-                await fs.mkdir(nested);
-                await f.write({ ...f.row, cwd: nested });
-                destination = path.join(nested, '.claude', 'session-stats', `${BRIDGE}.json`);
-            }
-            await f.publisher.start();
-            const result = await f.publisher.readLocal(LOCAL);
-            assert.equal(result.status, 'unavailable');
-            assert.equal(result.snapshotRevision, undefined);
-            assert.equal(await fs.stat(destination).then(() => true, () => false), false);
-        });
-    }
+test('user storage inside another discovered workspace prevents all publication there', async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
+        sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, cwd: f.userHome, bridgeSessionIds: ['session_second'] }));
+    await f.publisher.start();
+    assert.equal(await fs.stat(f.directory).then(() => true, () => false), false);
 });
+
+test('a second workspace discovered by final confirmation also blocks overlapping user storage', async t => {
+    let f, sampled = false;
+    f = await fixture(t, { store: { async getStats() {
+        if (!sampled) {
+            sampled = true;
+            await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
+                sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, cwd: f.userHome, bridgeSessionIds: ['session_second'] }));
+        }
+        return STATS;
+    } } });
+    await f.publisher.start();
+    assert.equal(sampled, true);
+    assert.equal(await fs.stat(f.directory).then(() => true, () => false), false);
+});
+
+test('a new organization binding takes over one user filename without old-owner cleanup deleting it', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const before = await f.snapshot(), nextOrg = '99999999-9999-4999-8999-999999999999';
+    const nextMetadata = path.join(f.claudeData, 'claude-code-sessions', ACCOUNT, nextOrg, `${LOCAL}.json`);
+    await fs.mkdir(path.dirname(nextMetadata), { recursive: true });
+    await fs.rename(f.metadata, nextMetadata);
+    f.setStats({ ...STATS, turns: 9 });
+    await f.publisher.start();
+    const after = await f.snapshot();
+    assert.equal(after.organizationId, nextOrg);
+    assert.equal(after.stats.turns, 9);
+    assert.ok(after.revision > before.revision);
+    assert.deepEqual(await fs.readdir(f.workspace), []);
+    await f.publisher.stop();
+    await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
+});
+
+test('publication ignores unavailable tweak roots and never creates a workspace ignore file', async t => {
+    const f = await fixture(t, { watchedTweaksRoot: 'Z:\\unavailable-tweaks' });
+    const opendir = fs.opendir;
+    t.mock.method(fs, 'opendir', async (directory, ...args) => {
+        if (directory === 'Z:\\unavailable-tweaks') throw Object.assign(new Error('UNKNOWN'), { code: 'UNKNOWN' });
+        return opendir(directory, ...args);
+    });
+    await f.publisher.start();
+    assert.deepEqual((await f.snapshot()).stats, STATS);
+    assert.deepEqual(await fs.readdir(f.workspace), []);
+});
+
+test('Windows case variants of the same physical user home retain their fixed destination',
+    { skip: process.platform !== 'win32' }, async t => {
+        const f = await fixture(t, async ({ userHome }) => ({ userHome: userHome.toUpperCase() }));
+        await f.publisher.start();
+        assert.deepEqual((await f.snapshot()).stats, STATS);
+        assert.deepEqual(await fs.readdir(f.workspace), []);
+    });
 
 test('a sibling project sharing a path prefix with an installation remains publishable', async t => {
     const f = await fixture(t, async ({ root, workspace }) => {
@@ -1232,22 +1372,62 @@ test('workspace migration publishes fresh metrics without reading or copying the
     });
     await f.publisher.start();
     const initial = await f.snapshot();
+    const legacyDirectory = path.join(f.workspace, '.claude', 'session-stats');
+    const legacy = path.join(legacyDirectory, `${BRIDGE}.json`);
+    await fs.mkdir(legacyDirectory, { recursive: true });
+    await fs.writeFile(legacy, JSON.stringify(initial));
     const worktree = path.join(f.root, 'worktree');
     await fs.mkdir(worktree);
     currentRoot = worktree; rootKey = 'worktree';
     f.setStats({ ...STATS, turns: 4, tps: 8 });
     const originalOpen = fs.open.bind(fs);
     const spy = t.mock.method(fs, 'open', async (file, ...args) => {
-        if (path.resolve(file) === path.resolve(f.destination)) throw new Error('Old workspace must not be read');
+        if (path.resolve(file) === path.resolve(legacy)) throw new Error('Old workspace must not be read');
         return originalOpen(file, ...args);
     });
     const local = await f.publisher.readLocal(LOCAL);
     assert.equal(local.status, 'ok');
     assert.equal(local.tps, 8);
-    const migrated = JSON.parse(await fs.readFile(path.join(worktree, '.claude', 'session-stats', BRIDGE + '.json'), 'utf8'));
+    const migrated = await f.snapshot();
     assert.equal(migrated.stats.turns, 4);
     assert.equal(migrated.stats.tps, 8);
     assert.ok(migrated.revision > initial.revision);
     spy.mock.restore();
-    assert.deepEqual(await f.snapshot(), initial);
+    assert.deepEqual(JSON.parse(await fs.readFile(legacy, 'utf8')), initial);
+    assert.deepEqual(await fs.readdir(worktree), []);
+});
+
+test('a rechecked Desktop binding resolves duplicate parent and child sources without a live registry', async t => {
+    const { createSessionStore } = require('../src/session-store.cjs');
+    let store, selected;
+    const f = await fixture(t, async ({ root, workspace }) => {
+        const claudeHome = path.join(root, 'claude');
+        const stale = path.join(claudeHome, 'projects', 'stale');
+        selected = path.join(claudeHome, 'projects', 'selected');
+        await fs.mkdir(stale, { recursive: true });
+        await fs.mkdir(selected, { recursive: true });
+        const lines = (...rows) => rows.map(row => JSON.stringify(row) + '\n').join('');
+        const answer = (id, output, extra = {}) => ({ type: 'assistant', sessionId: CLI, ...extra,
+            message: { id, role: 'assistant', model: 'test', usage: { input_tokens: 10,
+                cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: output } } });
+        const prefix = lines(answer('first', 5), { type: 'relocated', sessionId: CLI, relocatedCwd: workspace });
+        await fs.writeFile(path.join(stale, `${CLI}.jsonl`), prefix);
+        await fs.writeFile(path.join(selected, `${CLI}.jsonl`), prefix + lines(answer('second', 7)));
+        for (const [directory, output] of [[stale, 999], [selected, 13]]) {
+            const children = path.join(directory, CLI, 'subagents');
+            await fs.mkdir(children, { recursive: true });
+            await fs.writeFile(path.join(children, 'agent-a.jsonl'), lines(answer('child', output,
+                { agentId: 'a', isSidechain: true })));
+        }
+        store = createSessionStore({ claudeHome });
+        t.after(() => store.dispose());
+        return { store, resolveWorkspace: async () => null };
+    });
+    assert.equal((await store.getStats(CLI)).status, 'not-found');
+    await f.publisher.start();
+    assert.equal((await f.snapshot()).stats.totalTokens, 32);
+    const child = JSON.parse(await fs.readFile(path.join(f.directory, `${BRIDGE}.agent-a.json`), 'utf8'));
+    assert.equal(child.stats.totalTokens, 23);
+    await f.write({ ...f.row, cliSessionId: '99999999-9999-4999-8999-999999999999' });
+    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
 });

@@ -9,7 +9,7 @@ function parseSessionId(rawUrl) {
         if (!(url.protocol === 'app:' && url.hostname === 'localhost' && !url.port)
             && url.origin !== 'https://claude.ai')
             return null;
-        const match = /^\/epitaxy\/(local_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i
+        const match = /^\/(?:epitaxy|code)\/(local_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i
             .exec(url.pathname) ?? /^\/(?:epitaxy|code)\/(session_[A-Za-z0-9_-]{1,128})\/?$/.exec(url.pathname);
         return match ? match[1] : null;
     } catch { return null; }
@@ -48,37 +48,68 @@ function compact(value) {
     return String(Math.round(value));
 }
 
-function footerBounds(root, win) {
+function footerPlacement(root, win) {
     const rect = root.getBoundingClientRect();
-    const center = rect.left + rect.width / 2;
-    const fallback = { left: rect.left + 4, top: rect.bottom + 6, width: Math.max(0, rect.width - 8) };
-    const controls = new Map();
-    // 输入框内的加号、麦克风不是底部操作栏；只查找输入区下方的相邻控件。
-    for (let node = root.parentElement, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
-        if (node === win.document.body || node === win.document.documentElement || node.tagName === 'MAIN') break;
-        if (node.getBoundingClientRect().height > Math.min(500, win.innerHeight * 0.7)) break;
-        for (const button of node.querySelectorAll('button, [role="button"], select')) {
-            if (root.contains(button) || controls.has(button) || !isVisible(button, win)) continue;
-            const bounds = button.getBoundingClientRect();
-            if (bounds.width > 0 && bounds.width < rect.width * 0.6 && bounds.height > 0
-                && bounds.top >= rect.bottom - 2 && bounds.bottom <= rect.bottom + 64
-                && bounds.left >= rect.left - 4 && bounds.right <= rect.right + 4) controls.set(button, bounds);
+    const control = 'button, [role="button"], select';
+    let fallback = null;
+    // Mount beside the complete toolbar, never as another button inside its horizontal flex row.
+    for (let branch = root.closest('form') ?? root, depth = 0; branch?.parentElement && depth < 5;
+        branch = branch.parentElement, depth++) {
+        const parent = branch.parentElement;
+        // A sibling of a bottom-anchored box would not reserve space inside it.
+        if (['absolute', 'fixed', 'sticky'].includes(win.getComputedStyle(branch).position))
+            return fallback ?? { inside: branch };
+        const style = win.getComputedStyle(parent);
+        const horizontal = style.display.includes('flex') && !style.flexDirection.startsWith('column');
+        if ((horizontal || style.display.includes('grid')) && [...parent.children].some(peer => {
+            if (peer === branch || peer.hasAttribute('data-session-stats')) return false;
+            const b = peer.getBoundingClientRect();
+            return b.width > 0 && b.height > 0 && (b.left >= rect.right - 1 || b.right <= rect.left + 1);
+        })) return fallback ?? { inside: branch };
+        if (!horizontal && style.display !== 'contents') {
+            fallback ??= { after: branch };
+            let lastToolbar = null;
+            for (let sibling = branch.nextElementSibling; sibling; sibling = sibling.nextElementSibling) {
+                if (sibling.hasAttribute('data-session-stats') || sibling.matches('[data-pane-root]')) continue;
+                const box = sibling.getBoundingClientRect();
+                if (box.height && (box.height > 72 || box.top < rect.bottom - 2 || box.top > rect.bottom + 64)) continue;
+                const buttons = sibling.matches(control) ? [sibling] : sibling.querySelectorAll(control);
+                for (const button of buttons) {
+                    const b = button.getBoundingClientRect();
+                    if (b.width > 0 && b.height > 0 && b.top >= rect.bottom - 2 && b.bottom <= rect.bottom + 72
+                        && b.left >= rect.left - 4 && b.right <= rect.right + 4 && isVisible(button, win)) {
+                        lastToolbar = sibling;
+                        break;
+                    }
+                }
+            }
+            if (lastToolbar) return { after: lastToolbar };
         }
+        if (parent === win.document.body || parent.tagName === 'MAIN'
+            || parent.getBoundingClientRect().height > Math.min(500, win.innerHeight * 0.7))
+            return fallback ?? { inside: branch };
     }
-    if (!controls.size) return fallback;
-    const firstTop = Math.min(...[...controls.values()].map(bounds => bounds.top));
-    const row = [...controls.values()].filter(bounds => bounds.top < firstTop + 12);
-    const top = Math.min(...row.map(bounds => bounds.top));
-    const bottom = Math.max(...row.map(bounds => bounds.bottom));
-    let left = rect.left + 4;
-    let right = rect.right - 4;
-    for (const bounds of row) {
-        if ((bounds.left + bounds.right) / 2 < center) left = Math.max(left, bounds.right + 8);
-        else right = Math.min(right, bounds.left - 8);
+    return fallback ?? { inside: root };
+}
+
+function footerBottomMargin(bar, win) {
+    const rect = bar.getBoundingClientRect();
+    // Compare the unadjusted flow edge to the pane's padding edge, even on later layout passes.
+    const flowEnd = rect.bottom + (parseFloat(bar.style.marginBottom) || 0);
+    if (!rect.height || flowEnd < win.innerHeight - 32 || flowEnd >= win.innerHeight) return '';
+    let clipEnd = win.innerHeight, gutter = 0;
+    for (let parent = bar.parentElement; parent; parent = parent.parentElement) {
+        const bounds = parent.getBoundingClientRect();
+        if (!bounds.height) continue;
+        const css = win.getComputedStyle(parent);
+        const edge = bounds.bottom - (parseFloat(css.borderBottomWidth) || 0);
+        if (css.overflowY && css.overflowY !== 'visible') clipEnd = Math.min(clipEnd, edge);
+        const padding = parseFloat(css.paddingBottom) || 0;
+        if (Math.abs(edge - win.innerHeight) <= 1 && Math.abs(edge - padding - flowEnd) <= 1)
+            gutter = Math.max(gutter, padding);
     }
-    const halfWidth = Math.min(center - left, right - center);
-    if (halfWidth < 64) return { ...fallback, top: bottom + 4 };
-    return { left: center - halfWidth, top: (top + bottom - 14) / 2, width: halfWidth * 2 };
+    const reuse = Math.floor(Math.min(gutter, clipEnd - flowEnd - 1, rect.height - 2));
+    return reuse > 0 ? `-${reuse}px` : '';
 }
 
 const SnapshotUnavailable = {
@@ -87,7 +118,7 @@ const SnapshotUnavailable = {
     timeout: '统计快照读取超时，稍后重试',
     transport: '统计快照连接暂不可用',
     'snapshot-missing': '运行端尚未生成统计快照，请在运行端安装或更新 Session Stats',
-    'snapshot-denied': '运行端无法读取统计快照，请检查运行端 Session Stats、当前工作目录和读取权限',
+    'snapshot-denied': '运行端无法读取统计快照，请确认 Session Stats 已更新，并允许当前 Claude 会话读取 ~/.claude-plusplus/session-stats',
     'snapshot-unsupported': '运行端当前版本不支持读取统计快照',
     'snapshot-invalid': '运行端统计快照数据无效',
     'snapshot-identity': '统计快照与当前会话或组织不匹配',
@@ -127,8 +158,9 @@ function makeBar(doc, remote, agentId) {
 
 function render(entry, stats) {
     const s = stats?.status === 'ok' ? stats : {};
+    const localOnly = !entry.remote && s.snapshotSync === 'local-only';
     const text = {
-        turns: `${s.turns ?? '—'} turns`, steps: `${s.steps ?? '—'} steps`,
+        turns: `${localOnly ? '仅本机 · ' : ''}${s.turns ?? '—'} turns`, steps: `${s.steps ?? '—'} steps`,
         tps: `${Number.isFinite(s.tps) && s.tps > 0 ? `≈ ${Math.round(s.tps)}` : '—'} tok/s`,
         tokens: `${compact(s.totalTokens)} tok`,
         cache: `Cache hit ${Number.isFinite(s.cacheHit) ? `${Math.round(s.cacheHit * 100)}%` : '—'}`,
@@ -138,7 +170,7 @@ function render(entry, stats) {
     const pending = entry.remote ? SnapshotUnavailable[stats?.unavailableReason] ?? SnapshotUnavailable.pending
         : stats?.status === 'incomplete' ? '日志包含不完整记录，等待可验证的用量数据'
         : entry.agentId ? '等待当前子代理的本地统计数据' : '等待当前会话的本地统计数据';
-    entry.bar.title = stats?.status === 'ok'
+    entry.bar.title = localOnly ? '本机统计已计算，快照存储暂不可用，未同步到远端' : stats?.status === 'ok'
         ? (Number.isSafeInteger(stats.snapshotGeneratedAt)
             ? `共享统计快照，更新于 ${new Date(stats.snapshotGeneratedAt).toLocaleTimeString()}` : '') : pending;
     entry.fields.tokens.title = stats?.status === 'ok'
@@ -167,15 +199,20 @@ function startRenderer(api, options = {}) {
     const style = doc.createElement('style');
     style.dataset.sessionStatsStyle = '';
     style.textContent = `
-        [data-session-stats] { position: fixed; display: flex; gap: 20px; padding: 0; margin: 0;
-            height: 14px; line-height: 14px; font-size: 11px; font-family: inherit; z-index: 10;
+        [data-session-stats] { display: flex; gap: 20px; padding: 0; margin: 0;
+            line-height: 14px; font-size: 11px; font-family: inherit;
             font-variant-numeric: tabular-nums; opacity: .7;
-            overflow-x: auto; scrollbar-width: none; pointer-events: none; white-space: nowrap; }
+            overflow-x: auto; scrollbar-width: none; white-space: nowrap; }
+        [data-session-stats]:not([data-session-stats-agent]) { position: static; flex: none; grid-column: 1 / -1;
+            box-sizing: border-box; width: 100%; min-width: 0; padding: 0 4px; gap: min(3%, 20px); }
+        :has(> [data-session-stats-wrap]) { flex-wrap: wrap; }
+        [data-session-stats][data-session-stats-wrap] { flex-basis: 100%; }
         [data-session-stats] .session-stats-group { flex-shrink: 0; pointer-events: auto; }
         [data-session-stats] .session-stats-group:first-child { margin-left: auto; }
         [data-session-stats] .session-stats-group:last-child { margin-right: auto; }
-        ${TaskPaneSelector}[data-session-stats-footer] { box-sizing: border-box; padding-bottom: 24px; }
-        [data-session-stats-agent] { position: absolute; left: 16px; right: 16px; bottom: 2px; }
+        ${TaskPaneSelector}[data-session-stats-footer] { box-sizing: border-box; padding-bottom: 18px; }
+        [data-session-stats-agent] { position: absolute; left: 16px; right: 16px; bottom: 2px;
+            height: 14px; z-index: 10; pointer-events: none; }
     `;
     doc.head.append(style);
 
@@ -300,12 +337,17 @@ function startRenderer(api, options = {}) {
                     if (paneKeys.get(root) === key && paneRevisions.get(root) === revision) removeAgent(root);
         } finally { bindingsPending = false; }
     }
-    function position(current) {
-        const bounds = footerBounds(current.root, win);
+    function mountFooter(current) {
+        const { after, inside } = footerPlacement(current.root, win);
         current.bar.style.color = win.getComputedStyle(current.root).color;
-        current.bar.style.left = `${Math.round(bounds.left)}px`;
-        current.bar.style.top = `${Math.round(bounds.top)}px`;
-        current.bar.style.width = `${Math.round(bounds.width)}px`;
+        const style = inside && win.getComputedStyle(inside);
+        current.bar.toggleAttribute('data-session-stats-wrap', !!style
+            && style.display.includes('flex') && !style.flexDirection.startsWith('column'));
+        if (inside) {
+            if (inside.lastElementChild !== current.bar) inside.append(current.bar);
+        } else if (after.nextElementSibling !== current.bar) after.after(current.bar);
+        const margin = footerBottomMargin(current.bar, win);
+        if (current.bar.style.marginBottom !== margin) current.bar.style.marginBottom = margin;
     }
     function isCurrent(current) {
         return !stopped && entry === current && doc.visibilityState !== 'hidden'
@@ -330,14 +372,14 @@ function startRenderer(api, options = {}) {
             if (current.remote) {
                 if (stats?.threadId !== current.sessionId || stats.source !== 'remote_control'
                     || !(stats.status === 'ok' || stats.status === 'unavailable' && Object.hasOwn(SnapshotUnavailable, stats.unavailableReason))) {
-                    current.bar.remove(); return;
+                    current.confirmed = false; current.bar.remove(); return;
                 }
-                render(current, stats); position(current);
-                if (!current.bar.isConnected) doc.body.append(current.bar);
+                current.confirmed = true;
+                render(current, stats); mountFooter(current);
             } else render(current, stats?.threadId === current.sessionId ? stats : null);
         } catch {
             if (isCurrent(current) && current.root === requestedRoot && current.inflight === request) {
-                if (current.remote) current.bar.remove();
+                if (current.remote) { current.confirmed = false; current.bar.remove(); }
                 else render(current, null);
             }
         } finally {
@@ -366,13 +408,14 @@ function startRenderer(api, options = {}) {
         if (!entry || entry.sessionId !== sessionId) {
             const remote = sessionId.startsWith('session_');
             remove(); entry = { ...makeBar(doc, remote), root, sessionId, remote, inflight: false };
-            if (!remote) { render(entry, null); doc.body.append(entry.bar); }
+            if (!remote) render(entry, null);
         }
         // Sending a prompt can replace the composer while the session stays the same.
         // Move the existing bar; a late reply bound to the old root is ignored above.
         if (entry.root !== root) entry.inflight = false;
         entry.root = root; entry.composerMissingAt = null;
-        position(entry); void refresh(entry);
+        if (!entry.remote || entry.confirmed) mountFooter(entry);
+        void refresh(entry);
     }
     function schedule() {
         if (!stopped && scheduled === null) scheduled = win.setTimeout(reconcile, options.debounceMs ?? 100);

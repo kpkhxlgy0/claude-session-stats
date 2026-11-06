@@ -13,7 +13,7 @@ function createSubagentBindings() {
             if (url.username || url.password) return null;
             if (!(url.protocol === 'app:' && url.hostname === 'localhost' && !url.port)
                 && url.origin !== 'https://claude.ai') return null;
-            const local = /^\/epitaxy\/(local_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i
+            const local = /^\/(?:epitaxy|code)\/(local_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i
                 .exec(url.pathname);
             if (local) return { sessionId: local[1], type: 'local', remote: false };
             const remote = /^\/(?:epitaxy|code)\/(session_[A-Za-z0-9_-]{1,128})\/?$/.exec(url.pathname);

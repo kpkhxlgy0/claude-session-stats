@@ -67,9 +67,10 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         let active = true;
         const workspaceRoot = context?.workspaceRoot, verify = context?.verify;
         const resolveRelocation = context?.resolveRelocation;
+        const resolveAssistantTip = context?.resolveAssistantTip;
         const valid = () => active && !disposed && (!context
             || context.workspaceRoot === workspaceRoot && context.verify === verify
-                && context.resolveRelocation === resolveRelocation);
+                && context.resolveRelocation === resolveRelocation && context.resolveAssistantTip === resolveAssistantTip);
         const assert = () => { if (!valid()) throw new Error('Session operation changed'); };
         return {
             context: context && { workspaceRoot, verify: valid,
@@ -78,6 +79,12 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                     const evidence = await resolveRelocation.call(context, cwd);
                     assert();
                     return evidence;
+                } } : {}),
+                ...(typeof resolveAssistantTip === 'function' ? { resolveAssistantTip: async () => {
+                    assert();
+                    const tip = await resolveAssistantTip.call(context);
+                    assert();
+                    return tip;
                 } } : {}) },
             assert,
             async current() {
@@ -114,7 +121,7 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
         for (const directory of new Set([...roots, ...[...parents].map(file => path.dirname(file)),
             ...(operation.context ? [operation.context.workspaceRoot] : [])]))
             directories.set(directory, await safeDirectory(directory));
-        return { files, directories, path: entry.path, operation };
+        return { files, directories, path: entry.path, assistantTip: source.assistantTip, operation };
     }
 
     async function confirmFiles(proof)
@@ -470,6 +477,9 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
                 for (const sample of proofs) await confirmFiles(sample);
             }
             await operation.current();
+            for (const sample of proofs)
+                if (sample.assistantTip && await operation.context.resolveAssistantTip() !== sample.assistantTip)
+                    throw new Error('Session assistant tip changed');
             for (const sample of proofs) await confirmFiles(sample);
             operation.assert();
             return stats;

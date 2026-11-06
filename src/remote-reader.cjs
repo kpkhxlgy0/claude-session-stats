@@ -88,11 +88,20 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         return size;
     }
     function samePath(value, expected) {
-        if (typeof value !== 'string' || value.length > 4096 || /[\x00-\x1f]/.test(value)) return false;
-        const path = value.replaceAll('\\', '/');
-        if (path === expected) return true;
-        if (!/^(?:[A-Za-z]:\/|\/)/.test(path) || !path.endsWith(`/${expected}`)) return false;
-        return path.split('/').every((part, i) => i === 0 && part === '' || part && part !== '.' && part !== '..');
+        if (typeof value !== 'string' || value.length > 4096 || /[\x00-\x1f\x7f]/.test(value)) return false;
+        const target = expected.split('/');
+        if (target.length !== 4 || target[0] !== '~' || target[1] !== '.claude-plusplus'
+            || target[2] !== 'session-stats') return false;
+        // The native RC dispatcher can echo its exact request path after the worker authorizes and reads it.
+        if (value === expected) return true;
+        const windows = /^[A-Za-z]:[\\/]/.test(value);
+        if (!windows && (!/^\/[^/]/.test(value) || value.includes('\\'))) return false;
+        const path = windows ? value.replaceAll('\\', '/') : value;
+        const parts = path.slice(windows ? 3 : 1).split('/');
+        if (parts.length < 4 || !parts.every(part => part && part !== '.' && part !== '..'
+            && !/[<>:"|?*%~]/.test(part) && !/[. ]$/.test(part)
+            && (!windows || !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)))) return false;
+        return parts.slice(-3).every((part, index) => part === target[index + 1]);
     }
     function accept(current, file, expectedPath) {
         if (!record(file) || typeof file.contents !== 'string' || file.contents.length > protocol.maxBytes
@@ -192,8 +201,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             const initial = readPage(await request(`${base}/events?${new URLSearchParams({ limit: '1', sort_order: 'desc' })}`), 0, true);
             let cursor = initial.cursor;
             const requestId = win.crypto.randomUUID();
-            // workspace_root is fixed at CLI launch; EnterWorktree changes its allowed cwd.
-            // Use one current-directory contract, never a fallback after a refused anchored read.
+            // Request only the fixed home path; native refusal never triggers workspace or anchor fallbacks.
             await request(`${base}/events`, { events: [{ payload: { type: 'control_request', uuid: win.crypto.randomUUID(),
                 request_id: requestId, request: { subtype: 'read_file', path, max_bytes: protocol.maxBytes,
                     encoding: 'utf-8' } } }] });

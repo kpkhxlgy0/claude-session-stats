@@ -231,8 +231,37 @@ test('serialized lookup accepts the current message host alternate without readi
 test('binds only the exact selected subagent in a pane to its matching detail identity', t => {
     for (const remote of [false, true]) {
         const f = fixture(t, { remote });
-        assert.deepEqual(bindings().resolveSubagent(f.pane, f.dom.window),
-            { sessionId: f.sessionId, agentId: 'agent_A-1', remote });
+        for (const origin of ['https://claude.ai', 'app://localhost']) {
+            for (const path of ['epitaxy', 'code']) {
+                for (const suffix of ['', '/']) {
+                    f.dom.reconfigure({ url: `${origin}/${path}/${f.sessionId}${suffix}` });
+                    assert.deepEqual(bindings().resolveSubagent(f.pane, f.dom.window),
+                        { sessionId: f.sessionId, agentId: 'agent_A-1', remote });
+                }
+            }
+        }
+    }
+});
+
+test('subagent route lookup retains strict origins, local URI encoding and exact paths', t => {
+    const f = fixture(t);
+    for (const path of ['epitaxy', 'code']) {
+        for (const url of [`https://claude.ai.evil.example/${path}/${LOCAL}`,
+            `http://claude.ai/${path}/${LOCAL}`, `https://claude.ai:444/${path}/${LOCAL}`,
+            `app://localhost.evil.example/${path}/${LOCAL}`, `app://localhost:1234/${path}/${LOCAL}`,
+            `https://user:pass@claude.ai/${path}/${LOCAL}`, `app://user@localhost/${path}/${LOCAL}`,
+            `https://claude.ai/${path}/%6cocal_${LOCAL.slice(6)}`,
+            `https://claude.ai/${path}/${LOCAL.replace('1', '%31')}`,
+            `https://claude.ai/${path}/${LOCAL}%2fextra`, `https://claude.ai/${path}/${LOCAL}/extra`,
+            `https://claude.ai/${path}/local_11111111-1111-0111-8111-111111111111`]) {
+            f.dom.reconfigure({ url });
+            assert.equal(bindings().resolveSubagent(f.pane, f.dom.window), null, url);
+        }
+        f.dom.reconfigure({ url: `https://claude.ai/${path}/${LOCAL}` });
+        const bridgeRef = { type: 'bridge', id: LOCAL };
+        f.props({ ...f.view, sessionRef: bridgeRef }, { ...f.detail, sessionRef: bridgeRef });
+        assert.equal(bindings().resolveSubagent(f.pane, f.dom.window), null);
+        f.props(f.view, f.detail);
     }
 });
 

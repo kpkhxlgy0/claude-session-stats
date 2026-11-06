@@ -10,9 +10,9 @@ const stats = { status: 'ok', turns: 2, steps: 3, totalTokens: 50, inputTokens: 
     outputTokens: 10, cachedInputTokens: 20, cacheHit: .5, tps: null, usageComplete: true };
 
 test('agent paths require an exact bounded ASCII identity and leave parent paths unchanged', () => {
-    assert.equal(protocol.snapshotPath('cse_Parent'), '.claude/session-stats/session_Parent.json');
+    assert.equal(protocol.snapshotPath('cse_Parent'), '~/.claude-plusplus/session-stats/session_Parent.json');
     assert.equal(protocol.snapshotPath('cse_Parent', 'agent_A-1'),
-        '.claude/session-stats/session_Parent.agent-agent_A-1.json');
+        '~/.claude-plusplus/session-stats/session_Parent.agent-agent_A-1.json');
     assert.equal(protocol.normalizeAgentId('A_-0'), 'A_-0');
     assert.equal(protocol.normalizeAgentId('x'.repeat(64)), 'x'.repeat(64));
     for (const invalid of ['', null, 1, '../a', 'a/b', 'a\\b', 'a.b', 'a\n', 'a\r\n', '中文', 'x'.repeat(65)]) {

@@ -36,7 +36,9 @@ async function waitForSnapshot(f, agentId, predicate = () => true) {
 async function fixture(t, options = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-agent-publisher-')));
     const claudeData = path.join(root, 'desktop'), workspace = path.join(root, 'workspace');
+    const userHome = path.join(root, 'home');
     await fs.mkdir(workspace);
+    await fs.mkdir(userHome);
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, `${LOCAL}.json`);
     await fs.mkdir(path.dirname(metadata), { recursive: true });
     const row = { sessionId: LOCAL, cliSessionId: CLI, cwd: workspace, bridgeSessionIds: [BRIDGE] };
@@ -52,16 +54,33 @@ async function fixture(t, options = {}) {
             if (value instanceof Error) throw value;
             return value;
         } };
-    const publisher = createSnapshotPublisher({ claudeData, store, now: () => 100000,
+    const publisher = createSnapshotPublisher({ claudeData, userHome, store, now: () => 100000,
         publisherId: PUBLISHER, pollMs: 100000, ...options });
-    const directory = path.join(workspace, '.claude', 'session-stats');
+    const directory = path.join(userHome, '.claude-plusplus', 'session-stats');
     const destination = agentId => path.join(directory,
         `${BRIDGE}${agentId === undefined ? '' : `.agent-${agentId}`}.json`);
     const snapshot = async agentId => JSON.parse(await fs.readFile(destination(agentId), 'utf8'));
     t.after(async () => { await publisher.stop(); await fs.rm(root, { recursive: true, force: true }); });
-    return { root, claudeData, workspace, metadata, row, write, calls, samples, publisher,
+    return { root, claudeData, workspace, userHome, metadata, row, write, calls, samples, publisher,
         directory, destination, snapshot, setAgents(value) { agents = value; } };
 }
+
+test('storage failure exposes only the selected child sample while it belongs to the session', async t => {
+    const f = await fixture(t);
+    const rename = fs.rename;
+    t.mock.method(fs, 'rename', (from, to) => to === f.destination('a')
+        ? Promise.reject(Object.assign(new Error('Device unavailable'), { code: 'ENODEV' })) : rename(from, to));
+    f.samples.set('a', { ...STATS, threadId: CLI, agentId: 'a', turns: 8 });
+    await f.publisher.start();
+    const local = await f.publisher.readLocal(LOCAL, { agentId: 'a' });
+    assert.equal(local.turns, 8);
+    assert.equal(local.snapshotSync, 'local-only');
+    assert.equal(local.snapshotRevision, undefined);
+    assert.equal(local.agentId, 'a');
+    assert.equal((await f.publisher.readLocal(LOCAL)).snapshotSync, undefined);
+    f.setAgents(['b']);
+    assert.equal((await f.publisher.readLocal(LOCAL, { agentId: 'a', waitForPoll: false })).status, 'unavailable');
+});
 
 test('parent and siblings publish separate exact samples and local child reads use the shared revision', async t => {
     const f = await fixture(t);
@@ -81,7 +100,7 @@ test('parent and siblings publish separate exact samples and local child reads u
         assert.equal(await f.publisher.readLocal(LOCAL, { agentId, waitForPoll: false }), null);
 });
 
-test('a failed parent workspace proof forgets every owned child path before stopping', async t => {
+test('a failed workspace proof cleans owned user files without touching legacy workspace children', async t => {
     let relocated;
     const f = await fixture(t, { resolveWorkspace: async binding => ({
         workspaceRoot: relocated ?? binding.workspaceRoot,
@@ -89,10 +108,14 @@ test('a failed parent workspace proof forgets every owned child path before stop
     }) });
     await f.publisher.start();
     await Promise.all([f.snapshot(), f.snapshot('a'), f.snapshot('b')]);
+    const legacyDirectory = path.join(f.workspace, '.claude', 'session-stats');
+    await fs.mkdir(legacyDirectory, { recursive: true });
+    for (const agent of [undefined, 'a', 'b'])
+        await fs.copyFile(f.destination(agent), path.join(legacyDirectory, path.basename(f.destination(agent))));
     relocated = path.join(f.root, 'relocated'); await fs.mkdir(relocated);
     const originalOpen = fs.open, oldReads = [];
     const spy = t.mock.method(fs, 'open', async (file, ...args) => {
-        if (path.dirname(path.resolve(file)) === path.resolve(f.directory)) {
+        if (path.dirname(path.resolve(file)) === path.resolve(legacyDirectory)) {
             oldReads.push(file); throw new Error('Old workspace must not be opened');
         }
         return originalOpen(file, ...args);
@@ -101,6 +124,8 @@ test('a failed parent workspace proof forgets every owned child path before stop
     await f.publisher.stop();
     assert.deepEqual(oldReads, []);
     spy.mock.restore();
+    assert.equal((await fs.readdir(legacyDirectory)).length, 3);
+    assert.deepEqual(await fs.readdir(f.directory), []);
 });
 
 test('repeated discovery and duplicate IDs never accumulate or mix sibling counts', async t => {

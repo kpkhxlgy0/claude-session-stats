@@ -130,6 +130,22 @@ async function recheckSnapshotBinding(binding, options) {
     return await inspectSnapshotBinding(binding, options) === true;
 }
 
+async function resolveSnapshotAssistantTip(binding, options) {
+    // Attest this exact record only. The caller must bracket sampling with its
+    // global local/bridge identity discovery (as the publisher does).
+    try {
+        const before = await readRecord(binding.metadataFile, true);
+        const tip = before?.record.lastAssistantUuid;
+        if (typeof tip !== 'string' || !UUID.test(tip) || before.record.sessionId !== binding.localSessionId
+            || before.record.cliSessionId !== binding.cliSessionId
+            || !await recheckSnapshotBinding(binding, options)) return null;
+        const after = await readRecord(binding.metadataFile, true);
+        return after && sameVersion(before.info, after.info) && after.record.lastAssistantUuid === tip
+            && after.record.sessionId === binding.localSessionId && after.record.cliSessionId === binding.cliSessionId
+            ? tip : null;
+    } catch { return null; }
+}
+
 async function resolveSnapshotRelocation(binding, relocationCwd, { resolveWorkspace } = {}) {
     if (typeof relocationCwd !== 'string' || !path.isAbsolute(relocationCwd)) return null;
     const proof = await inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd });
@@ -205,4 +221,5 @@ async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavai
     return resolved.sort((a, b) => a.metadataFile.localeCompare(b.metadataFile)
         || a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
-module.exports = { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation, snapshotBindingIdentity };
+module.exports = { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation,
+    resolveSnapshotAssistantTip, snapshotBindingIdentity };

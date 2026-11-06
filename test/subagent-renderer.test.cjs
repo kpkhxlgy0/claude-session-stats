@@ -79,6 +79,23 @@ function fixture(t, { remote = false, parent = false, childEditor = false } = {}
         setReply(value) { reply = value; } };
 }
 
+test('both local route prefixes render parent and selected child through local IPC only', async t => {
+    for (const origin of ['https://claude.ai', 'app://localhost']) {
+        for (const path of ['epitaxy', 'code']) {
+            const f = fixture(t, { parent: true });
+            f.dom.reconfigure({ url: `${origin}/${path}/${LOCAL}` });
+            const controller = f.run(); await tick();
+            assert.ok(f.doc.querySelector('[data-session-stats]:not([data-session-stats-agent])'));
+            assert.ok(f.selected.root.querySelector('[data-session-stats-agent]'));
+            assert.ok(f.calls.some(call => call[0] === 'stats' && call[1] === LOCAL));
+            assert.deepEqual(f.calls.find(call => call[0] === 'agent-stats'),
+                ['agent-stats', { sessionId: LOCAL, agentId: 'agent_A-1' }]);
+            assert.equal(f.calls.some(call => call[0].startsWith('remote-')), false);
+            controller.stop();
+        }
+    }
+});
+
 test('local selected child reserves a fixed footer below its flex transcript without a composer', async t => {
     const f = fixture(t); const before = f.selected.root.style.cssText;
     f.run(); await tick();
@@ -89,11 +106,13 @@ test('local selected child reserves a fixed footer below its flex transcript wit
     assert.doesNotMatch(bar.textContent, /context|上下文/i);
     const style = f.dom.window.getComputedStyle(bar);
     assert.equal(style.position, 'absolute');
+    assert.equal(style.height, '14px');
     assert.equal(style.bottom, '2px');
     assert.equal(style.left, '16px'); assert.equal(style.right, '16px');
     assert.equal(style.margin, '0px'); assert.equal(style.padding, '0px');
     assert.equal(f.selected.root.style.cssText, before);
-    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    const reserve = parseFloat(f.dom.window.getComputedStyle(f.selected.root).paddingBottom);
+    assert.equal(reserve - parseFloat(style.height) - parseFloat(style.bottom), 2, 'clearance above the statistics line');
     assert.equal(f.dom.window.getComputedStyle(f.selected.root).boxSizing, 'border-box');
     assert.equal(f.dom.window.getComputedStyle(f.selected.root.querySelector('.content')).flex, '1 1 0%');
     assert.equal(f.dom.window.getComputedStyle(bar.firstChild).marginLeft, 'auto');
@@ -137,7 +156,7 @@ test('remote child metrics require matching session, exact agent and Remote Cont
     const bar = f.selected.root.querySelector('[data-session-stats-agent]');
     assert.match(bar.textContent, /— turns.*— steps.*— tok\/s/);
     assert.match(bar.title, /Session Stats/);
-    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '18px');
 });
 
 test('multiple child panes keep independent identities and metric bars', async t => {
@@ -166,7 +185,7 @@ test('resuming the selected child keeps its mounted footer when task metadata mo
             await tick();
             assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), bar);
             assert.match(bar.textContent, /8 steps/);
-            assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+            assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '18px');
         }
     });
 });
@@ -227,13 +246,13 @@ test('selection switches, task lists, hidden panes and remounts remove obsolete 
     assert.equal(f.dom.window.getComputedStyle(f.selected.root).boxSizing, 'content-box');
     f.selected.select('agent_C'); await tick();
     assert.ok(f.selected.root.querySelector('[data-session-stats-agent]'));
-    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '18px');
     f.selected.root.hidden = true; await tick();
     assert.equal(f.selected.root.querySelector('[data-session-stats-agent]'), null);
     assert.equal(f.selected.root.hasAttribute('data-session-stats-key'), false);
     assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
     f.selected.root.hidden = false; await tick();
-    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '18px');
     f.selected.root.remove(); const replacement = f.pane('agent_D'); await tick();
     assert.equal(f.selected.root.hasAttribute('data-session-stats-footer'), false);
     assert.ok(replacement.root.querySelector('[data-session-stats-agent]'));
@@ -258,7 +277,7 @@ test('late binding replies cannot remount a closed or route-changed pane', async
 test('stopping removes child bars and keys and ignores pending metric replies', async t => {
     const f = fixture(t, { remote: true }); let settle;
     const controller = f.run(); await tick();
-    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '24px');
+    assert.equal(f.dom.window.getComputedStyle(f.selected.root).paddingBottom, '18px');
     f.setReply(() => new Promise(resolve => { settle = resolve; }));
     await tick();
     const oldKey = f.selected.root.dataset.sessionStatsKey;

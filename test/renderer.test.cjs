@@ -30,20 +30,33 @@ function fixture(t, url = `https://claude.ai/epitaxy/${ID}`) {
 const tick = () => new Promise(resolve => setTimeout(resolve, 70));
 test('only trusted local and Remote Control candidate routes produce identities', () => {
     for (const origin of ['https://claude.ai', 'app://localhost']) {
-        assert.equal(parseSessionId(`${origin}/epitaxy/${ID}`), ID);
         for (const path of ['epitaxy', 'code']) {
+            assert.equal(parseSessionId(`${origin}/${path}/${ID}`), ID);
+            assert.equal(parseSessionId(`${origin}/${path}/${ID}/`), ID);
             assert.equal(parseSessionId(`${origin}/${path}/${REMOTE}`), REMOTE);
             assert.equal(parseSessionId(`${origin}/${path}/session_${'a'.repeat(128)}/`), `session_${'a'.repeat(128)}`);
         }
     }
     for (const url of [`https://evil.example/epitaxy/${ID}`, 'https://claude.ai/new',
         `https://claude.ai/chat/${ID}`, `https://claude.ai/epitaxy/${ID}/extra`,
-        `https://claude.ai/code/${ID}`, `https://claude.ai/chat/${REMOTE}`,
+        `https://claude.ai/code/${ID}/extra`, `https://claude.ai/chat/${REMOTE}`,
         `https://claude.ai/code/${REMOTE}/extra`, 'https://claude.ai/epitaxy/session_',
         `https://claude.ai/epitaxy/session_${'a'.repeat(129)}`, 'https://claude.ai/epitaxy/session_a%2fb',
         `app://user@localhost/epitaxy/${REMOTE}`, `app://localhost:1234/code/${REMOTE}`,
         `https://user:pass@claude.ai/code/${REMOTE}`, `app://claude.ai/code/${REMOTE}`,
         'https://claude.ai/epitaxy/local_..%2fsecret']) assert.equal(parseSessionId(url), null);
+    for (const path of ['epitaxy', 'code']) {
+        for (const url of [`https://claude.ai.evil.example/${path}/${ID}`,
+            `http://claude.ai/${path}/${ID}`, `https://claude.ai:444/${path}/${ID}`,
+            `app://localhost.evil.example/${path}/${ID}`, `app://localhost:1234/${path}/${ID}`,
+            `https://user:pass@claude.ai/${path}/${ID}`, `app://user@localhost/${path}/${ID}`,
+            `https://claude.ai/${path}/%6cocal_${ID.slice(6)}`,
+            `https://claude.ai/${path}/${ID.replace('1', '%31')}`,
+            `https://claude.ai/${path}/${ID}%2fextra`, `https://claude.ai/${path}/${ID}/extra`,
+            `https://claude.ai/${path}/local_11111111-1111-0111-8111-111111111111`]) {
+            assert.equal(parseSessionId(url), null, url);
+        }
+    }
 });
 test('semantic composer detection requires a unique visible editor and excludes dialogs', t => {
     const f = fixture(t);
@@ -64,11 +77,25 @@ test('shows five stats, missing TPS and no context, without changing composer la
     assert.match(f.doc.querySelector('[data-stat="tps"]').title, /整个会话.*有效响应样本/);
     assert.match(f.doc.querySelector('[data-stat="tps"]').title, /首 Token 等待/);
     assert.doesNotMatch(bar.textContent, /context|上下文/i);
-    assert.equal(f.dom.window.getComputedStyle(bar).position, 'fixed');
+    assertStatsRow(bar, f.doc.querySelector('form'), f.dom.window);
     assert.equal(f.doc.querySelector('form').outerHTML, before);
     c.stop(); c.stop();
     assert.equal(f.doc.querySelector('[data-session-stats]'), null);
     assert.equal(f.doc.querySelector('[data-session-stats-style]'), null);
+});
+
+test('marks a local-only sample visibly and clears the notice on a shared sample', async t => {
+    const f = fixture(t);
+    f.api.ipc.invoke = async () => ({ ...stats, threadId: ID, snapshotSync: 'local-only' });
+    f.run(); await tick();
+    const bar = f.doc.querySelector('[data-session-stats]');
+    assert.match(bar.textContent, /33 steps/);
+    assert.match(bar.textContent, /仅本机/);
+    assert.match(bar.title, /未同步/);
+    f.api.ipc.invoke = async () => ({ ...stats, threadId: ID, snapshotGeneratedAt: Date.now() });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.doesNotMatch(bar.textContent, /仅本机/);
+    assert.match(bar.title, /共享/);
 });
 
 test('replacing the composer for a new prompt preserves the same session bar while stats are pending', async t => {
@@ -134,7 +161,7 @@ test('reusing composer A after A to B to A ignores the first A request and its c
         assert.match(bar.textContent, /88 steps/);
     });
 });
-test('uses the empty center of the lower controls row instead of the input border', async t => {
+function lowerControlsFixture(t) {
     const f = fixture(t);
     const form = f.doc.querySelector('form');
     const wrapper = f.doc.createElement('section');
@@ -146,17 +173,158 @@ test('uses the empty center of the lower controls row instead of the input borde
         const rect = { left, top, right: left + width, bottom: top + height, width, height };
         node.getClientRects = () => [rect]; node.getBoundingClientRect = () => rect;
     };
-    bounds(wrapper, 20, 500, 600, 140);
-    bounds(controls.children[0], 22, 612, 100, 24);
-    bounds(controls.children[1], 500, 612, 115, 24);
-    const before = wrapper.outerHTML;
-    f.run(); await tick();
+    Object.defineProperty(f.dom.window, 'innerHeight', { value: 640, configurable: true });
+    const layout = ({ left, width, buttons }) => {
+        bounds(wrapper, left, 500, width, 140);
+        for (const node of [form, ...form.children]) bounds(node, left, 500, width, 100);
+        buttons.forEach(([buttonLeft, buttonWidth], i) => bounds(controls.children[i], buttonLeft, 612, buttonWidth, 24));
+    };
+    return { ...f, wrapper, controls, layout };
+}
+
+test('an anchored composer keeps the reserved row within its bottom-aligned box', async t => {
+    const f = fixture(t);
+    const form = f.doc.querySelector('form');
+    form.style.cssText = 'position:fixed; bottom:0; display:flex; align-items:center';
+    const original = form.outerHTML;
+    const controller = f.run(); await tick();
     const bar = f.doc.querySelector('[data-session-stats]');
-    assert.equal(parseFloat(bar.style.top), 617);
-    assert.equal(parseFloat(bar.style.left) + parseFloat(bar.style.width) / 2, 320);
-    assert.ok(parseFloat(bar.style.left) > 122);
-    assert.ok(parseFloat(bar.style.left) + parseFloat(bar.style.width) < 500);
-    assert.equal(wrapper.outerHTML, before);
+    assert.equal(form.lastElementChild, bar);
+    assert.equal(f.dom.window.getComputedStyle(form).flexWrap, 'wrap');
+    controller.stop();
+    assert.equal(form.outerHTML, original);
+});
+
+for (const layout of ['grid', 'flex']) test(`does not put the footer across the sidebar in a split ${layout}`, async t => {
+    const f = fixture(t);
+    const main = f.doc.querySelector('main'), form = main.querySelector('form');
+    main.style.cssText = `display:${layout}; grid-template-columns: 600px 300px`;
+    const sidebar = f.doc.createElement('aside');
+    // A top-aligned sidebar can end well above the bottom-aligned composer.
+    sidebar.getBoundingClientRect = () => ({ left: 620, right: 920, top: 0, bottom: 200, height: 200, width: 300 });
+    main.append(sidebar);
+    f.run(); await tick();
+    assert.equal(form.lastElementChild, f.doc.querySelector('[data-session-stats]'));
+    assert.equal(main.children.length, 2, 'native pane tracks keep their original siblings');
+});
+
+function assertStatsRow(bar, previous, win) {
+    assert.ok(bar, 'the statistics must be visible');
+    const row = bar.closest('[data-session-stats-row]') ?? bar;
+    assert.equal(row.parentElement, previous.parentElement, 'the row must stay in the composer column');
+    assert.equal(row.previousElementSibling, previous, 'the statistics row must follow the composer controls');
+    const rowStyle = win.getComputedStyle(row), barStyle = win.getComputedStyle(bar);
+    assert.notEqual(rowStyle.position, 'fixed', 'the row must reserve space in normal flow');
+    assert.notEqual(rowStyle.position, 'absolute', 'the row must reserve space in normal flow');
+    assert.ok(['block', 'flex', 'grid'].includes(rowStyle.display), 'the statistics must have their own block row');
+    const first = bar.querySelector('.session-stats-group:first-child');
+    const last = bar.querySelector('.session-stats-group:last-child');
+    assert.ok(barStyle.justifyContent === 'center'
+        || win.getComputedStyle(first).marginLeft === 'auto' && win.getComputedStyle(last).marginRight === 'auto',
+    'the metrics must be horizontally centered in the row');
+    if (rowStyle.width.endsWith('px')) {
+        assert.ok(parseFloat(rowStyle.width) <= previous.parentElement.getBoundingClientRect().width,
+            'the statistics row must fit the composer column');
+    } else if (rowStyle.width.endsWith('%')) {
+        assert.ok(parseFloat(rowStyle.width) <= 100, 'the statistics row must fit the composer column');
+    }
+    assert.equal(barStyle.whiteSpace, 'nowrap');
+    return row;
+}
+
+test('reuses only the bottom padding available to a docked statistics row', async t => {
+    const f = lowerControlsFixture(t);
+    f.layout({ left: 20, width: 800, buttons: [[510, 135], [670, 135]] });
+    f.run(); await tick();
+    const win = f.dom.window, bar = f.doc.querySelector('[data-session-stats]');
+    const style = win.getComputedStyle(bar);
+    assert.equal(style.paddingTop, '0px');
+    assert.equal(style.paddingBottom, '0px');
+    const main = f.doc.querySelector('main');
+    main.style.paddingBottom = '8px';
+    main.getBoundingClientRect = () => ({ top: 0, bottom: 640, height: 640 });
+    f.wrapper.getBoundingClientRect = () => ({ top: 500, bottom: 632, height: 132, width: 800 });
+    bar.getBoundingClientRect = () => {
+        const bottom = 632 - (parseFloat(bar.style.marginBottom) || 0);
+        return { height: 14, top: bottom - 14, bottom };
+    };
+    async function reflow() { win.dispatchEvent(new win.Event('resize')); await tick(); }
+    await reflow();
+    assert.equal(bar.style.marginBottom, '-7px', 'leave one pixel before the window edge');
+    await reflow();
+    assert.equal(bar.getBoundingClientRect().bottom, 639, 'repeated layout must not drift');
+    f.wrapper.style.overflowY = 'hidden';
+    await reflow();
+    assert.equal(parseFloat(win.getComputedStyle(bar).marginBottom), 0, 'keep the line inside a clipped pane');
+    f.wrapper.style.overflowY = 'visible';
+    main.style.paddingBottom = '0px';
+    await reflow();
+    assert.equal(parseFloat(win.getComputedStyle(bar).marginBottom), 0, 'preserve the row when no native padding is available');
+});
+
+test('centers statistics in their own normal-flow row below legacy or right-aligned controls', async t => {
+    for (const [label, width, buttons] of [
+        ['legacy controls at both ends', 600, [[22, 100], [500, 115]]],
+        ['new controls on the right', 800, [[470, 140], [630, 185]]],
+        ['new controls crossing the composer midpoint', 800, [[410, 170], [630, 185]]],
+    ]) await t.test(label, async t => {
+        const f = lowerControlsFixture(t);
+        f.layout({ left: 20, width, buttons });
+        const before = f.wrapper.outerHTML;
+        const controller = f.run(); await tick();
+        const bar = f.doc.querySelector('[data-session-stats]');
+        assertStatsRow(bar, f.controls, f.dom.window);
+        assert.equal(f.wrapper.children.length, 3, 'only one statistics row may be added');
+        controller.stop();
+        assert.equal(f.wrapper.outerHTML, before);
+    });
+});
+
+test('opening and closing a sidebar keeps one centered statistics row within the composer column', async t => {
+    const f = lowerControlsFixture(t);
+    f.layout({ left: 20, width: 900, buttons: [[650, 140], [810, 105]] });
+    const before = f.wrapper.outerHTML;
+    const controller = f.run(); await tick();
+    const bar = f.doc.querySelector('[data-session-stats]');
+    const row = assertStatsRow(bar, f.controls, f.dom.window);
+    for (const layout of [
+        { left: 220, width: 700, buttons: [[590, 160], [810, 105]] },
+        { left: 220, width: 380, buttons: [[260, 170], [450, 145]] },
+        { left: 20, width: 900, buttons: [[650, 140], [810, 105]] },
+    ]) {
+        f.layout(layout);
+        f.dom.window.dispatchEvent(new f.dom.window.Event('resize'));
+        await tick();
+        assert.equal(f.doc.querySelector('[data-session-stats]'), bar);
+        assert.equal(assertStatsRow(bar, f.controls, f.dom.window), row);
+        assert.equal(f.wrapper.children.length, 3, 'resizing must not accumulate spacer rows');
+    }
+    controller.stop();
+    assert.equal(f.wrapper.outerHTML, before);
+});
+
+test('replacing the composer column moves the existing row and removes the old placeholder', async t => {
+    const f = lowerControlsFixture(t);
+    f.layout({ left: 20, width: 800, buttons: [[470, 140], [630, 185]] });
+    const before = f.wrapper.outerHTML;
+    const replacement = f.wrapper.cloneNode(true);
+    const originals = [f.wrapper, ...f.wrapper.querySelectorAll('*')];
+    const replacements = [replacement, ...replacement.querySelectorAll('*')];
+    replacements.forEach((node, i) => {
+        const original = originals[i];
+        node.getClientRects = original.getClientRects; node.getBoundingClientRect = original.getBoundingClientRect;
+    });
+    const replacementControls = replacement.lastElementChild;
+    const controller = f.run(); await tick();
+    const bar = f.doc.querySelector('[data-session-stats]');
+    assertStatsRow(bar, f.controls, f.dom.window);
+    f.wrapper.replaceWith(replacement); await tick();
+    assert.equal(f.doc.querySelector('[data-session-stats]'), bar);
+    assertStatsRow(bar, replacementControls, f.dom.window);
+    assert.equal(f.wrapper.outerHTML, before, 'the detached column must not retain a statistics placeholder');
+    assert.equal(replacement.children.length, 3);
+    controller.stop();
+    assert.equal(replacement.outerHTML, before);
 });
 
 test('marks numeric TPS as an estimate', async t => {
@@ -199,8 +367,10 @@ test('Remote Control candidates wait for confirmed stats without overlapping req
         return new Promise(resolve => { resolveStats = resolve; });
     };
     const before = f.doc.querySelector('form').outerHTML;
+    const beforeColumn = f.doc.querySelector('main').outerHTML;
     f.run(); await tick();
     assert.equal(f.doc.querySelector('[data-session-stats]'), null);
+    assert.equal(f.doc.querySelector('main').outerHTML, beforeColumn, 'pending remote statistics must not reserve an empty row');
     assert.deepEqual(calls, [['remote-stats']]);
     resolveStats({ ...stats, threadId: REMOTE, source: 'remote_control', tps: 41.7 });
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -210,7 +380,7 @@ test('Remote Control candidates wait for confirmed stats without overlapping req
     assert.match(f.doc.querySelector('[data-stat="tokens"]').title, /运行端.*会话日志/);
     assert.doesNotMatch(bar.title, /本地/);
     assert.equal(f.doc.querySelector('form').outerHTML, before);
-    assert.equal(parseFloat(bar.style.left) + parseFloat(bar.style.width) / 2, 320);
+    assertStatsRow(bar, f.doc.querySelector('form'), f.dom.window);
 });
 
 test('Remote Control can show valid metrics when TPS is unavailable', async t => {

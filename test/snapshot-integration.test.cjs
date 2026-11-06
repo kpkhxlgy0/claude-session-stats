@@ -17,7 +17,7 @@ const CLI = '22222222-2222-4222-8222-222222222222';
 const ORG = '33333333-3333-4333-8333-333333333333';
 const ACCOUNT = '44444444-4444-4444-8444-444444444444';
 const BRIDGE = 'session_Integration123';
-const relative = '.claude/session-stats/session_Integration123.json';
+const remotePath = '~/.claude-plusplus/session-stats/session_Integration123.json';
 function turn(id, seconds, output) {
     const timestamp = n => new Date(Date.UTC(2026, 9, 24, 0, 0, n)).toISOString();
     return [{ type: 'user', sessionId: CLI, uuid: 'user-' + id, parentUuid: null, timestamp: timestamp(seconds),
@@ -30,18 +30,22 @@ function turn(id, seconds, output) {
 for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapshot and RC receiver share successive samples (CLI moved=${moved})`, async t => {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-integration-')));
     const workspace = path.join(root, 'workspace'), claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config');
+    const userHome = path.join(root, 'home');
+    const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG);
     const logs = path.join(claudeHome, 'projects', 'fixture');
-    await Promise.all([fs.mkdir(workspace, { recursive: true }), fs.mkdir(metadata, { recursive: true }), fs.mkdir(logs, { recursive: true })]);
+    await Promise.all([fs.mkdir(workspace, { recursive: true }), fs.mkdir(metadata, { recursive: true }),
+        fs.mkdir(logs, { recursive: true }), fs.mkdir(userHome)]);
     await fs.writeFile(path.join(metadata, LOCAL + '.json'), JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
         cwd: workspace, originCwd: workspace, bridgeSessionIds: [BRIDGE], isArchived: false }));
     const active = moved ? path.join(workspace, 'current-directory') : workspace;
+    const registry = path.join(claudeHome, 'sessions', '101.json');
+    const registryRow = { pid: 101, sessionId: CLI, hostSessionId: LOCAL, bridgeSessionId: BRIDGE, cwd: active,
+        startedAt: 1000, procStart: '123456', pidDomain: 'win32:fixture-host' };
     if (moved) {
         await fs.mkdir(active);
         await fs.mkdir(path.join(claudeHome, 'sessions'));
-        await fs.writeFile(path.join(claudeHome, 'sessions', '101.json'), JSON.stringify({
-            pid: 101, sessionId: CLI, hostSessionId: LOCAL, bridgeSessionId: BRIDGE, cwd: active,
-            startedAt: 1000, procStart: '123456', pidDomain: 'win32:fixture-host' }));
+        await fs.writeFile(registry, JSON.stringify(registryRow));
     }
     const log = path.join(logs, CLI + '.jsonl');
     const marker = moved === 'duplicate' ? JSON.stringify({ type: 'relocated', sessionId: CLI, relocatedCwd: active }) + '\n' : '';
@@ -57,7 +61,7 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
     const events = [], store = createSessionStore({ claudeHome });
     const resolveWorkspace = createCliWorkspaceResolver({ claudeHome, platform: 'win32', hostname: 'fixture-host',
         getProcessIdentities: async () => new Map([[101, { alive: true, procStart: '123456' }]]) });
-    const publisher = createSnapshotPublisher({ claudeData, store, resolveWorkspace, now: () => time, pollMs: 600000 });
+    const publisher = createSnapshotPublisher({ claudeData, userHome, store, resolveWorkspace, now: () => time, pollMs: 600000 });
     const dom = new JSDOM('<div class="ProseMirror" contenteditable="true"></div>', { url: 'https://claude.ai/code/' + BRIDGE });
     const editor = dom.window.document.querySelector('.ProseMirror');
     editor.getClientRects = () => [{ width: 100 }];
@@ -74,11 +78,11 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
             if (init.method === 'POST') {
                 const request = JSON.parse(init.body).events[0].payload;
                 assert.equal(request.type, 'control_request');
-                assert.deepEqual(request.request, { subtype: 'read_file', path: relative, max_bytes: 16384,
+                assert.deepEqual(request.request, { subtype: 'read_file', path: remotePath, max_bytes: 16384,
                     encoding: 'utf-8' });
-                const contents = await fs.readFile(path.join(active, relative), 'utf8');
+                const contents = await fs.readFile(destination, 'utf8');
                 events.push({ sequence_num: ++sequence, payload: { type: 'control_response', response: {
-                    request_id: request.request_id, subtype: 'success', response: { contents, absPath: relative } } } });
+                    request_id: request.request_id, subtype: 'success', response: { contents, absPath: destination } } } });
                 body = {};
             } else {
                 const after = Number(url.searchParams.get('cursor') ?? 0);
@@ -103,6 +107,21 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
     assert.equal(nextLocal.tps, 5); assert.equal(nextLocal.totalTokens, 300);
     assert.ok(nextLocal.snapshotRevision > local.snapshotRevision);
     for (const field of fields) assert.equal(nextRemote[field], nextLocal[field], field);
+    if (moved) {
+        const migrated = path.join(workspace, 'next-directory');
+        await fs.mkdir(migrated);
+        for (const cwd of [migrated, workspace]) {
+            await fs.writeFile(registry, JSON.stringify({ ...registryRow, cwd }));
+            const relocatedLocal = await publisher.readLocal(LOCAL), relocatedRemote = await receiver.read();
+            assert.equal(relocatedLocal.status, 'ok');
+            assert.equal(relocatedLocal.totalTokens, 300);
+            for (const field of fields) assert.equal(relocatedRemote[field], relocatedLocal[field], field);
+            assert.equal(JSON.parse(await fs.readFile(destination, 'utf8')).stats.totalTokens, 300);
+            await assert.rejects(fs.stat(path.join(cwd, '.claude', 'session-stats')), { code: 'ENOENT' });
+        }
+    }
+    for (const directory of new Set([workspace, active]))
+        await assert.rejects(fs.stat(path.join(directory, '.claude', 'session-stats')), { code: 'ENOENT' });
     connected = false;
     const offline = await receiver.read();
     assert.equal(offline.status, 'unavailable'); assert.equal(offline.tps, null);
@@ -121,8 +140,10 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-main-workspace-')));
     const workspace = path.join(root, 'workspace'), active = path.join(workspace, 'child');
     const claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config');
+    const userHome = path.join(root, 'home');
+    const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG);
-    await fs.mkdir(active, { recursive: true }); await fs.mkdir(metadata, { recursive: true });
+    await fs.mkdir(active, { recursive: true }); await fs.mkdir(metadata, { recursive: true }); await fs.mkdir(userHome);
     await fs.mkdir(path.join(claudeHome, 'sessions'), { recursive: true });
     await fs.writeFile(path.join(metadata, LOCAL + '.json'), JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
         cwd: workspace, bridgeSessionIds: [BRIDGE] }));
@@ -136,7 +157,7 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
     let read;
     const controller = startMain({ manifest: { id: 'com.kpk.session-stats' },
         ipc: { handle(name, handler) { if (name === 'stats') read = handler; } }, log: { info() {} } }, {
-        claudeData, claudeHome, resolveWorkspace, store: { getStats: async () => sample, dispose() {} },
+        claudeData, claudeHome, userHome, resolveWorkspace, store: { getStats: async () => sample, dispose() {} },
         ipcMain: { handle() {}, removeHandler() {} } });
     t.after(async () => { await controller.stop(); await fs.rm(root, { recursive: true, force: true }); });
     let local;
@@ -147,10 +168,11 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
         await new Promise(resolve => setTimeout(resolve, 20));
     } while (Date.now() < deadline);
     assert.equal(local.status, 'ok'); assert.equal(local.tps, 3);
-    const published = JSON.parse(await fs.readFile(path.join(active, relative), 'utf8'));
+    const published = JSON.parse(await fs.readFile(destination, 'utf8'));
     assert.equal(published.revision, local.snapshotRevision);
     assert.equal(published.stats.tps, local.tps);
-    await assert.rejects(fs.stat(path.join(workspace, relative)), { code: 'ENOENT' });
+    for (const directory of [workspace, active])
+        await assert.rejects(fs.stat(path.join(directory, '.claude', 'session-stats')), { code: 'ENOENT' });
     await fs.writeFile(path.join(claudeHome, 'sessions', '101.json'), JSON.stringify({ pid: 101,
         sessionId: CLI, hostSessionId: 'local_conflict', bridgeSessionId: BRIDGE, cwd: active,
         startedAt: 1000, procStart: '123456', pidDomain: 'win32:fixture-host' }));
@@ -162,6 +184,8 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
 for (const returned of [true, false]) test(`bridge-less registry publishes proven relocated copies (returned=${returned})`, async t => {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-registry-copies-')));
     const workspace = path.join(root, 'workspace');
+    const userHome = path.join(root, 'home');
+    const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
     const worktree = path.join(workspace, '.claude', 'worktrees', 'presentation');
     const common = path.join(workspace, '.git');
     const claudeHome = path.join(root, 'config'), claudeData = path.join(root, 'desktop');
@@ -169,7 +193,7 @@ for (const returned of [true, false]) test(`bridge-less registry publishes prove
     const registry = path.join(claudeHome, 'sessions', '101.json');
     const first = path.join(claudeHome, 'projects', 'original', CLI + '.jsonl');
     const second = path.join(claudeHome, 'projects', 'worktree-copy', CLI + '.jsonl');
-    for (const directory of [worktree, common, ...[metadata, registry, first, second].map(path.dirname)])
+    for (const directory of [userHome, worktree, common, ...[metadata, registry, first, second].map(path.dirname)])
         await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(worktree, '.git'), 'gitdir: fixture-only');
     await fs.writeFile(metadata, JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
@@ -190,7 +214,7 @@ for (const returned of [true, false]) test(`bridge-less registry publishes prove
             callback(null, `${common}\n${top}\n`, '');
         } });
     const store = createSessionStore({ claudeHome });
-    const publisher = createSnapshotPublisher({ claudeData, store, resolveWorkspace, pollMs: 600000 });
+    const publisher = createSnapshotPublisher({ claudeData, userHome, store, resolveWorkspace, pollMs: 600000 });
     t.after(async () => { await publisher.stop(); store.dispose(); await fs.rm(root, { recursive: true, force: true }); });
     await publisher.start();
     const local = await publisher.readLocal(LOCAL);
@@ -198,8 +222,9 @@ for (const returned of [true, false]) test(`bridge-less registry publishes prove
     assert.equal(local.totalTokens, returned ? 300 : 140);
     assert.equal(local.steps, returned ? 2 : 1);
     assert.equal(local.tps, returned ? 5 : 4);
-    const active = returned ? workspace : worktree;
-    assert.equal(JSON.parse(await fs.readFile(path.join(active, relative), 'utf8')).stats.totalTokens, returned ? 300 : 140);
+    assert.equal(JSON.parse(await fs.readFile(destination, 'utf8')).stats.totalTokens, returned ? 300 : 140);
+    for (const directory of [workspace, worktree])
+        await assert.rejects(fs.stat(path.join(directory, '.claude', 'session-stats')), { code: 'ENOENT' });
     if (returned) {
         registered = false;
         assert.notEqual((await publisher.readLocal(LOCAL)).status, 'ok');

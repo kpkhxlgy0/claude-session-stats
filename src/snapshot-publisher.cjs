@@ -1,16 +1,18 @@
 'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { homedir } = require('node:os');
 const { randomUUID, createHash } = require('node:crypto');
 const { createSnapshotProtocol } = require('./snapshot.cjs');
 const { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation,
-    snapshotBindingIdentity } = require('./snapshot-bindings.cjs');
+    resolveSnapshotAssistantTip, snapshotBindingIdentity } = require('./snapshot-bindings.cjs');
 const { isLocalId } = require('./session-map.cjs');
 const MaxAgentsPerParent = 128;
 const MaxChildBindings = 4096;
 const MaxConcurrentFamilies = 2;
 const MaxAgentBatch = 8;
 const MaxConcurrentPublications = 4;
+const storageFailures = new Set(['EIO', 'ENODEV', 'ENXIO', 'ENOSPC', 'EROFS', 'EDQUOT', 'UNKNOWN']);
 
 function fileIdentity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
 function fileVersion(info) { return `${fileIdentity(info)}:${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.nlink}`; }
@@ -46,41 +48,16 @@ function containsPath(root, candidate) {
     return relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-async function resolveProtectedRoots(installationRoot, watchedTweaksRoot) {
-    try {
-        const roots = new Set([await fs.realpath(installationRoot)]);
-        if (!watchedTweaksRoot) return [...roots];
-        roots.add(path.resolve(watchedTweaksRoot));
-        let watched;
-        try { watched = await fs.realpath(watchedTweaksRoot); }
-        catch (error) { if (error.code === 'ENOENT') return [...roots]; throw error; }
-        if (!(await fs.stat(watched)).isDirectory()) return null;
-        roots.add(watched);
-        let entries = 0;
-        const directory = await fs.opendir(watched);
-        for await (const child of directory) {
-            if (++entries > 4096) return null;
-            if (!child.isDirectory() && !child.isSymbolicLink()) continue;
-            const installed = path.join(watched, child.name);
-            try {
-                const target = await fs.realpath(installed);
-                if ((await fs.stat(target)).isDirectory()) roots.add(target);
-            } catch (error) { if (error.code !== 'ENOENT') throw error; }
-        }
-        return [...roots];
-    } catch { return null; }
-}
-
 function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Date.now, pollMs = 2000,
-    heartbeatMs = 10000, publisherId = randomUUID(), installationRoot = path.resolve(__dirname, '..'),
-    watchedTweaksRoot = process.env.CLAUDE_PLUSPLUS_USER_ROOT
-        ? path.join(process.env.CLAUDE_PLUSPLUS_USER_ROOT, 'tweaks') : null } = {}) {
+    heartbeatMs = 10000, publisherId = randomUUID(), userHome = homedir() } = {}) {
+    if (typeof userHome !== 'string' || !path.isAbsolute(userHome)) throw new Error('Invalid snapshot user home');
+    const home = path.resolve(userHome), storageRoot = path.join(home, '.claude-plusplus');
+    const snapshotDirectory = path.join(storageRoot, 'session-stats');
     const protocol = createSnapshotProtocol();
     const states = new Map();
     let unavailableWorkspaces = new Set();
     const ownFiles = new Map();
     const ownTemps = new Set();
-    const protectedRoots = resolveProtectedRoots(installationRoot, watchedTweaksRoot);
     let publicationRevision = 0;
     let requestedLocalId;
     let requestedParent;
@@ -88,6 +65,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     let timer, stopPending, stopped = false, started = false, completedPoll = false, epoch = 0;
     let discoveryRevision = 0, appliedDiscovery = 0, appliedProof = 0;
     let knownParents = new Map();
+    let knownWorkspaceRoots = new Set();
     let globalChecks;
     const lanes = new Map(), sourcesInFlight = new Map(), targetWrites = new Map(), parentChecks = new Map();
     const invalidParents = new Map();
@@ -98,8 +76,12 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
 
     function alive(runEpoch) { return !stopped && epoch === runEpoch; }
 
+    function snapshotDestination(binding) {
+        return path.join(snapshotDirectory, protocol.snapshotFilename(binding.bridgeSessionId, binding.agentId));
+    }
+
     function writeTarget(binding, action) {
-        const destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
+        const destination = snapshotDestination(binding);
         const key = process.platform === 'win32' ? destination.toLowerCase() : destination;
         const previous = targetWrites.get(key) || Promise.resolve();
         const next = previous.catch(() => {}).then(action);
@@ -146,7 +128,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     }
 
     async function directoryInfo(directory) {
-        const info = await fs.lstat(directory);
+        const info = await fs.lstat(directory, { bigint: true });
         if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Unsafe snapshot directory');
         return fileIdentity(info);
     }
@@ -154,17 +136,16 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     async function directories(binding, create) {
         const result = [];
         const root = binding.workspaceRoot;
-        if (create) {
-            const excluded = await protectedRoots;
-            const managed = path.join(root, '.claude', 'session-stats');
-            if (!excluded || excluded.some(directory => containsPath(directory, root)
-                || containsPath(directory, managed) || containsPath(managed, directory)))
-                throw new Error('Snapshot workspace overlaps a watched installation');
-        }
+        if ([root, ...knownWorkspaceRoots].some(workspace => containsPath(workspace, home)
+            || containsPath(workspace, snapshotDirectory) || containsPath(snapshotDirectory, workspace)))
+            throw new Error('Snapshot user storage overlaps the workspace');
         if (await fs.realpath(root) !== root) throw new Error('Workspace root changed');
         result.push([root, await directoryInfo(root)]);
-        for (const directory of [path.join(root, '.claude'), path.join(root, '.claude', 'session-stats')]) {
+        if (path.relative(home, await fs.realpath(home)) !== '') throw new Error('Snapshot user home changed');
+        result.push([home, await directoryInfo(home)]);
+        for (const directory of [storageRoot, snapshotDirectory]) {
             if (create) {
+                await confirmDirectories(result);
                 try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
             }
             result.push([directory, await directoryInfo(directory)]);
@@ -269,39 +250,26 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         }
     }
 
-    async function ensureIgnore(directory) {
-        const file = path.join(directory, '.gitignore');
-        let handle;
-        try {
-            handle = await fs.open(file, 'wx', 0o600);
-            await handle.writeFile('*\n', 'utf8');
-        } catch (error) {
-            if (error.code !== 'EEXIST') throw error;
-            const info = await fs.lstat(file);
-            if (!info.isFile() || info.isSymbolicLink()) throw new Error('Unsafe snapshot ignore file');
-        } finally { await handle?.close(); }
-    }
-
     async function removeOwn(file, binding) {
+        const owned = ownFiles.get(file);
+        if (!owned || bindingKey(owned.binding) !== bindingKey(binding) || file !== snapshotDestination(binding)) return;
         try {
             const expected = await directories(binding, false);
             const existing = await readDestination(file, binding);
-            if (existing?.snapshot.publisherId !== publisherId.toLowerCase()) return;
+            if (JSON.stringify(existing?.snapshot) !== JSON.stringify(owned.snapshot)) return;
             await confirmDirectories(expected);
             const current = await fs.lstat(file);
-            if (fileVersion(current) === existing.version && !current.isSymbolicLink()) await fs.unlink(file);
+            if (ownFiles.get(file) === owned && fileVersion(current) === existing.version && !current.isSymbolicLink()) {
+                await fs.unlink(file);
+                if (ownFiles.get(file) === owned) ownFiles.delete(file);
+            }
         } catch { /* Never remove unknown or unsafe state. */ }
     }
 
     async function current(binding, runEpoch) {
         const parent = parentBinding(binding), key = bindingKey(parent);
         if (!alive(runEpoch)) return false;
-        const forget = () => {
-            if (!binding.workspaceEvidence) return;
-            for (const [destination, owned] of ownFiles)
-                if (bindingKey(parentBinding(owned)) === key) ownFiles.delete(destination);
-        };
-        if (!knownParents.has(key) || invalidParents.has(key)) { forget(); return false; }
+        if (!knownParents.has(key) || invalidParents.has(key)) return false;
         let checks = parentChecks.get(key);
         if (!checks) {
             checks = { parent, waiting: [] };
@@ -323,15 +291,13 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         }
         const matches = await new Promise(resolve => { checks.waiting.push(resolve); });
         const valid = knownParents.has(key) && !invalidParents.has(key) && matches;
-        if (alive(runEpoch) && !valid) forget();
         return alive(runEpoch) && valid;
     }
 
     async function publish(binding, snapshot, runEpoch) {
         let expected = await directories(binding, true);
         const directory = expected.at(-1)[0];
-        const destination = path.join(binding.workspaceRoot, protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
-        await ensureIgnore(directory);
+        const destination = snapshotDestination(binding);
         const before = await readDestination(destination, binding, snapshot.stats.status === 'ok');
         const temporary = path.join(directory, `.${binding.bridgeSessionId}.${publisherId}.${randomUUID()}.tmp`);
         let handle;
@@ -373,7 +339,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 }
             }
             ownTemps.delete(temporary);
-            ownFiles.set(destination, binding);
+            ownFiles.set(destination, { binding, snapshot });
             if (stopped || epoch !== runEpoch || !await current(binding, runEpoch)) {
                 await removeOwn(destination, binding);
                 throw new Error('Snapshot identity changed');
@@ -406,19 +372,9 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 if (markUnavailable) unavailableWorkspaces.add(state.binding.localSessionId);
                 states.delete(key);
                 if (state.destination) {
-                    const replacement = bindings.find(candidate => candidate.accountId === state.binding.accountId
-                        && candidate.organizationId === state.binding.organizationId
-                        && candidate.localSessionId === state.binding.localSessionId
-                        && candidate.cliSessionId === state.binding.cliSessionId
-                        && candidate.bridgeSessionId === state.binding.bridgeSessionId
-                        && candidate.agentId === state.binding.agentId);
-                    if (state.binding.workspaceEvidence || replacement?.workspaceEvidence) {
-                        // Forget moved/unverifiable destinations; never use their payload as migration input.
-                        ownFiles.delete(state.destination);
-                    } else {
-                        await removeOwn(state.destination, state.binding);
-                        ownFiles.delete(state.destination);
-                    }
+                    // User storage survives workspace moves. Remove only the
+                    // exact sample owned by this binding, never its successor.
+                    await removeOwn(state.destination, state.binding);
                 }
             }));
             }
@@ -434,13 +390,17 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     }
 
     function sourceContext(binding, runEpoch) {
-        return binding.workspaceEvidence ? {
+        return {
             workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch),
             resolveRelocation: async cwd => {
                 if (stopped || runEpoch !== epoch) return null;
                 const proof = await resolveSnapshotRelocation(parentBinding(binding), cwd, { resolveWorkspace });
                 return !stopped && runEpoch === epoch ? proof : null;
-            } } : undefined;
+            }, resolveAssistantTip: async () => {
+                if (stopped || runEpoch !== epoch) return null;
+                const tip = await resolveSnapshotAssistantTip(parentBinding(binding), { resolveWorkspace });
+                return !stopped && runEpoch === epoch ? tip : null;
+            } };
     }
 
     function scanParents(targets) {
@@ -454,14 +414,18 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     const full = cohort.some(caller => caller.targets === undefined);
                     const selected = new Map(cohort.flatMap(caller => caller.targets || [])
                         .map(binding => [snapshotBindingIdentity(binding), binding]));
-                    let parents = [], identities = new Set();
+                    let parents = [], identities = new Set(), workspaceRoots = new Set();
                     try {
                         if (!stopped) parents = await discoverSnapshotBindings(claudeData, { resolveWorkspace,
                             onUnavailableWorkspace: id => blocked.add(id),
-                            onIdentityScan: bindings => { identities = new Set(bindings.map(snapshotBindingIdentity)); },
+                            onIdentityScan: bindings => {
+                                identities = new Set(bindings.map(snapshotBindingIdentity));
+                                workspaceRoots = new Set(bindings.map(binding => binding.workspaceRoot));
+                            },
                             ...(full ? {} : { onlyBindings: [...selected.values()] }) });
                     } catch { /* Failed scans must not reuse a preceding identity view. */ }
-                    for (const caller of cohort) caller.resolve({ parents, blocked, identities });
+                    for (const parent of parents) workspaceRoots.add(parent.workspaceRoot);
+                    for (const caller of cohort) caller.resolve({ parents, blocked, identities, workspaceRoots });
                 }
                 if (globalChecks === checks) globalChecks = null;
             });
@@ -471,12 +435,13 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
 
     async function discoverParents(runEpoch, confirmation = false) {
         const revision = ++discoveryRevision;
-        const { parents, blocked } = await scanParents();
+        const { parents, blocked, workspaceRoots } = await scanParents();
         if (!alive(runEpoch)) return [];
         if (revision > appliedDiscovery) {
             appliedDiscovery = revision;
             appliedProof = Math.max(appliedProof, revision);
             knownParents = new Map(parents.map(binding => [bindingKey(binding), binding]));
+            knownWorkspaceRoots = workspaceRoots;
             for (const [key, failed] of invalidParents) if (failed.revision <= revision) invalidParents.delete(key);
             unavailableWorkspaces = new Set(blocked);
             for (const failed of invalidParents.values()) unavailableWorkspaces.add(failed.localSessionId);
@@ -493,7 +458,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             return [snapshotBindingIdentity(parent), parent];
         })).values()];
         const revision = ++discoveryRevision;
-        const { parents, identities } = await scanParents(targets);
+        const { parents, identities, workspaceRoots } = await scanParents(targets);
         if (!alive(runEpoch)) return { parents: [], revision, stale: true };
         const scope = new Set(targets.map(snapshotBindingIdentity));
         const confirmed = parents.filter(parent => scope.has(snapshotBindingIdentity(parent)));
@@ -504,6 +469,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             const key = bindingKey(parent);
             return knownParents.has(key) && !invalidParents.has(key);
         }), revision, stale: false };
+        for (const workspace of workspaceRoots) knownWorkspaceRoots.add(workspace);
         const keys = new Set(confirmed.map(bindingKey));
         const contradicted = [];
         appliedProof = Math.max(appliedProof, revision);
@@ -607,13 +573,18 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     publicationRevision = snapshot.revision;
                     state.publication = { snapshot, finished: new Promise(resolve => { finishPublication = resolve; }) };
                     state.snapshot = await publish(binding, snapshot, runEpoch);
+                    state.localSample = null;
                     state.generation = (state.generation || 0) + 1;
-                    state.destination = path.join(binding.workspaceRoot,
-                        protocol.snapshotPath(binding.bridgeSessionId, binding.agentId));
+                    state.destination = snapshotDestination(binding);
                     published.push(binding);
                 } catch (error) {
+                    const candidate = state.publication?.snapshot;
+                    const raw = samples.get(sourceKey(binding));
+                    const deviceFailed = candidate && storageFailures.has(error.code);
+                    state.localSample = deviceFailed && candidate.stats.status === 'ok'
+                        && raw?.threadId === binding.cliSessionId && raw.agentId === binding.agentId ? candidate : null;
                     state.snapshot = null;
-                    if (state.destination && !error.preserveDestination) await removeOwn(state.destination, binding);
+                    if (state.destination && !deviceFailed && !error.preserveDestination) await removeOwn(state.destination, binding);
                 } finally {
                     if (finishPublication) { state.publication = null; finishPublication(); }
                 }
@@ -653,8 +624,10 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                 const samples = new Map(), times = new Map();
                 await sampleBindings(free, samples, times, runEpoch);
                 if (!alive(runEpoch)) return;
-                if (free.every(binding => !protocol.projectStats(samples.get(sourceKey(binding)))
-                    && !states.get(bindingKey(binding))?.destination)) return;
+                if (free.every(binding => {
+                    const state = states.get(bindingKey(binding));
+                    return !state?.destination && !state?.localSample && !protocol.projectStats(samples.get(sourceKey(binding)));
+                })) return;
                 const confirmation = await confirmParents(free, runEpoch);
                 const confirmedParents = confirmation.parents;
                 if (!alive(runEpoch)) return;
@@ -791,7 +764,17 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             || [...knownParents.values()].some(binding => binding.localSessionId === localSessionId.toLowerCase())
             || agentId !== undefined && local.length ? unavailable(localSessionId, agentId) : null;
         const state = bound.find(candidate => candidate.snapshot);
-        if (!state) return unavailable(localSessionId, agentId);
+        if (!state) {
+            const pending = bound.find(candidate => candidate.localSample);
+            const sample = pending?.localSample;
+            if (!sample || !await stillOwned(pending.binding, epoch)
+                || states.get(bindingKey(pending.binding)) !== pending || pending.localSample !== sample)
+                return unavailable(localSessionId, agentId);
+            const age = now() - sample.generatedAt;
+            if (age < -protocol.futureSkewMs || age > protocol.maxAgeMs) return unavailable(localSessionId, agentId);
+            return { ...sample.stats, threadId: localSessionId, snapshotSync: 'local-only',
+                ...(agentId !== undefined ? { agentId } : {}) };
+        }
         const runEpoch = epoch, key = bindingKey(state.binding);
         const active = () => !stopped && epoch === runEpoch && states.get(key) === state && state.snapshot;
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -843,7 +826,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         cancelWaits();
         stopPending = (async () => {
             await Promise.allSettled([...targetWrites.values()]);
-            for (const [file, binding] of ownFiles) await removeOwn(file, binding);
+            for (const [file, owned] of ownFiles) await removeOwn(file, owned.binding);
             states.clear(); ownFiles.clear();
         })();
         return stopPending;

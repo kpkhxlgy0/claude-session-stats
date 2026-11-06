@@ -5,6 +5,7 @@ const path = require('node:path');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ChunkBytes = 64 * 1024;
 const MaxLineBytes = 8 * 1024 * 1024;
+const MaxTipUuids = 65536;
 function identity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
 function version(info) { return `${identity(info)}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`; }
 function samePath(left, right) {
@@ -37,6 +38,8 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                 return false;
             if (proof.relocation && (typeof context.resolveRelocation !== 'function'
                 || await context.resolveRelocation(proof.relocation.cwd) !== proof.relocation.evidence)) return false;
+            if (proof.assistantTip && (typeof context.resolveAssistantTip !== 'function'
+                || await context.resolveAssistantTip() !== proof.assistantTip)) return false;
             for (const [file, stamp] of proof.versions)
                 if (version(await safeFile(file)) !== stamp) return false;
             return await safeDirectory(context.workspaceRoot) === proof.workspaceIdentity;
@@ -81,7 +84,10 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     if (!expected.equals(actual)) throw new Error('Divergent session sources');
                 }
             }
-            let matched = false, pending = Buffer.alloc(0), relocation;
+            let matched = false, pending = Buffer.alloc(0), relocation, assistantTip, lastAssistantUuid;
+            const tipUuids = new Map();
+            const trackAssistantTip = typeof context.resolveAssistantTip === 'function';
+            let tipOverflow = false;
             const checkedRelocations = new Set();
             const buffer = Buffer.alloc(ChunkBytes);
             for (let offset = 0; offset < longest.size && !matched; offset += ChunkBytes) {
@@ -95,6 +101,18 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     const line = pending.length ? Buffer.concat([pending, part]) : part;
                     pending = Buffer.alloc(0);
                     const row = JSON.parse(line.toString('utf8'));
+                    if (trackAssistantTip && !tipOverflow) {
+                        if (typeof row?.uuid === 'string' && UUID.test(row.uuid) && !tipUuids.has(row.uuid)) {
+                            if (tipUuids.size >= MaxTipUuids) {
+                                tipOverflow = true;
+                                tipUuids.clear();
+                            } else tipUuids.set(row.uuid, offset + newline + 1);
+                        }
+                        if (row?.type === 'assistant' && row.sessionId === sessionId && !row.isSidechain
+                            && !row.isMeta && !row.isSynthetic && !row.isCompactSummary && !row.isApiErrorMessage
+                            && row.message?.role === 'assistant' && row.message.model !== '<synthetic>')
+                            lastAssistantUuid = typeof row.uuid === 'string' && UUID.test(row.uuid) ? row.uuid : null;
+                    }
                     if (row?.type === 'relocated' && row.sessionId === sessionId
                         && typeof row.relocatedCwd === 'string' && path.isAbsolute(row.relocatedCwd)) {
                         const cwd = path.resolve(row.relocatedCwd);
@@ -114,8 +132,13 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     start = newline + 1;
                 }
             }
-            if (!matched) return null;
-            const proof = { path: longest.file, workspaceIdentity, relocation,
+            if (!matched) {
+                if (pending.length || tipOverflow || !lastAssistantUuid || !trackAssistantTip) return null;
+                assistantTip = await context.resolveAssistantTip();
+                if (assistantTip !== lastAssistantUuid || sources.some(source => source.size < longest.size
+                    && tipUuids.get(assistantTip) <= source.size)) return null;
+            }
+            const proof = { path: longest.file, workspaceIdentity, relocation, assistantTip,
                 versions: new Map(sources.map(source => [source.file, source.stamp])) };
             for (const source of sources)
                 if (version(await source.handle.stat()) !== source.stamp) return null;
@@ -142,7 +165,8 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
             cache.set(key, proof);
             while (cache.size > maxCacheEntries) cache.delete(cache.keys().next().value);
             // Only scalar file versions and the selected path survive a comparison.
-            return { path: proof.path, verify: () => confirm(proof, context) };
+            return { path: proof.path, ...(proof.assistantTip ? { assistantTip: proof.assistantTip } : {}),
+                verify: () => confirm(proof, context) };
         } catch { cache.delete(key); return null; }
     };
 }
