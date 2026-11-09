@@ -20,13 +20,25 @@ function startMain(api, options = {}) {
     const resolveWorkspace = options.resolveWorkspace ?? createCliWorkspaceResolver({ claudeHome,
         processCacheMs: 2000, gitCacheMs: 2000 });
     const publisher = options.publisher ?? require('./snapshot-publisher.cjs').createSnapshotPublisher({
-        claudeData, store, resolveWorkspace, userHome: options.userHome });
+        claudeData, store, resolveWorkspace, claudeHome });
     const protocol = createSnapshotProtocol();
     let stopped = false;
     let stopping;
+    let registration;
     try {
         Promise.resolve(publisher.start()).catch(() => api.log.info('Session Stats snapshot publisher could not start'));
     } catch { api.log.info('Session Stats snapshot publisher could not start'); }
+    try {
+        registration = api.sessionStats?.registerProvider(async context => {
+            if (stopped || context.signal.aborted) return null;
+            try {
+                const snapshot = await publisher.readRemoteSnapshot(context.bridgeSessionId, {
+                    organizationId: context.organizationId, agentId: context.agentId, signal: context.signal });
+                return stopped || context.signal.aborted ? null : snapshot;
+            } catch { return null; }
+        });
+        if (!registration) api.log.info('Session Stats Remote Control requires the core session-stats capability');
+    } catch { api.log.info('Session Stats Remote Control provider could not register'); }
     api.ipc.handle('stats', async sessionId => {
         const unavailable = { threadId: isLocalId(sessionId) ? sessionId : null, status: 'unavailable', tps: null };
         if (stopped || !isLocalId(sessionId)) return unavailable;
@@ -93,6 +105,7 @@ function startMain(api, options = {}) {
     return { stop() {
         if (stopped) return stopping;
         stopped = true;
+        try { registration?.unregister(); } catch {}
         try { stopping = Promise.resolve(publisher.stop()).catch(() => {}); }
         catch { stopping = Promise.resolve(); }
         store.dispose(); remote.stop(); binding.stop(); remoteAgents.stop();

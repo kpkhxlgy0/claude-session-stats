@@ -1,15 +1,24 @@
 {
   "id": "com.kpk.session-stats",
   "name": "Session Stats",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Session and selected-subagent statistics with estimated TPS, token usage and cache hit, synchronized through Remote Control snapshots.",
   "author": "KPK",
   "githubRepo": "kpkhxlgy0/claude-session-stats",
   "homepage": "https://github.com/kpkhxlgy0/claude-session-stats",
   "iconUrl": "./icon.svg",
-  "tags": ["session", "tokens", "statistics"],
-  "minRuntime": "0.3.6",
+  "tags": [
+    "session",
+    "tokens",
+    "statistics"
+  ],
+  "minRuntime": "0.3.9",
   "scope": "both",
   "main": "index.js",
-  "permissions": ["ipc", "filesystem", "network"]
+  "permissions": [
+    "ipc",
+    "filesystem",
+    "network",
+    "session-stats"
+  ]
 }

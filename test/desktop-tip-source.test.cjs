@@ -151,8 +151,8 @@ test('the targeted assistant tip helper reads only its exact record and never en
 test('publisher global confirmation rejects a tip sample when another account claims the binding after sampling', async t => {
     const { createSnapshotPublisher } = require('../src/snapshot-publisher.cjs');
     const f = await fixture(t);
-    const userHome = path.join(f.root, 'home');
-    await fs.mkdir(userHome);
+    const claudeHome = path.join(f.root, 'home');
+    await fs.mkdir(claudeHome);
     let changed = false;
     const store = { getStats: async (...args) => {
         const stats = await f.store.getStats(...args);
@@ -165,12 +165,12 @@ test('publisher global confirmation rejects a tip sample when another account cl
         }
         return stats;
     } };
-    const publisher = createSnapshotPublisher({ claudeData: f.claudeData, userHome, store, pollMs: 600000 });
+    const publisher = createSnapshotPublisher({ claudeData: f.claudeData, claudeHome, store, pollMs: 600000 });
     t.after(() => publisher.stop());
     await publisher.start();
     assert.equal(changed, true);
     assert.notEqual((await publisher.readLocal(LOCAL))?.status, 'ok');
-    await assert.rejects(fs.stat(path.join(userHome, '.claude-plusplus', 'session-stats', `${BRIDGE}.json`)), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(path.join(claudeHome, '.session-stats', `${BRIDGE}.json`)), { code: 'ENOENT' });
 });
 
 test('parent and child reads retain independent tip proofs through the final caller callback', async t => {

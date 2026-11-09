@@ -285,9 +285,9 @@ test('local snapshot reads use six Git calls and a fresh proof after snapshot I/
     await fs.mkdir(path.dirname(metadata), { recursive: true });
     await fs.writeFile(metadata, JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
         cwd: f.desktop, bridgeSessionIds: [BRIDGE] }));
-    const userHome = path.join(f.root, 'publisher-home');
-    await fs.mkdir(userHome);
-    const publisher = createSnapshotPublisher({ claudeData, userHome, resolveWorkspace: f.resolver, pollMs: 600000,
+    const claudeHome = path.join(f.root, 'publisher-home');
+    await fs.mkdir(claudeHome);
+    const publisher = createSnapshotPublisher({ claudeData, claudeHome, resolveWorkspace: f.resolver, pollMs: 600000,
         store: { getStats: async () => ({ status: 'ok', usageComplete: true, turns: 1, steps: 1,
             totalTokens: 10, inputTokens: 4, outputTokens: 6, cachedInputTokens: 0, cacheHit: 0, tps: 3 }) } });
     t.after(() => publisher.stop());
@@ -303,7 +303,7 @@ test('local snapshot reads use six Git calls and a fresh proof after snapshot I/
     assert.equal(f.getProcessQueries() - beforeQueries, 2);
 
     const originalOpen = fs.open;
-    const snapshot = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
+    const snapshot = path.join(claudeHome, '.session-stats', BRIDGE + '.json');
     let changed = false;
     t.mock.method(fs, 'open', async (file, ...args) => {
         const handle = await originalOpen(file, ...args);

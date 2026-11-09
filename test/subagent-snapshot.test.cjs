@@ -9,15 +9,14 @@ const producer = { publisherId: '22222222-2222-4222-8222-222222222222', revision
 const stats = { status: 'ok', turns: 2, steps: 3, totalTokens: 50, inputTokens: 40,
     outputTokens: 10, cachedInputTokens: 20, cacheHit: .5, tps: null, usageComplete: true };
 
-test('agent paths require an exact bounded ASCII identity and leave parent paths unchanged', () => {
-    assert.equal(protocol.snapshotPath('cse_Parent'), '~/.claude-plusplus/session-stats/session_Parent.json');
-    assert.equal(protocol.snapshotPath('cse_Parent', 'agent_A-1'),
-        '~/.claude-plusplus/session-stats/session_Parent.agent-agent_A-1.json');
+test('agent filenames require an exact bounded ASCII identity and leave parent filenames unchanged', () => {
+    assert.equal(protocol.snapshotFilename('cse_Parent'), 'session_Parent.json');
+    assert.equal(protocol.snapshotFilename('cse_Parent', 'agent_A-1'), 'session_Parent.agent-agent_A-1.json');
     assert.equal(protocol.normalizeAgentId('A_-0'), 'A_-0');
     assert.equal(protocol.normalizeAgentId('x'.repeat(64)), 'x'.repeat(64));
     for (const invalid of ['', null, 1, '../a', 'a/b', 'a\\b', 'a.b', 'a\n', 'a\r\n', '中文', 'x'.repeat(65)]) {
         assert.equal(protocol.normalizeAgentId(invalid), null);
-        assert.equal(protocol.snapshotPath('session_Parent', invalid), null);
+        assert.equal(protocol.snapshotFilename('session_Parent', invalid), null);
         assert.equal(protocol.makeSnapshot({ ...binding, agentId: invalid }, stats, producer), null);
     }
 });

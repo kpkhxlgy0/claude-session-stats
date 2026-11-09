@@ -17,7 +17,6 @@ const CLI = '22222222-2222-4222-8222-222222222222';
 const ORG = '33333333-3333-4333-8333-333333333333';
 const ACCOUNT = '44444444-4444-4444-8444-444444444444';
 const BRIDGE = 'session_Integration123';
-const remotePath = '~/.claude-plusplus/session-stats/session_Integration123.json';
 function turn(id, seconds, output) {
     const timestamp = n => new Date(Date.UTC(2026, 9, 24, 0, 0, n)).toISOString();
     return [{ type: 'user', sessionId: CLI, uuid: 'user-' + id, parentUuid: null, timestamp: timestamp(seconds),
@@ -30,12 +29,11 @@ function turn(id, seconds, output) {
 for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapshot and RC receiver share successive samples (CLI moved=${moved})`, async t => {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-integration-')));
     const workspace = path.join(root, 'workspace'), claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config');
-    const userHome = path.join(root, 'home');
-    const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
+    const destination = path.join(claudeHome, '.session-stats', BRIDGE + '.json');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG);
     const logs = path.join(claudeHome, 'projects', 'fixture');
     await Promise.all([fs.mkdir(workspace, { recursive: true }), fs.mkdir(metadata, { recursive: true }),
-        fs.mkdir(logs, { recursive: true }), fs.mkdir(userHome)]);
+        fs.mkdir(logs, { recursive: true })]);
     await fs.writeFile(path.join(metadata, LOCAL + '.json'), JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
         cwd: workspace, originCwd: workspace, bridgeSessionIds: [BRIDGE], isArchived: false }));
     const active = moved ? path.join(workspace, 'current-directory') : workspace;
@@ -50,6 +48,13 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
     const log = path.join(logs, CLI + '.jsonl');
     const marker = moved === 'duplicate' ? JSON.stringify({ type: 'relocated', sessionId: CLI, relocatedCwd: active }) + '\n' : '';
     await fs.writeFile(log, marker + turn('m1', 0, 40));
+    const agentId = 'child_A', childDirectory = path.join(logs, CLI, 'subagents');
+    const childRow = JSON.stringify({ type: 'assistant', sessionId: CLI, uuid: 'child-assistant',
+        agentId, isSidechain: true, message: { role: 'assistant', id: 'child-message', usage: {
+            input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } } }) + '\n';
+    const childFile = path.join(childDirectory, `agent-${agentId}.jsonl`);
+    await fs.mkdir(childDirectory, { recursive: true });
+    await fs.writeFile(childFile, childRow);
     let duplicate;
     if (moved === 'duplicate') {
         const directory = path.join(claudeHome, 'projects', 'earlier-copy');
@@ -61,7 +66,7 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
     const events = [], store = createSessionStore({ claudeHome });
     const resolveWorkspace = createCliWorkspaceResolver({ claudeHome, platform: 'win32', hostname: 'fixture-host',
         getProcessIdentities: async () => new Map([[101, { alive: true, procStart: '123456' }]]) });
-    const publisher = createSnapshotPublisher({ claudeData, userHome, store, resolveWorkspace, now: () => time, pollMs: 600000 });
+    const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, resolveWorkspace, now: () => time, pollMs: 600000 });
     const dom = new JSDOM('<div class="ProseMirror" contenteditable="true"></div>', { url: 'https://claude.ai/code/' + BRIDGE });
     const editor = dom.window.document.querySelector('.ProseMirror');
     editor.getClientRects = () => [{ width: 100 }];
@@ -78,11 +83,15 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
             if (init.method === 'POST') {
                 const request = JSON.parse(init.body).events[0].payload;
                 assert.equal(request.type, 'control_request');
-                assert.deepEqual(request.request, { subtype: 'read_file', path: remotePath, max_bytes: 16384,
-                    encoding: 'utf-8' });
-                const contents = await fs.readFile(destination, 'utf8');
+                const child = request.request.agentId;
+                assert.ok(child === undefined || child === agentId);
+                assert.deepEqual(request.request, { subtype: 'claudepp_session_stats', protocolVersion: 1,
+                    organizationId: ORG, ...(child ? { agentId: child } : {}) });
+                const snapshot = await publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, agentId: child });
+                const file = child ? path.join(claudeHome, '.session-stats', `${BRIDGE}.agent-${child}.json`) : destination;
+                assert.deepEqual(snapshot, JSON.parse(await fs.readFile(file, 'utf8')));
                 events.push({ sequence_num: ++sequence, payload: { type: 'control_response', response: {
-                    request_id: request.request_id, subtype: 'success', response: { contents, absPath: destination } } } });
+                    request_id: request.request_id, subtype: 'success', response: { protocolVersion: 1, snapshot } } } });
                 body = {};
             } else {
                 const after = Number(url.searchParams.get('cursor') ?? 0);
@@ -93,7 +102,11 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
     };
     const receiver = createRemoteReader(dom.window, createSnapshotProtocol,
         { now: () => time, pollMs: 0, errorBackoffMs: 0, responsePollMs: 0 });
-    t.after(async () => { receiver.stop(); dom.window.close(); await publisher.stop(); store.dispose(); await fs.rm(root, { recursive: true }); });
+    const childReceiver = createRemoteReader(dom.window, createSnapshotProtocol, { now: () => time,
+        pollMs: 0, errorBackoffMs: 0, responsePollMs: 0,
+        resolveAgent: () => ({ sessionId: BRIDGE, agentId, remote: true }) });
+    t.after(async () => { receiver.stop(); childReceiver.stop(); dom.window.close();
+        await publisher.stop(); store.dispose(); await fs.rm(root, { recursive: true }); });
     await publisher.start();
     const fields = ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheHit', 'tps',
         'usageComplete', 'snapshotGeneratedAt', 'snapshotRevision', 'snapshotPublisherId'];
@@ -101,6 +114,17 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, atomic snapsh
     assert.equal(local.tps, 4); assert.equal(local.totalTokens, 140);
     for (const field of fields) assert.equal(remote[field], local[field], field);
     assert.equal(remote.status, 'ok');
+    for (const duplicateChild of [false, true]) {
+        if (duplicateChild) await fs.appendFile(childFile, childRow);
+        const childLocal = await publisher.readLocal(LOCAL, { agentId }), childRemote = await childReceiver.read();
+        assert.equal(childRemote.status, 'ok');
+        assert.equal(childRemote.agentId, agentId);
+        assert.equal(childRemote.totalTokens, 10);
+        assert.equal(childRemote.outputTokens, 0);
+        assert.equal(childRemote.steps, 1);
+        assert.equal(childRemote.tps, null);
+        for (const field of fields) assert.equal(childRemote[field], childLocal[field], field);
+    }
     time += 1000;
     await fs.appendFile(log, turn('m2', 20, 60));
     const nextLocal = await publisher.readLocal(LOCAL), nextRemote = await receiver.read();
@@ -140,10 +164,9 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-main-workspace-')));
     const workspace = path.join(root, 'workspace'), active = path.join(workspace, 'child');
     const claudeData = path.join(root, 'desktop'), claudeHome = path.join(root, 'config');
-    const userHome = path.join(root, 'home');
-    const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
+    const destination = path.join(claudeHome, '.session-stats', BRIDGE + '.json');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG);
-    await fs.mkdir(active, { recursive: true }); await fs.mkdir(metadata, { recursive: true }); await fs.mkdir(userHome);
+    await fs.mkdir(active, { recursive: true }); await fs.mkdir(metadata, { recursive: true });
     await fs.mkdir(path.join(claudeHome, 'sessions'), { recursive: true });
     await fs.writeFile(path.join(metadata, LOCAL + '.json'), JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
         cwd: workspace, bridgeSessionIds: [BRIDGE] }));
@@ -157,7 +180,7 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
     let read;
     const controller = startMain({ manifest: { id: 'com.kpk.session-stats' },
         ipc: { handle(name, handler) { if (name === 'stats') read = handler; } }, log: { info() {} } }, {
-        claudeData, claudeHome, userHome, resolveWorkspace, store: { getStats: async () => sample, dispose() {} },
+        claudeData, claudeHome, resolveWorkspace, store: { getStats: async () => sample, dispose() {} },
         ipcMain: { handle() {}, removeHandler() {} } });
     t.after(async () => { await controller.stop(); await fs.rm(root, { recursive: true, force: true }); });
     let local;
@@ -184,16 +207,15 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
 for (const returned of [true, false]) test(`bridge-less registry publishes proven relocated copies (returned=${returned})`, async t => {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-registry-copies-')));
     const workspace = path.join(root, 'workspace');
-    const userHome = path.join(root, 'home');
-    const destination = path.join(userHome, '.claude-plusplus', 'session-stats', BRIDGE + '.json');
     const worktree = path.join(workspace, '.claude', 'worktrees', 'presentation');
     const common = path.join(workspace, '.git');
     const claudeHome = path.join(root, 'config'), claudeData = path.join(root, 'desktop');
+    const destination = path.join(claudeHome, '.session-stats', BRIDGE + '.json');
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, LOCAL + '.json');
     const registry = path.join(claudeHome, 'sessions', '101.json');
     const first = path.join(claudeHome, 'projects', 'original', CLI + '.jsonl');
     const second = path.join(claudeHome, 'projects', 'worktree-copy', CLI + '.jsonl');
-    for (const directory of [userHome, worktree, common, ...[metadata, registry, first, second].map(path.dirname)])
+    for (const directory of [worktree, common, ...[metadata, registry, first, second].map(path.dirname)])
         await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(worktree, '.git'), 'gitdir: fixture-only');
     await fs.writeFile(metadata, JSON.stringify({ sessionId: LOCAL, cliSessionId: CLI,
@@ -214,7 +236,7 @@ for (const returned of [true, false]) test(`bridge-less registry publishes prove
             callback(null, `${common}\n${top}\n`, '');
         } });
     const store = createSessionStore({ claudeHome });
-    const publisher = createSnapshotPublisher({ claudeData, userHome, store, resolveWorkspace, pollMs: 600000 });
+    const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, resolveWorkspace, pollMs: 600000 });
     t.after(async () => { await publisher.stop(); store.dispose(); await fs.rm(root, { recursive: true, force: true }); });
     await publisher.start();
     const local = await publisher.readLocal(LOCAL);

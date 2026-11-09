@@ -1,6 +1,6 @@
 'use strict';
 
-// 此函数被序列化到调用方页面；原始事件、文件内容和登录态始终留在该页面内。
+// 此函数被序列化到调用方页面；原始事件、快照内容和登录态始终留在该页面内。
 function createRemoteReader(win, createSnapshotProtocol, options = {}) {
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const protocol = createSnapshotProtocol();
@@ -87,29 +87,13 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         }
         return size;
     }
-    function samePath(value, expected) {
-        if (typeof value !== 'string' || value.length > 4096 || /[\x00-\x1f\x7f]/.test(value)) return false;
-        const target = expected.split('/');
-        if (target.length !== 4 || target[0] !== '~' || target[1] !== '.claude-plusplus'
-            || target[2] !== 'session-stats') return false;
-        // The native RC dispatcher can echo its exact request path after the worker authorizes and reads it.
-        if (value === expected) return true;
-        const windows = /^[A-Za-z]:[\\/]/.test(value);
-        if (!windows && (!/^\/[^/]/.test(value) || value.includes('\\'))) return false;
-        const path = windows ? value.replaceAll('\\', '/') : value;
-        const parts = path.slice(windows ? 3 : 1).split('/');
-        if (parts.length < 4 || !parts.every(part => part && part !== '.' && part !== '..'
-            && !/[<>:"|?*%~]/.test(part) && !/[. ]$/.test(part)
-            && (!windows || !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)))) return false;
-        return parts.slice(-3).every((part, index) => part === target[index + 1]);
-    }
-    function accept(current, file, expectedPath) {
-        if (!record(file) || typeof file.contents !== 'string' || file.contents.length > protocol.maxBytes
-            || utf8Bytes(file.contents) > protocol.maxBytes || file.anchor !== undefined
-            || file.truncated !== undefined && file.truncated !== false
-            || file.encoding !== undefined && file.encoding !== 'utf-8' || !samePath(file.absPath, expectedPath))
-            throw failure('snapshot-invalid');
-        const parsed = protocol.parseSnapshot(file.contents, { bridgeSessionId: current.bound.threadId,
+    function accept(current, response) {
+        if (!record(response) || Object.keys(response).length !== 2
+            || !Object.hasOwn(response, 'protocolVersion') || response.protocolVersion !== 1
+            || !Object.hasOwn(response, 'snapshot') || !record(response.snapshot)) throw failure('snapshot-invalid');
+        const text = JSON.stringify(response.snapshot);
+        if (text.length > protocol.maxBytes || utf8Bytes(text) > protocol.maxBytes) throw failure('snapshot-invalid');
+        const parsed = protocol.parseSnapshot(text, { bridgeSessionId: current.bound.threadId,
             organizationId: current.bound.org, agentId: current.bound.agentId, now: now() });
         if (!parsed.ok) throw failure(`snapshot-${parsed.reason}`);
         const sample = parsed.snapshot, previous = current.accepted;
@@ -196,15 +180,13 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             current.trusted = true;
             if ((session.connection_status ?? detail.connection_status) !== 'connected') throw failure('offline');
             if (!current.result) current.result = unavailable(current, 'pending');
-            const path = protocol.snapshotPath(current.bound.threadId, current.bound.agentId);
-            if (!path) throw failure('snapshot-invalid');
             const initial = readPage(await request(`${base}/events?${new URLSearchParams({ limit: '1', sort_order: 'desc' })}`), 0, true);
             let cursor = initial.cursor;
             const requestId = win.crypto.randomUUID();
-            // Request only the fixed home path; native refusal never triggers workspace or anchor fallbacks.
+            // 请求由会话自身处理；原生不支持时不尝试文件或其他数据源。
             await request(`${base}/events`, { events: [{ payload: { type: 'control_request', uuid: win.crypto.randomUUID(),
-                request_id: requestId, request: { subtype: 'read_file', path, max_bytes: protocol.maxBytes,
-                    encoding: 'utf-8' } } }] });
+                request_id: requestId, request: { subtype: 'claudepp_session_stats', protocolVersion: 1,
+                    organizationId: current.bound.org, ...(current.bound.agentId ? { agentId: current.bound.agentId } : {}) } } }] });
             for (let page = 0; page < (options.maxPages ?? 128); page++) {
                 const params = new URLSearchParams({ limit: '500', sort_order: 'asc', cursor: String(cursor) });
                 const data = readPage(await request(`${base}/events?${params}`), cursor);
@@ -217,10 +199,12 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
                         const error = typeof reply.error === 'string' ? reply.error.toLowerCase() : '';
                         throw failure(/denied|permission|eacces/.test(error) ? 'snapshot-denied'
                             : /enoent|not found|no such file/.test(error) ? 'snapshot-missing'
-                                : /unsupported|unknown.*request|not implemented/.test(error) ? 'snapshot-unsupported' : 'snapshot-invalid');
+                                : /unsupported|unknown.*request|not implemented|does not handle control_request subtype/.test(error)
+                                    ? 'snapshot-unsupported' : error === 'session-stats-unavailable'
+                                        ? 'source-unavailable' : 'snapshot-invalid');
                     }
                     if (reply.subtype !== 'success') throw failure('snapshot-invalid');
-                    return accept(current, reply.response, path);
+                    return accept(current, reply.response);
                 }
                 cursor = data.cursor;
                 if (!data.hasNext) await wait();

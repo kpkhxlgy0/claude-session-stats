@@ -36,9 +36,9 @@ async function waitForSnapshot(f, agentId, predicate = () => true) {
 async function fixture(t, options = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-agent-publisher-')));
     const claudeData = path.join(root, 'desktop'), workspace = path.join(root, 'workspace');
-    const userHome = path.join(root, 'home');
+    const claudeHome = path.join(root, 'home');
     await fs.mkdir(workspace);
-    await fs.mkdir(userHome);
+    await fs.mkdir(claudeHome);
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, `${LOCAL}.json`);
     await fs.mkdir(path.dirname(metadata), { recursive: true });
     const row = { sessionId: LOCAL, cliSessionId: CLI, cwd: workspace, bridgeSessionIds: [BRIDGE] };
@@ -54,16 +54,32 @@ async function fixture(t, options = {}) {
             if (value instanceof Error) throw value;
             return value;
         } };
-    const publisher = createSnapshotPublisher({ claudeData, userHome, store, now: () => 100000,
+    const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, now: () => 100000,
         publisherId: PUBLISHER, pollMs: 100000, ...options });
-    const directory = path.join(userHome, '.claude-plusplus', 'session-stats');
+    const directory = path.join(claudeHome, '.session-stats');
     const destination = agentId => path.join(directory,
         `${BRIDGE}${agentId === undefined ? '' : `.agent-${agentId}`}.json`);
     const snapshot = async agentId => JSON.parse(await fs.readFile(destination(agentId), 'utf8'));
     t.after(async () => { await publisher.stop(); await fs.rm(root, { recursive: true, force: true }); });
-    return { root, claudeData, workspace, userHome, metadata, row, write, calls, samples, publisher,
+    return { root, claudeData, workspace, claudeHome, metadata, row, write, calls, samples, publisher,
         directory, destination, snapshot, setAgents(value) { agents = value; } };
 }
+
+test('remote parent and child envelopes retain exact sibling revisions without collecting new metrics', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const samples = f.calls.filter(call => call[0] === 'stats').length;
+    for (const agentId of [undefined, 'a', 'b'])
+        assert.deepEqual(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, agentId }),
+            await f.snapshot(agentId));
+    assert.equal(f.calls.filter(call => call[0] === 'stats').length, samples);
+    assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, agentId: 'missing' }), null);
+    f.setAgents(['b']);
+    assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, agentId: 'a' }), null);
+    assert.deepEqual(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, agentId: 'b' }),
+        await f.snapshot('b'));
+    assert.deepEqual(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), await f.snapshot());
+});
 
 test('storage failure exposes only the selected child sample while it belongs to the session', async t => {
     const f = await fixture(t);

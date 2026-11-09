@@ -20,9 +20,9 @@ const STATS = { turns: 2, steps: 3, totalTokens: 100, inputTokens: 60, outputTok
 async function fixture(t, { children = [], ...options } = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-snapshot-recovery-')));
     const claudeData = path.join(root, 'desktop'), workspace = path.join(root, 'workspace');
-    const userHome = path.join(root, 'home');
+    const claudeHome = path.join(root, 'home');
     await fs.mkdir(workspace);
-    await fs.mkdir(userHome);
+    await fs.mkdir(claudeHome);
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, `${LOCAL}.json`);
     await fs.mkdir(path.dirname(metadata), { recursive: true });
     const row = { sessionId: LOCAL, cliSessionId: CLI, cwd: workspace, bridgeSessionIds: [BRIDGE] };
@@ -31,12 +31,12 @@ async function fixture(t, { children = [], ...options } = {}) {
     let stats = { ...STATS }, clock = 100000;
     const store = { async getStats() { return stats; }, async listAgents() { return children; },
         async getAgentStats() { return stats; } };
-    const publisherOptions = { claudeData, userHome, store, now: () => clock, pollMs: 100000,
+    const publisherOptions = { claudeData, claudeHome, store, now: () => clock, pollMs: 100000,
         publisherId: PUBLISHER, ...options };
     const publishers = [];
     const makePublisher = () => { const value = createSnapshotPublisher(publisherOptions); publishers.push(value); return value; };
     const publisher = makePublisher();
-    const directory = path.join(userHome, '.claude-plusplus', 'session-stats');
+    const directory = path.join(claudeHome, '.session-stats');
     const destination = agentId => path.join(directory, `${BRIDGE}${agentId === undefined ? '' : `.agent-${agentId}`}.json`);
     const backupDirectory = path.join(directory, 'corrupt-backups');
     const backup = (bytes, agentId) => path.join(backupDirectory,
@@ -46,7 +46,7 @@ async function fixture(t, { children = [], ...options } = {}) {
     };
     const snapshot = async agentId => JSON.parse(await fs.readFile(destination(agentId), 'utf8'));
     t.after(async () => { for (const value of publishers) await value.stop(); await fs.rm(root, { recursive: true, force: true }); });
-    return { root, workspace, userHome, metadata, row, writeBinding, publisher, makePublisher, directory, destination,
+    return { root, workspace, claudeHome, metadata, row, writeBinding, publisher, makePublisher, directory, destination,
         backupDirectory, backup, seed, snapshot, children, setStats(value) { stats = value; }, setClock(value) { clock = value; } };
 }
 

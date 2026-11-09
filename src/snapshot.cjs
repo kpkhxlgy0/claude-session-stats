@@ -28,10 +28,6 @@ function createSnapshotProtocol() {
         if (!id || child && !normalizeAgentId(agentId)) return null;
         return `${id}${child ? `.agent-${agentId}` : ''}.json`;
     }
-    function snapshotPath(value, agentId) {
-        const filename = snapshotFilename(value, agentId);
-        return filename && `~/.claude-plusplus/session-stats/${filename}`;
-    }
     function projectStats(raw) {
         if (!record(raw) || !statuses.includes(raw.status) || typeof raw.usageComplete !== 'boolean') return null;
         const stats = { status: raw.status };
@@ -86,7 +82,7 @@ function createSnapshotProtocol() {
         if (expected.now - snapshot.generatedAt > maxAgeMs) return invalid('expired');
         return { ok: true, snapshot: normalized };
     }
-    return { normalizeBridgeId, normalizeAgentId, snapshotFilename, snapshotPath, projectStats, makeSnapshot, parseSnapshot,
+    return { normalizeBridgeId, normalizeAgentId, snapshotFilename, projectStats, makeSnapshot, parseSnapshot,
         maxBytes, maxAgeMs, futureSkewMs };
 }
 

@@ -49,10 +49,10 @@ function containsPath(root, candidate) {
 }
 
 function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Date.now, pollMs = 2000,
-    heartbeatMs = 10000, publisherId = randomUUID(), userHome = homedir() } = {}) {
-    if (typeof userHome !== 'string' || !path.isAbsolute(userHome)) throw new Error('Invalid snapshot user home');
-    const home = path.resolve(userHome), storageRoot = path.join(home, '.claude-plusplus');
-    const snapshotDirectory = path.join(storageRoot, 'session-stats');
+    heartbeatMs = 10000, publisherId = randomUUID(),
+    claudeHome = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), '.claude') } = {}) {
+    if (typeof claudeHome !== 'string' || !path.isAbsolute(claudeHome)) throw new Error('Invalid Claude configuration directory');
+    const home = path.resolve(claudeHome), snapshotDirectory = path.join(home, '.session-stats');
     const protocol = createSnapshotProtocol();
     const states = new Map();
     let unavailableWorkspaces = new Set();
@@ -136,14 +136,13 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     async function directories(binding, create) {
         const result = [];
         const root = binding.workspaceRoot;
-        if ([root, ...knownWorkspaceRoots].some(workspace => containsPath(workspace, home)
-            || containsPath(workspace, snapshotDirectory) || containsPath(snapshotDirectory, workspace)))
-            throw new Error('Snapshot user storage overlaps the workspace');
+        if ([root, ...knownWorkspaceRoots].some(workspace => containsPath(snapshotDirectory, workspace)))
+            throw new Error('Snapshot storage contains the workspace');
         if (await fs.realpath(root) !== root) throw new Error('Workspace root changed');
         result.push([root, await directoryInfo(root)]);
-        if (path.relative(home, await fs.realpath(home)) !== '') throw new Error('Snapshot user home changed');
+        if (path.relative(home, await fs.realpath(home)) !== '') throw new Error('Claude configuration directory changed');
         result.push([home, await directoryInfo(home)]);
-        for (const directory of [storageRoot, snapshotDirectory]) {
+        for (const directory of [snapshotDirectory]) {
             if (create) {
                 await confirmDirectories(result);
                 try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -775,12 +774,20 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             return { ...sample.stats, threadId: localSessionId, snapshotSync: 'local-only',
                 ...(agentId !== undefined ? { agentId } : {}) };
         }
+        const snapshot = await readPublished(state);
+        return snapshot ? { ...snapshot.stats, threadId: localSessionId, snapshotGeneratedAt: snapshot.generatedAt,
+            snapshotRevision: snapshot.revision, snapshotPublisherId: snapshot.publisherId,
+            ...(agentId !== undefined ? { agentId } : {}) } : unavailable(localSessionId, agentId);
+    }
+
+    async function readPublished(state, { verify, valid = () => true } = {}) {
         const runEpoch = epoch, key = bindingKey(state.binding);
-        const active = () => !stopped && epoch === runEpoch && states.get(key) === state && state.snapshot;
+        const active = () => !stopped && epoch === runEpoch && states.get(key) === state && state.snapshot && valid();
+        const recheck = verify || (() => current(state.binding, runEpoch));
         for (let attempt = 0; attempt < 3; attempt++) {
             const snapshot = state.snapshot;
             try {
-                if (!active() || !await current(state.binding, runEpoch)) throw new Error('Snapshot identity changed');
+                if (!active() || !await recheck()) throw new Error('Snapshot identity changed');
                 const expected = await directories(state.binding, false);
                 let existing = await readDestination(state.destination, state.binding);
                 const publication = state.publication;
@@ -794,7 +801,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     existing = await readDestination(state.destination, state.binding);
                 }
                 await confirmDirectories(expected);
-                if (!await current(state.binding, runEpoch) || !active()) throw new Error('Snapshot identity changed');
+                if (!await recheck() || !active()) throw new Error('Snapshot identity changed');
                 const latest = state.snapshot;
                 const encoded = JSON.stringify(existing?.snapshot);
                 let sample;
@@ -803,20 +810,49 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
                     && snapshot.stats.status === 'ok' && latest.stats.status === 'ok') sample = snapshot;
                 else throw new Error('Published snapshot changed');
                 const parsed = protocol.parseSnapshot(JSON.stringify(sample), { bridgeSessionId: state.binding.bridgeSessionId,
-                    organizationId: state.binding.organizationId, agentId, now: now() });
+                    organizationId: state.binding.organizationId, agentId: state.binding.agentId, now: now() });
                 if (!parsed.ok) throw new Error('Published snapshot expired');
-                return { ...sample.stats, threadId: localSessionId, snapshotGeneratedAt: sample.generatedAt,
-                    snapshotRevision: sample.revision, snapshotPublisherId: sample.publisherId,
-                    ...(agentId !== undefined ? { agentId } : {}) };
+                return parsed.snapshot;
             } catch (error) {
                 // Atomic replacement can cross lstat/open/read. Retry only this file-identity race;
                 // each attempt must still match a committed sample and recheck the binding.
                 if (error.code === 'SNAPSHOT_DESTINATION_CHANGED' && attempt < 2 && active()) continue;
                 // File cleanup belongs to serialized poll/stop paths, never an older read.
-                if (state.snapshot === snapshot) state.snapshot = null;
-                return unavailable(localSessionId, agentId);
+                if (state.snapshot === snapshot && active()) state.snapshot = null;
+                return null;
             }
         }
+    }
+
+    async function readRemoteSnapshot(bridgeSessionId, { organizationId, agentId, signal } = {}) {
+        const bridge = protocol.normalizeBridgeId(bridgeSessionId);
+        if (!bridge || typeof organizationId !== 'string'
+            || agentId !== undefined && !protocol.normalizeAgentId(agentId)
+            || signal && (typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')
+            || stopped || signal?.aborted) return null;
+        const matches = () => [...states.values()].filter(state => state.binding.bridgeSessionId === bridge
+            && state.binding.organizationId === organizationId.toLowerCase() && state.binding.agentId === agentId);
+        const bound = matches();
+        if (bound.length !== 1 || !bound[0].snapshot) return null;
+        const state = bound[0], runEpoch = epoch, parent = parentBinding(state.binding), parentKey = bindingKey(parent);
+        const valid = () => alive(runEpoch) && !signal?.aborted && matches().length === 1 && matches()[0] === state;
+        const verify = async () => {
+            if (!valid()) return false;
+            const { parents } = await scanParents([parent]);
+            return valid() && parents.some(binding => bindingKey(binding) === parentKey)
+                && await stillOwned(state.binding, runEpoch);
+        };
+        let abort;
+        try {
+            const aborted = signal && new Promise(resolve => {
+                abort = () => resolve(null);
+                signal.addEventListener('abort', abort, { once: true });
+            });
+            const snapshot = await Promise.race([readPublished(state, { valid, verify }), cancelled,
+                ...(aborted ? [aborted] : [])]);
+            return valid() ? snapshot ?? null : null;
+        } catch { return null; }
+        finally { if (abort) signal.removeEventListener('abort', abort); }
     }
 
     function stop() {
@@ -831,6 +867,6 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         })();
         return stopPending;
     }
-    return { start, readLocal, stop };
+    return { start, readLocal, readRemoteSnapshot, stop };
 }
 module.exports = { createSnapshotPublisher };

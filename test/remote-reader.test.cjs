@@ -7,10 +7,6 @@ const { createRemoteReader, buildRemoteScripts } = require('../src/remote-reader
 const ID = 'session_Test123';
 const ORG = '11111111-1111-4111-8111-111111111111';
 const PUBLISHER = '22222222-2222-4222-8222-222222222222';
-const PATH = '~/.claude-plusplus/session-stats/session_Test123.json';
-const ABS_PATH = '/home/runner/.claude-plusplus/session-stats/session_Test123.json';
-const absolutePath = agentId => agentId === undefined ? ABS_PATH
-    : `/home/runner/.claude-plusplus/session-stats/session_Test123.agent-${agentId}.json`;
 const STATS = { turns: 7, steps: 13, totalTokens: 1400, inputTokens: 1000, outputTokens: 400,
     cachedInputTokens: 700, cacheHit: .7, tps: 20, usageComplete: true, status: 'ok' };
 const NOW = Date.parse('2026-10-24T00:00:00Z');
@@ -51,8 +47,7 @@ function fixture(t, options = {}) {
         if (!request.url.pathname.endsWith('/events')) return response(detail);
         if (request.url.searchParams.get('sort_order') === 'desc') return response({ data: [], resume_cursor: '10' });
         return response({ data: [event(onReply({ type: 'control_response', response: { request_id: requestId,
-            subtype: 'success', response: { contents: JSON.stringify(snapshot()),
-                absPath: absolutePath(options.sampleAgentId) } } }), 12)], resume_cursor: '12' });
+            subtype: 'success', response: { protocolVersion: 1, snapshot: snapshot() } } }), 12)], resume_cursor: '12' });
     };
     const reader = createRemoteReader(win, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0,
         responsePollMs: 1, timeoutMs: 100, now: () => clock, ...options });
@@ -62,18 +57,17 @@ function fixture(t, options = {}) {
         advance(ms) { clock += ms; }, setSample(value, at = clock) { revision = value; generatedAt = at; } };
 }
 
-test('reads the fixed home snapshot through one correlated control request and exports only its aggregates', async t => {
+test('reads session statistics through one correlated control request and exports only its aggregates', async t => {
     const f = fixture(t); const result = await f.reader.read();
     assert.deepEqual(result, { ...STATS, threadId: ID, source: 'remote_control',
         snapshotGeneratedAt: NOW, snapshotRevision: 1, snapshotPublisherId: PUBLISHER });
     const post = f.requests.find(request => request.init.method === 'POST');
-    assert.ok(post, 'a read_file control request must be sent');
+    assert.ok(post, 'a session statistics control request must be sent');
     assert.equal(post.url, `https://claude.ai/v1/code/sessions/${ID}/events`);
     const payload = JSON.parse(post.init.body).events[0].payload;
     assert.equal(payload.type, 'control_request');
     assert.match(payload.uuid, /^[0-9a-f-]{36}$/i); assert.match(payload.request_id, /^[0-9a-f-]{36}$/i);
-    assert.deepEqual(payload.request, { subtype: 'read_file', path: PATH, max_bytes: 16384,
-        encoding: 'utf-8' });
+    assert.deepEqual(payload.request, { subtype: 'claudepp_session_stats', protocolVersion: 1, organizationId: ORG });
     assert.equal(JSON.parse(post.init.body).events.length, 1);
     const postIndex = f.requests.indexOf(post);
     assert.equal(new URL(f.requests[postIndex - 1].url).searchParams.get('sort_order'), 'desc');
@@ -93,8 +87,22 @@ test('selected child reads only its own bounded snapshot and returns agent ident
     assert.equal(result?.agentId, agentId);
     assert.equal(result?.tps, 20);
     const post = f.requests.find(request => request.init.method === 'POST');
-    assert.equal(JSON.parse(post.init.body).events[0].payload.request.path,
-        `~/.claude-plusplus/session-stats/${ID}.agent-${agentId}.json`);
+    assert.deepEqual(JSON.parse(post.init.body).events[0].payload.request,
+        { subtype: 'claudepp_session_stats', protocolVersion: 1, organizationId: ORG, agentId });
+});
+
+test('valid zero usage remains zero while an unmeasured TPS remains null', async t => {
+    const f = fixture(t);
+    f.setReply(value => {
+        value.response.response.snapshot.stats = { status: 'ok', turns: 0, steps: 0, totalTokens: 0,
+            inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheHit: 0, tps: null, usageComplete: true };
+        return value;
+    });
+    const result = await f.reader.read();
+    assert.equal(result.status, 'ok');
+    for (const field of ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheHit'])
+        assert.equal(result[field], 0, field);
+    assert.equal(result.tps, null);
 });
 
 test('a visible task-pane editor cannot suppress either parent or child snapshot reads', async t => {
@@ -132,7 +140,7 @@ test('child selection change invalidates a pending read and cannot display anoth
     f.setFetch(({url,requestId,snapshot}) => url.searchParams.get('sort_order') === 'asc'
         ? new Promise(resolve => { release = () => resolve(response({ data: [event({ type: 'control_response',
             response: { request_id: requestId, subtype: 'success', response: {
-                contents: JSON.stringify(snapshot()), absPath: absolutePath(agentId),
+                protocolVersion: 1, snapshot: snapshot(),
             } } }, 12)], resume_cursor: '12' })); }) : undefined);
     const pending = f.reader.read();
     await waitFor(() => release);
@@ -164,7 +172,7 @@ test('synchronized messages and unrelated or pre-cursor responses never supply u
         if (init.method !== 'GET' || url.searchParams.get('sort_order') !== 'asc') return;
         polls++;
         const payload = { type: 'control_response', response: { request_id: requestId,
-            subtype: 'success', response: { contents: JSON.stringify(snapshot()), absPath: ABS_PATH } } };
+            subtype: 'success', response: { protocolVersion: 1, snapshot: snapshot() } } };
         if (polls === 1) return response({ data: [
             event(payload, 10), event({ ...payload, response: { ...payload.response, request_id: 'old-request' } }, 11),
             event({ type: 'user', uuid: 'prompt', message: { role: 'user', content: 'private prompt' } }, 12),
@@ -179,7 +187,9 @@ test('synchronized messages and unrelated or pre-cursor responses never supply u
 test('matching denied, missing and unsupported replies return unavailable without estimated numbers', async t => {
     for (const [error, reason] of [['read denied: file', 'snapshot-denied'],
         ['EACCES: no such file or directory', 'snapshot-denied'], ['ENOENT', 'snapshot-missing'],
-        ['Unsupported control request: read_file', 'snapshot-unsupported']]) {
+        ['Unsupported control request: claudepp_session_stats', 'snapshot-unsupported'],
+        ['REPL bridge does not handle control_request subtype: claudepp_session_stats', 'snapshot-unsupported'],
+        ['session-stats-unavailable', 'source-unavailable']]) {
         const f = fixture(t);
         f.setReply(value => ({ ...value, response: { request_id: value.response.request_id, subtype: 'error', error } }));
         const result = await f.reader.read();
@@ -188,15 +198,15 @@ test('matching denied, missing and unsupported replies return unavailable withou
     }
 });
 
-test('invalid file envelopes and malformed snapshots fail closed', async t => {
+test('invalid RPC envelopes, protocol versions and oversized snapshots fail closed', async t => {
     const invalid = [
-        value => ({ ...value, truncated: true }), value => ({ ...value, encoding: 'base64' }),
-        value => ({ ...value, anchor: 'workspace_root' }), value => ({ ...value, anchor: 'cwd' }),
-        value => ({ ...value, absPath: '.claude/session-stats/session_Other.json' }),
-        value => ({ ...value, absPath: '/home/runner/../.claude-plusplus/session-stats/session_Test123.json' }),
-        value => ({ ...value, contents: 'x'.repeat(16385) }), value => ({ ...value, contents: '😀'.repeat(5000) }),
-        value => ({ ...value, contents: '{' }),
-        value => ({ ...value, contents: JSON.stringify({ ...JSON.parse(value.contents), privatePrompt: 'must reject' }) }),
+        value => null, value => [], value => ({ ...value, protocolVersion: 2 }),
+        value => ({ ...value, protocolVersion: '1' }), value => ({ snapshot: value.snapshot }),
+        value => ({ protocolVersion: 1 }), value => ({ ...value, path: '/private/file' }),
+        value => ({ ...value, contents: '{}' }), value => ({ ...value, snapshot: '{}' }),
+        value => ({ ...value, snapshot: { ...value.snapshot, privatePrompt: 'must reject' } }),
+        value => ({ ...value, snapshot: { ...value.snapshot, privatePrompt: 'x'.repeat(16385) } }),
+        value => ({ ...value, snapshot: { ...value.snapshot, privatePrompt: '😀'.repeat(5000) } }),
     ];
     for (const mutate of invalid) {
         const f = fixture(t);
@@ -207,44 +217,29 @@ test('invalid file envelopes and malformed snapshots fail closed', async t => {
     }
 });
 
-test('matches the native bridge request-path echo and canonical expanded OS home paths', async t => {
-    for (const absPath of [PATH, ABS_PATH, '/Users/runner/.claude-plusplus/session-stats/session_Test123.json',
-        '/root/.claude-plusplus/session-stats/session_Test123.json',
-        'C:\\Users\\Runner\\.claude-plusplus\\session-stats\\session_Test123.json',
-        'D:/Custom Home/Runner/.claude-plusplus/session-stats/session_Test123.json']) {
-        const f = fixture(t);
-        f.setReply(value => ({ ...value, response: { ...value.response,
-            response: { ...value.response.response, absPath } } }));
-        assert.equal((await f.reader.read()).totalTokens, 1400, absPath);
-    }
+test('snapshot UTF-8 byte limit is checked before parsing metrics', async t => {
+    let parsed = false;
+    const protocolFactory = () => ({ ...createSnapshotProtocol(), parseSnapshot() {
+        parsed = true; throw new Error('oversized data reached the parser');
+    } });
+    const f = fixture(t);
+    f.setReply(value => ({ ...value, response: { ...value.response, response: { protocolVersion: 1,
+        snapshot: { privatePrompt: '😀'.repeat(5000) } } } }));
+    const reader = createRemoteReader(f.win, protocolFactory, { now: () => NOW, responsePollMs: 0 });
+    t.after(() => reader.stop());
+    assert.equal((await reader.read()).unavailableReason, 'snapshot-invalid');
+    assert.equal(parsed, false);
 });
 
-test('home snapshot responses reject different tilde paths, relative, traversal, device and network paths', async t => {
-    const suffix = '.claude-plusplus/session-stats/session_Test123.json';
-    for (const absPath of [`~other/${suffix}`, `~/../${suffix}`, PATH.replace(ID, 'session_Other'), suffix, `.claude/session-stats/${ID}.json`,
-        `/home/runner/.claude/session-stats/${ID}.json`, `/${suffix}`, `C:/${suffix}`,
-        `/home/runner/../${suffix}`, `/home/runner/./${suffix}`, `/home//runner/${suffix}`,
-        `/home/runner/../../home/runner/${suffix}`, `/home/runner/%2e%2e/${suffix}`,
-        `/home/runner/~/${suffix}`, `//home/runner/${suffix}`, `//server/share/${suffix}`,
-        `C:Users/runner/${suffix}`, `\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
-        `\\\\server\\share\\${suffix.replaceAll('/', '\\')}`,
-        `\\\\?\\C:\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
-        `\\\\.\\C:\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
-        `\\??\\C:\\Users\\runner\\${suffix.replaceAll('/', '\\')}`,
-        `/C:/Users/runner/${suffix}`, `C:/D:/Users/runner/${suffix}`,
-        `C:/Users/runner:stream/${suffix}`, `C:/Users/CON/${suffix}`, `C:/Users/runner./${suffix}`,
-        `C:/Users/runner /${suffix}`, `/home/runner\\other/${suffix}`,
-        `/home/runner/.claude-plusplus/session-stats-other/${ID}.json`,
-        `/home/runner/.claude-plusplus/session-stats/${ID}.agent-other.json`,
-        `/home/runner/.claude-plusplus/session-stats/${ID}.json/extra`]) {
-        const f = fixture(t);
-        f.setReply(value => ({ ...value, response: { ...value.response,
-            response: { ...value.response.response, absPath } } }));
-        const result = await f.reader.read();
-        assert.equal(result.unavailableReason, 'snapshot-invalid', absPath);
-        assert.equal(result.tps, null, absPath);
-        assert.equal(f.requests.filter(request => request.init.method === 'POST').length, 1, absPath);
+test('child snapshots cannot be accepted by a different agent or by the parent reader', async t => {
+    for (const selected of [undefined, 'child_B']) {
+        const f = fixture(t, { sampleAgentId: 'child_A', ...(selected ? {
+            resolveAgent: () => ({ sessionId: ID, agentId: selected, remote: true }),
+        } : {}) });
+        assert.equal((await f.reader.read()).unavailableReason, 'snapshot-identity');
     }
+    const f = fixture(t, { resolveAgent: () => ({ sessionId: ID, agentId: 'child_A', remote: true }) });
+    assert.equal((await f.reader.read()).unavailableReason, 'snapshot-identity');
 });
 
 test('wrong snapshot identity, stale and future samples remain unavailable', async t => {
@@ -256,7 +251,7 @@ test('wrong snapshot identity, stale and future samples remain unavailable', asy
     ]) {
         const f = fixture(t);
         f.setReply(value => ({ ...value, response: { ...value.response,
-            response: { ...value.response.response, contents: JSON.stringify(mutate(JSON.parse(value.response.response.contents))) } } }));
+            response: { ...value.response.response, snapshot: mutate(value.response.response.snapshot) } } }));
         assert.equal((await f.reader.read()).unavailableReason, reason);
     }
 });
@@ -264,8 +259,8 @@ test('wrong snapshot identity, stale and future samples remain unavailable', asy
 test('valid snapshots with unavailable source data do not claim a usable shared revision', async t => {
     const f = fixture(t);
     f.setReply(value => ({ ...value, response: { ...value.response, response: { ...value.response.response,
-        contents: JSON.stringify(createSnapshotProtocol().makeSnapshot({ bridgeSessionId: ID, organizationId: ORG },
-            { ...STATS, status: 'incomplete' }, { publisherId: PUBLISHER, revision: 1, now: NOW })) } } }));
+        snapshot: createSnapshotProtocol().makeSnapshot({ bridgeSessionId: ID, organizationId: ORG },
+            { ...STATS, status: 'incomplete' }, { publisherId: PUBLISHER, revision: 1, now: NOW }) } } }));
     assert.equal((await f.reader.read()).unavailableReason, 'source-unavailable'); assert.equal(f.reader.peek().tps, null);
 });
 
@@ -274,8 +269,7 @@ test('cache expires while an RPC is pending and concurrent reads share its one r
     f.advance(29000); let release;
     f.setFetch(({ url, requestId, snapshot }) => url.searchParams.get('sort_order') === 'asc'
         ? new Promise(resolve => { release = () => resolve(response({ data: [event({ type: 'control_response',
-            response: { request_id: requestId, subtype: 'success', response: { contents: JSON.stringify(snapshot()),
-                absPath: ABS_PATH } } }, 12)], resume_cursor: '12' })); }) : undefined);
+            response: { request_id: requestId, subtype: 'success', response: { protocolVersion: 1, snapshot: snapshot() } } }, 12)], resume_cursor: '12' })); }) : undefined);
     const first = f.reader.read(), second = f.reader.read(); assert.equal(first, second);
     await waitFor(() => release);
     assert.equal(f.reader.peek().tps, 20); f.advance(1001);
@@ -287,10 +281,10 @@ test('snapshot revision rollback, changed same revision and old publisher replay
     const f = fixture(t); f.setSample(3); assert.equal((await f.reader.read()).snapshotRevision, 3);
     f.setSample(2); assert.equal((await f.reader.read()).unavailableReason, 'snapshot-replay');
     f.setSample(3); f.setReply(value => ({ ...value, response: { ...value.response,
-        response: { ...value.response.response, contents: value.response.response.contents.replace('"tps":20', '"tps":21') } } }));
+        response: { ...value.response.response, snapshot: { ...value.response.response.snapshot, stats: { ...value.response.response.snapshot.stats, tps: 21 } } } } }));
     assert.equal((await f.reader.read()).unavailableReason, 'snapshot-replay');
     f.setReply(value => ({ ...value, response: { ...value.response, response: { ...value.response.response,
-        contents: JSON.stringify({ ...JSON.parse(value.response.response.contents), publisherId: '44444444-4444-4444-8444-444444444444' }) } } }));
+        snapshot: { ...value.response.response.snapshot, publisherId: '44444444-4444-4444-8444-444444444444' } } } }));
     f.advance(1); f.setSample(1); assert.equal((await f.reader.read()).snapshotRevision, 1);
     f.setReply(value => value); f.setSample(4); assert.equal((await f.reader.read()).unavailableReason, 'snapshot-replay');
 });
@@ -395,7 +389,7 @@ test('serialized bridge returns pending at 750ms, finishes in the page and clean
     const posted = JSON.parse(f.requests.find(request => request.init.method === 'POST').init.body).events[0].payload;
     const sample = f.snapshot(); sample.generatedAt = Date.now();
     release(response({ data: [event({ type: 'control_response', response: { request_id: posted.request_id,
-        subtype: 'success', response: { contents: JSON.stringify(sample), absPath: ABS_PATH } } }, 12)], resume_cursor: '12' }));
+        subtype: 'success', response: { protocolVersion: 1, snapshot: sample } } }, 12)], resume_cursor: '12' }));
     const reader = f.win[Symbol.for('claudepp.session-stats.slow-owner')];
     assert.equal((await reader.read()).tps, 20); assert.equal(timers.size, 0);
     vm.runInContext(cleanupScript, context); assert.equal(f.win[Symbol.for('claudepp.session-stats.slow-owner')], undefined);
@@ -414,8 +408,7 @@ test('serialized child reader derives identity from the selected pane and reject
     host.child.child = { memoizedProps: { openedToolUseId: 'tool_1', sessionRef: ref,
         paneView: { agentId }, task: { taskId: agentId, toolUseId: 'tool_1' } }, return: host.child };
     pane.__reactFiber$test = host;
-    f.setReply(reply => { const sample = JSON.parse(reply.response.response.contents);
-        sample.generatedAt = Date.now(); reply.response.response.contents = JSON.stringify(sample); return reply; });
+    f.setReply(reply => { reply.response.response.snapshot.generatedAt = Date.now(); return reply; });
     const scripts = buildRemoteScripts('child-owner');
     assert.equal(typeof scripts.agentScript, 'function');
     for (const key of [null, '', 'pane-1);window.secret', 'x'.repeat(129)]) assert.equal(scripts.agentScript(key), null);
@@ -427,30 +420,31 @@ test('serialized child reader derives identity from the selected pane and reject
     vm.runInContext(scripts.cleanupScript, context);
     assert.equal(f.win[Symbol.for('claudepp.session-stats.child-owner')], undefined);
 });
-test('home snapshot requests do not use a current-directory or launch-root anchor', async t => {
+test('session statistics requests carry no filesystem path, encoding or anchor', async t => {
     const f = fixture(t);
-    f.setReply(value => {
-        delete value.response.response.anchor;
-        return value;
-    });
-    const result = await f.reader.read();
-    assert.equal(result.status, 'ok');
-    assert.equal(result.tps, 20);
+    assert.equal((await f.reader.read()).tps, 20);
     const posts = f.requests.filter(request => request.init.method === 'POST');
     assert.equal(posts.length, 1);
     assert.deepEqual(JSON.parse(posts[0].init.body).events[0].payload.request,
-        { subtype: 'read_file', path: PATH, max_bytes: 16384, encoding: 'utf-8' });
+        { subtype: 'claudepp_session_stats', protocolVersion: 1, organizationId: ORG });
 });
 
-test('a denied home read never tries another path, anchor or data source', async t => {
-    const f = fixture(t);
+test('native unsupported replies back off without probing paths or another data source', async t => {
+    const f = fixture(t, { errorBackoffMs: 30000 });
     f.setReply(value => ({ ...value, response: { request_id: value.response.request_id,
-        subtype: 'error', error: 'read denied: ' + PATH } }));
+        subtype: 'error', error: 'REPL bridge does not handle control_request subtype: claudepp_session_stats' } }));
     const result = await f.reader.read();
-    assert.equal(result.unavailableReason, 'snapshot-denied');
+    assert.equal(result.unavailableReason, 'snapshot-unsupported');
     assert.equal(result.tps, null);
+    const calls = f.requests.length;
+    f.advance(29999);
+    assert.equal((await f.reader.read()).unavailableReason, 'snapshot-unsupported');
+    assert.equal(f.requests.length, calls);
     const posts = f.requests.filter(request => request.init.method === 'POST');
     assert.equal(posts.length, 1);
     assert.deepEqual(JSON.parse(posts[0].init.body).events[0].payload.request,
-        { subtype: 'read_file', path: PATH, max_bytes: 16384, encoding: 'utf-8' });
+        { subtype: 'claudepp_session_stats', protocolVersion: 1, organizationId: ORG });
+    f.advance(1);
+    await f.reader.read();
+    assert.equal(f.requests.filter(request => request.init.method === 'POST').length, 2);
 });

@@ -20,9 +20,9 @@ async function fixture(t, options = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'claude-stats-publisher-')));
     const claudeData = path.join(root, 'desktop');
     const workspace = path.join(root, 'workspace');
-    const userHome = path.join(root, 'home');
+    const claudeHome = path.join(root, 'home');
     await fs.mkdir(workspace);
-    await fs.mkdir(userHome);
+    await fs.mkdir(claudeHome);
     const metadata = path.join(claudeData, 'claude-code-sessions', ACCOUNT, ORG, `${LOCAL}.json`);
     await fs.mkdir(path.dirname(metadata), { recursive: true });
     const row = { sessionId: LOCAL, cliSessionId: CLI, cwd: workspace, bridgeSessionIds: [BRIDGE] };
@@ -30,17 +30,129 @@ async function fixture(t, options = {}) {
     await write(row);
     let stats = { ...STATS, private: 'do not export', threadId: CLI };
     let clock = 100000;
-    const publisherOptions = typeof options === 'function' ? await options({ root, claudeData, workspace, userHome }) : options;
+    const publisherOptions = typeof options === 'function' ? await options({ root, claudeData, workspace, claudeHome }) : options;
     const store = publisherOptions.store || { async getStats(id) { assert.equal(id, CLI); return stats; } };
-    const publisher = createSnapshotPublisher({ claudeData, userHome, store, now: () => clock,
+    const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, now: () => clock,
         pollMs: 100000, publisherId: PUBLISHER, ...publisherOptions });
     t.after(async () => { await publisher.stop(); await fs.rm(root, { recursive: true, force: true }); });
-    const directory = path.join(publisherOptions.userHome ?? userHome, '.claude-plusplus', 'session-stats');
+    const directory = path.join(publisherOptions.claudeHome ?? claudeHome, '.session-stats');
     const destination = path.join(directory, `${BRIDGE}.json`);
     const snapshot = async () => JSON.parse(await fs.readFile(destination, 'utf8'));
-    return { root, claudeData, workspace, userHome, metadata, row, write, publisher, directory,
+    return { root, claudeData, workspace, claudeHome, metadata, row, write, publisher, directory,
         destination, snapshot, setStats(value) { stats = value; }, setClock(value) { clock = value; } };
 }
+
+test('configured Claude directory owns publication while legacy user snapshots stay untouched', async t => {
+    const f = await fixture(t, async ({ root }) => {
+        const claudeHome = path.join(root, 'custom-config');
+        await fs.mkdir(claudeHome);
+        return { claudeHome };
+    });
+    const legacyDirectory = path.join(f.root, 'legacy-home', '.claude-plusplus', 'session-stats');
+    const legacyDestination = path.join(legacyDirectory, `${BRIDGE}.json`);
+    await fs.mkdir(legacyDirectory, { recursive: true });
+    const legacy = Buffer.from('legacy snapshot left untouched');
+    await fs.writeFile(legacyDestination, legacy);
+    const destination = path.join(f.root, 'custom-config', '.session-stats', `${BRIDGE}.json`);
+    await f.publisher.start();
+    assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    await f.publisher.stop();
+    await assert.rejects(fs.stat(destination), { code: 'ENOENT' });
+    assert.deepEqual(await fs.readFile(legacyDestination), legacy);
+});
+
+for (const location of ['workspace', 'workspace-child'])
+test(`explicit Claude configuration at ${location} remains publishable`, async t => {
+    let claudeHome;
+    const f = await fixture(t, async ({ workspace }) => {
+        claudeHome = location === 'workspace' ? workspace : path.join(workspace, '.custom-claude');
+        await fs.mkdir(claudeHome, { recursive: true });
+        return { claudeHome };
+    });
+    await f.publisher.start();
+    const destination = path.join(claudeHome, '.session-stats', `${BRIDGE}.json`);
+    assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'ok');
+});
+
+test('snapshot publisher rejects relative Claude configuration directories', () => {
+    assert.throws(() => createSnapshotPublisher({ claudeHome: 'relative-config' }));
+});
+
+test('publisher defaults to CLAUDE_CONFIG_DIR when the caller has not supplied a resolved root', async t => {
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    t.after(() => {
+        if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = previous;
+    });
+    let claudeHome;
+    const f = await fixture(t, async ({ root }) => {
+        claudeHome = path.join(root, 'environment-config');
+        await fs.mkdir(claudeHome);
+        process.env.CLAUDE_CONFIG_DIR = claudeHome;
+        return { claudeHome: undefined };
+    });
+    await f.publisher.start();
+    const destination = path.join(claudeHome, '.session-stats', `${BRIDGE}.json`);
+    assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    await assert.rejects(fs.stat(f.directory), { code: 'ENOENT' });
+});
+
+test('an unset CLAUDE_CONFIG_DIR publishes inside the default home Claude hidden snapshot directory', async t => {
+    const names = ['CLAUDE_CONFIG_DIR', 'HOME', 'USERPROFILE'];
+    const previous = new Map(names.map(name => [name, process.env[name]]));
+    t.after(() => {
+        for (const [name, value] of previous) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+    });
+    const f = await fixture(t, async ({ root }) => {
+        const userHome = path.join(root, 'default-home');
+        await fs.mkdir(path.join(userHome, '.claude'), { recursive: true });
+        process.env.HOME = userHome;
+        process.env.USERPROFILE = userHome;
+        delete process.env.CLAUDE_CONFIG_DIR;
+        return { claudeHome: undefined };
+    });
+    await f.publisher.start();
+    const destination = path.join(f.root, 'default-home', '.claude', '.session-stats', `${BRIDGE}.json`);
+    assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    await assert.rejects(fs.stat(f.directory), { code: 'ENOENT' });
+});
+
+test('remote snapshot reads reuse the committed local sample without recomputing or exposing mutable cache', async t => {
+    let samples = 0;
+    const f = await fixture(t, { store: { async getStats() { samples++; return STATS; } } });
+    await f.publisher.start();
+    const local = await f.publisher.readLocal(LOCAL);
+    const published = await f.snapshot(), before = samples;
+    const remote = await f.publisher.readRemoteSnapshot(BRIDGE.replace('session_', 'cse_'), { organizationId: ORG });
+    assert.deepEqual(remote, published);
+    assert.equal(remote.revision, local.snapshotRevision);
+    assert.equal(remote.stats.totalTokens, local.totalTokens);
+    remote.stats.totalTokens = 999;
+    assert.deepEqual(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), published);
+    assert.equal(samples, before);
+});
+
+test('remote snapshots require an exact supported bridge organization and agent selection', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    for (const [bridge, options] of [[BRIDGE, {}], [BRIDGE, { organizationId: ACCOUNT }],
+        [LOCAL, { organizationId: ORG }], ['../snapshot', { organizationId: ORG }],
+        ['session_unknown', { organizationId: ORG }], [BRIDGE, { organizationId: ORG, agentId: '../a' }],
+        [BRIDGE, { organizationId: ORG, agentId: 'missing' }]])
+        assert.equal(await f.publisher.readRemoteSnapshot(bridge, options), null);
+});
+
+test('remote snapshots reject a newly ambiguous bridge before the next publication poll', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
+        sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI }));
+    assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), null);
+});
 
 test('background publication writes allowlisted stats and local reads return the exact shared revision', async t => {
     const f = await fixture(t);
@@ -761,11 +873,15 @@ test('refuses unknown destination ownership and preserves unrelated project file
     assert.equal(await fs.readFile(path.join(f.directory, 'keep.txt'), 'utf8'), 'keep');
 });
 
-test('refuses directory junctions below the user home without writing outside it', async t => {
-    const f = await fixture(t);
-    const outside = path.join(f.root, 'outside');
-    await fs.mkdir(outside);
-    await fs.symlink(outside, path.join(f.userHome, '.claude-plusplus'), 'junction');
+test('refuses a linked Claude configuration directory without writing outside it', async t => {
+    let outside;
+    const f = await fixture(t, async ({ root }) => {
+        outside = path.join(root, 'outside');
+        const claudeHome = path.join(root, 'config-alias');
+        await fs.mkdir(outside);
+        await fs.symlink(outside, claudeHome, 'junction');
+        return { claudeHome };
+    });
     await f.publisher.start();
     assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable');
     assert.deepEqual(await fs.readdir(outside), []);
@@ -773,19 +889,18 @@ test('refuses directory junctions below the user home without writing outside it
 
 test('a linked session-stats directory cannot redirect generated files into a project', async t => {
     const f = await fixture(t);
-    await fs.mkdir(path.dirname(f.directory));
     await fs.symlink(f.workspace, f.directory, 'junction');
     await f.publisher.start();
     assert.equal((await f.publisher.readLocal(LOCAL)).snapshotUnavailableReason, 'publish-failed');
     assert.deepEqual(await fs.readdir(f.workspace), []);
 });
 
-for (const level of ['home', 'state-root', 'session-stats'])
+for (const level of ['config-root', 'session-stats'])
 test(`${level} replaced during a snapshot write cannot redirect publication or cleanup into a project`, async t => {
     const f = await fixture(t);
     await f.publisher.start();
     const original = await f.snapshot();
-    const directory = level === 'home' ? f.userHome : level === 'state-root' ? path.dirname(f.directory) : f.directory;
+    const directory = level === 'config-root' ? f.claudeHome : f.directory;
     const moved = path.join(f.root, 'moved-storage');
     const open = fs.open;
     let replaced = false;
@@ -999,7 +1114,8 @@ test('returning bindings preserve monotonic revisions for the lifetime of the pu
     assert.equal((await f.snapshot()).revision, restored.snapshotRevision);
 });
 
-async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, stage = 'before-open' } = {}) {
+async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, stage = 'before-open',
+    readSnapshot = () => f.publisher.readLocal(LOCAL, { waitForPoll: false }) } = {}) {
     const destination = await fs.realpath(f.destination);
     let entered, releaseWait, timer, armHold, reads = 0, paused = false, released = false;
     const ready = new Promise(resolve => { entered = resolve; });
@@ -1032,7 +1148,7 @@ async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, sta
         return originalOpen(file, flags, ...args);
     });
     t.after(release);
-    const read = f.publisher.readLocal(LOCAL, { waitForPoll: false });
+    const read = readSnapshot();
     const local = Promise.race([read, deadline]);
     void local.catch(() => {});
     try {
@@ -1042,6 +1158,57 @@ async function pauseLocalValidation(t, f, { timeoutMs = 5000, holdMs = 5000, sta
     } catch (error) { release(); throw error; }
     return { local, release };
 }
+
+for (const change of ['publisher', 'stats', 'revision', 'rebound', 'ambiguous', 'expired'])
+test(`remote snapshot validation rejects ${change} changes across its asynchronous file read`, async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const stage = ['publisher', 'stats', 'revision'].includes(change) ? 'before-open' : 'after-close';
+    const paused = await pauseLocalValidation(t, f, { stage,
+        readSnapshot: () => f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }) });
+    try {
+        if (change === 'rebound') await f.write({ ...f.row, cliSessionId: SECOND_CLI });
+        else if (change === 'ambiguous') {
+            await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
+                sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI }));
+        } else if (change === 'expired') f.setClock(131000);
+        else {
+            const replacement = await f.snapshot();
+            if (change === 'publisher') replacement.publisherId = OTHER_PUBLISHER;
+            if (change === 'stats') replacement.stats.totalTokens = 999;
+            if (change === 'revision') replacement.revision++;
+            await fs.writeFile(f.destination, JSON.stringify(replacement));
+        }
+    } finally { paused.release(); }
+    assert.equal(await paused.local, null);
+});
+
+test('remote snapshot cancellation releases a blocked read without invalidating its cached sample', async t => {
+    const f = await fixture(t), controller = new AbortController();
+    await f.publisher.start();
+    const published = await f.snapshot();
+    const paused = await pauseLocalValidation(t, f, { stage: 'after-close',
+        readSnapshot: () => f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, signal: controller.signal }) });
+    controller.abort();
+    try { assert.equal(await within(paused.local), null); }
+    finally { paused.release(); }
+    assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG, signal: controller.signal }), null);
+    assert.deepEqual(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), published);
+});
+
+test('remote snapshot stop releases a blocked read and never restarts publication', async t => {
+    const f = await fixture(t);
+    assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), null);
+    await f.publisher.start();
+    const paused = await pauseLocalValidation(t, f, { stage: 'after-close',
+        readSnapshot: () => f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }) });
+    try {
+        await f.publisher.stop();
+        assert.equal(await within(paused.local), null);
+    } finally { paused.release(); }
+    assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), null);
+    await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
+});
 
 test('a workspace alias never redirects the fixed snapshot destination', async t => {
     const f = await fixture(t);
@@ -1262,18 +1429,13 @@ test('identity changes invalidate delayed local validation before it can return 
     assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
 });
 
-test('user storage overlapping a workspace is rejected before any generated write', async t => {
-    for (const location of ['home-is-workspace', 'home-in-workspace', 'workspace-is-storage', 'workspace-in-storage', 'home-junction']) {
+test('snapshot storage containing a workspace is rejected before any generated write', async t => {
+    for (const location of ['workspace-is-storage', 'workspace-in-storage', 'home-junction']) {
         await t.test(location, async t => {
             const f = await fixture(t, async ({ root, workspace }) => {
-                if (location === 'home-is-workspace') return { userHome: workspace };
-                if (location === 'home-in-workspace') {
-                    const userHome = path.join(workspace, 'home'); await fs.mkdir(userHome);
-                    return { userHome };
-                }
                 if (location === 'home-junction') {
-                    const userHome = path.join(root, 'home-alias'); await fs.symlink(workspace, userHome, 'junction');
-                    return { userHome };
+                    const claudeHome = path.join(root, 'home-alias'); await fs.symlink(workspace, claudeHome, 'junction');
+                    return { claudeHome };
                 }
                 return {};
             });
@@ -1291,12 +1453,13 @@ test('user storage overlapping a workspace is rejected before any generated writ
     }
 });
 
-test('user storage inside another discovered workspace prevents all publication there', async t => {
+test('snapshot storage containing another discovered workspace prevents all publication there', async t => {
     const f = await fixture(t);
+    await fs.mkdir(f.directory);
     await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
-        sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, cwd: f.userHome, bridgeSessionIds: ['session_second'] }));
+        sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, cwd: f.directory, bridgeSessionIds: ['session_second'] }));
     await f.publisher.start();
-    assert.equal(await fs.stat(f.directory).then(() => true, () => false), false);
+    assert.deepEqual(await fs.readdir(f.directory), []);
 });
 
 test('a second workspace discovered by final confirmation also blocks overlapping user storage', async t => {
@@ -1305,13 +1468,14 @@ test('a second workspace discovered by final confirmation also blocks overlappin
         if (!sampled) {
             sampled = true;
             await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
-                sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, cwd: f.userHome, bridgeSessionIds: ['session_second'] }));
+                sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, cwd: f.directory, bridgeSessionIds: ['session_second'] }));
         }
         return STATS;
     } } });
+    await fs.mkdir(f.directory);
     await f.publisher.start();
     assert.equal(sampled, true);
-    assert.equal(await fs.stat(f.directory).then(() => true, () => false), false);
+    assert.deepEqual(await fs.readdir(f.directory), []);
 });
 
 test('a new organization binding takes over one user filename without old-owner cleanup deleting it', async t => {
@@ -1346,7 +1510,7 @@ test('publication ignores unavailable tweak roots and never creates a workspace 
 
 test('Windows case variants of the same physical user home retain their fixed destination',
     { skip: process.platform !== 'win32' }, async t => {
-        const f = await fixture(t, async ({ userHome }) => ({ userHome: userHome.toUpperCase() }));
+        const f = await fixture(t, async ({ claudeHome }) => ({ claudeHome: claudeHome.toUpperCase() }));
         await f.publisher.start();
         assert.deepEqual((await f.snapshot()).stats, STATS);
         assert.deepEqual(await fs.readdir(f.workspace), []);

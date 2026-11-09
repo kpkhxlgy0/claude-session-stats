@@ -13,9 +13,9 @@ const wire = () => ({ schemaVersion: 1, producer: 'claude-session-stats', ...bin
 
 test('snapshot names are fixed to one validated bridge ID', () => {
     assert.equal(protocol.normalizeBridgeId('cse_Test123'), 'session_Test123');
-    assert.equal(protocol.snapshotPath('cse_Test123'), '~/.claude-plusplus/session-stats/session_Test123.json');
+    assert.equal(protocol.snapshotFilename('cse_Test123'), 'session_Test123.json');
     for (const value of ['../other', 'session_../other', 'session_', 'session_a/b', null])
-        assert.equal(protocol.snapshotPath(value), null);
+        assert.equal(protocol.snapshotFilename(value), null);
 });
 
 test('publisher projects exact metrics and strips private source data', () => {
@@ -62,6 +62,6 @@ test('unavailable source data cannot retain a previous numeric sample', () => {
 
 test('snapshot factory runs standalone in an isolated renderer realm', () => {
     const isolated = vm.runInNewContext('(' + createSnapshotProtocol.toString() + ')()');
-    assert.equal(isolated.snapshotPath('session_Test123'), '~/.claude-plusplus/session-stats/session_Test123.json');
+    assert.equal(isolated.snapshotFilename('session_Test123'), 'session_Test123.json');
     assert.equal(isolated.parseSnapshot(JSON.stringify(wire()), { ...binding, now: 105000 }).snapshot?.stats.tps, 25.125);
 });
