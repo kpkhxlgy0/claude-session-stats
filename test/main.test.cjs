@@ -12,6 +12,7 @@ function fixture(extra = {}, apiExtra = {}) {
     const options = { claudeData: 'unused', claudeHome: 'unused', ipcMain: { handle() {}, removeHandler() {} },
         publisher: { start() {}, readLocal: async () => null, stop() {} },
         metadataPublisher: { start() {}, stop() {} },
+        snapshotAccess: { start() {}, stop() {} },
         resolveSession: async (_, id) => id === LOCAL ? CLI : null,
         store: { getStats: async id => { calls.push(id); return { status: 'ok', threadId: id, turns: 3, tps: null }; },
             dispose() { disposed = true; } }, ...extra };
@@ -123,6 +124,23 @@ test('failed metadata startup preserves local statistics and cleanup', async () 
     await f.controller.stop();
     assert.equal(stopped, 1);
     assert.equal(f.disposed(), true);
+});
+
+test('automatic snapshot access starts with the producer and stops exactly once', async () => {
+    const events = [];
+    const f = fixture({ snapshotAccess: { start() { events.push('start'); }, stop() { events.push('stop'); } } });
+    assert.deepEqual(events, ['start']);
+    assert.equal((await f.read(LOCAL)).turns, 3);
+    await f.controller.stop(); await f.controller.stop();
+    assert.deepEqual(events, ['start', 'stop']);
+});
+
+test('unavailable native directory access does not break local stats or metadata publication', async () => {
+    let stopped = 0;
+    const f = fixture({ snapshotAccess: { start() { throw Error('native unavailable'); }, stop() { stopped++; } } });
+    assert.equal((await f.read(LOCAL)).turns, 3);
+    await f.controller.stop();
+    assert.equal(stopped, 1);
 });
 
 test('tweak stop waits for metadata shutdown while immediately revoking local reads', async () => {

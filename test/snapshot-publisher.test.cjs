@@ -81,6 +81,48 @@ test('snapshot publisher rejects relative Claude configuration directories', () 
     assert.throws(() => createSnapshotPublisher({ claudeHome: 'relative-config' }));
 });
 
+test('local access exports only the published fixed directory and rechecks the session before a grant', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const expected = { localSessionId: LOCAL, cliSessionId: CLI, bridgeSessionId: BRIDGE,
+        organizationId: ORG, accountId: ACCOUNT, directory: f.directory };
+    assert.deepEqual(f.publisher.listLocalSnapshotAccess(), [expected]);
+    assert.equal(await f.publisher.verifyLocalSnapshotAccess(expected), true);
+    assert.equal(await f.publisher.verifyLocalSnapshotAccess({ ...expected, directory: f.claudeHome }), false);
+    assert.equal(await f.publisher.verifyLocalSnapshotAccess({ ...expected, cliSessionId: ACCOUNT }), false);
+    await f.write({ ...f.row, cliSessionId: ACCOUNT });
+    assert.equal(await f.publisher.verifyLocalSnapshotAccess(expected), false);
+    await f.publisher.stop();
+    assert.deepEqual(f.publisher.listLocalSnapshotAccess(), []);
+});
+
+test('unpublished and disabled RC sessions do not request snapshot directory access', async t => {
+    const f = await fixture(t);
+    assert.deepEqual(f.publisher.listLocalSnapshotAccess(), []);
+    await f.write({ ...f.row, remoteControlUserEnabled: false });
+    await f.publisher.start();
+    assert.deepEqual(f.publisher.listLocalSnapshotAccess(), []);
+});
+
+test('snapshot access rejects a directory replaced by a junction after publication', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const [candidate] = f.publisher.listLocalSnapshotAccess();
+    await fs.rename(f.directory, `${f.directory}-original`);
+    await fs.symlink(f.workspace, f.directory, 'junction');
+    assert.equal(await f.publisher.verifyLocalSnapshotAccess(candidate), false);
+});
+
+test('snapshot access rejects a newly ambiguous local identity before the next publisher poll', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const [candidate] = f.publisher.listLocalSnapshotAccess();
+    const duplicate = path.join(f.claudeData, 'claude-code-sessions', PUBLISHER, ORG, `${LOCAL}.json`);
+    await fs.mkdir(path.dirname(duplicate), { recursive: true });
+    await fs.writeFile(duplicate, JSON.stringify(f.row));
+    assert.equal(await f.publisher.verifyLocalSnapshotAccess(candidate), false);
+});
+
 test('publisher defaults to CLAUDE_CONFIG_DIR when the caller has not supplied a resolved root', async t => {
     const previous = process.env.CLAUDE_CONFIG_DIR;
     t.after(() => {

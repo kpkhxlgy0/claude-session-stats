@@ -25,6 +25,7 @@ function startMain(api, options = {}) {
     let stopped = false;
     let stopping;
     let metadataPublisher;
+    let snapshotAccess;
     try {
         Promise.resolve(publisher.start()).catch(() => api.log.info('Session Stats snapshot publisher could not start'));
     } catch { api.log.info('Session Stats snapshot publisher could not start'); }
@@ -34,6 +35,13 @@ function startMain(api, options = {}) {
                 fetch: options.metadataFetch ?? ((...args) => require('electron').net.fetch(...args)) });
         Promise.resolve(metadataPublisher.start()).catch(() => api.log.info('Session Stats metadata publisher could not start'));
     } catch { api.log.info('Session Stats metadata publisher could not start'); }
+    try {
+        snapshotAccess = options.snapshotAccess
+            ?? require('./snapshot-access.cjs').createSnapshotAccess({ source: publisher,
+                getWebContents: options.getWebContents ?? (() => require('electron').webContents.getAllWebContents()),
+                log: message => api.log.info(message) });
+        Promise.resolve(snapshotAccess.start()).catch(() => api.log.info('Session Stats snapshot directory access could not start'));
+    } catch { api.log.info('Session Stats snapshot directory access could not start'); }
     api.ipc.handle('stats', async sessionId => {
         const unavailable = { threadId: isLocalId(sessionId) ? sessionId : null, status: 'unavailable', tps: null };
         if (stopped || !isLocalId(sessionId)) return unavailable;
@@ -101,7 +109,7 @@ function startMain(api, options = {}) {
         if (stopped) return stopping;
         stopped = true;
         const shutdown = [];
-        for (const target of [metadataPublisher, publisher]) {
+        for (const target of [snapshotAccess, metadataPublisher, publisher]) {
             try { shutdown.push(Promise.resolve(target?.stop()).catch(() => {})); } catch {}
         }
         stopping = Promise.all(shutdown).then(() => {});

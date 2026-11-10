@@ -19,10 +19,14 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-当前版本：[v0.10.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.10.0)。
+当前版本：[v0.10.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.10.1)。
 
 自 v0.8.0 起，快照保存在运行端的 `<CLAUDE_CONFIG_DIR>/.session-stats`，未设置时为 `~/.claude/.session-stats`。
 Remote Control 通过会话元数据发现运行端真实快照目录，再用原生 `read_file` 按需读取当前主会话或子代理。两端均需 Claude++ 0.3.9 或更新版本及 Session Stats 0.10.0。
+自 v0.10.1 起，运行端会自动通过 Desktop 的原生目录接口，把自己的 `.session-stats` 目录加入对应本地会话的附加目录权限。
+已有的有效 Remote Control 会话会补齐，新会话获得 RC 绑定后自动处理，无需输入 `/add-dir` 或发送附件。
+仅授权统计目录，不改项目文件或全局权限；会话身份、目录或原生接口无法确认时等待重试。
+目录授权由 Desktop 保存在会话中，启用中的 CLI 由 Desktop 异步同步；接口接受授权不等于已确认远端读取成功。
 仅更新 Session Stats 支持热加载。Claude++ 0.3.10 清理了旧核心适配，推荐一并更新；更新核心时需完全退出并重新启动 Claude。
 
 也可以使用 PowerShell 7 运行仓库根目录的脚本：

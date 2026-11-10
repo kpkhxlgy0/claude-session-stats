@@ -866,6 +866,37 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
             }));
     }
 
+    function localAccess(binding) {
+        return { localSessionId: binding.localSessionId, cliSessionId: binding.cliSessionId,
+            bridgeSessionId: binding.bridgeSessionId, organizationId: binding.organizationId,
+            accountId: binding.accountId, directory: snapshotDirectory };
+    }
+
+    function listLocalSnapshotAccess() {
+        const ready = new Set(listRemoteBindings().map(binding => JSON.stringify([
+            binding.bridgeSessionId, binding.organizationId, binding.accountId])));
+        return [...knownParents.values()].filter(binding => ready.has(JSON.stringify([
+            binding.bridgeSessionId, binding.organizationId, binding.accountId]))).map(localAccess);
+    }
+
+    async function verifyLocalSnapshotAccess(candidate) {
+        if (!candidate || stopped) return false;
+        const keys = ['localSessionId', 'cliSessionId', 'bridgeSessionId', 'organizationId', 'accountId', 'directory'];
+        const matches = () => listLocalSnapshotAccess().filter(value => keys.every(key => value[key] === candidate[key]));
+        if (matches().length !== 1) return false;
+        const binding = [...knownParents.values()].find(value => keys.every(key => localAccess(value)[key] === candidate[key]));
+        const runEpoch = epoch;
+        try {
+            if (!binding) return false;
+            const { parents } = await scanParents([binding]);
+            if (!alive(runEpoch) || !parents.some(parent => bindingKey(parent) === bindingKey(binding))
+                || !await recheckSnapshotBinding(binding, { resolveWorkspace })) return false;
+            const expected = await directories(binding, false);
+            await confirmDirectories(expected);
+            return alive(runEpoch) && matches().length === 1;
+        } catch { return false; }
+    }
+
     async function readRemoteLocation(bridgeSessionId, { organizationId, signal } = {}) {
         // 目录与本地发布目标保持一致；只校验主快照，不批量读取或上传子代理。
         const snapshot = await readRemoteSnapshot(bridgeSessionId, { organizationId, signal });
@@ -886,6 +917,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         })();
         return stopPending;
     }
-    return { start, readLocal, readRemoteSnapshot, listRemoteBindings, readRemoteLocation, stop };
+    return { start, readLocal, readRemoteSnapshot, listRemoteBindings, readRemoteLocation,
+        listLocalSnapshotAccess, verifyLocalSnapshotAccess, stop };
 }
 module.exports = { createSnapshotPublisher };
