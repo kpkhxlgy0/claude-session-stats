@@ -19,11 +19,11 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-当前版本：[v0.8.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.8.0)。
+当前版本：[v0.9.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.9.0)。
 
 自 v0.8.0 起，快照保存在运行端的 `<CLAUDE_CONFIG_DIR>/.session-stats`，未设置时为 `~/.claude/.session-stats`。
-Remote Control 通过 Claude++ 的专用统计接口接收数值。两端均需 Claude++ 0.3.9 和 Session Stats 0.8.0 或更新版本。
-升级时先完全退出 Claude，安装或更新 Claude++ 核心，再安装或更新 Session Stats 并重新启动 Claude，使核心适配生效。
+Remote Control 通过 Claude 原生会话元数据同步统计。两端均需 Claude++ 0.3.9 或更新版本及 Session Stats 0.9.0；旧版 stats RPC 不能用于 Desktop 本地 Code 的 Remote Control。
+仅更新 Session Stats 支持热加载。Claude++ 0.3.10 清理了旧核心适配，推荐一并更新；更新核心时需完全退出并重新启动 Claude。
 
 也可以使用 PowerShell 7 运行仓库根目录的脚本：
 
@@ -121,7 +121,7 @@ Desktop fork 使用会话元数据中的父子关系，核对副本与源日志�
   日志与快照使用同一个配置根目录。旧版用户目录和项目内的快照及备份保留原位，不混入新目录的统计。
   快照只包含统计数值、会话/组织标识、发布者标识、递增版本和更新时间，不包含正文、原始日志路径或认证信息。
 - 子代理使用同目录的 `session_<id>.agent-<agentId>.json` 独立快照，并验证所属会话、组织和子代理 ID。
-  主会话使用 v1 快照，子代理使用 v2 快照。**两端均需 Claude++ 0.3.9 和 Session Stats 0.8.0 或更新版本**。
+  主会话使用 v1 快照，子代理使用 v2 快照。**两端均需 Claude++ 0.3.9 或更新版本及 Session Stats 0.9.0**。
 - 后台每 2 秒调度刷新，即使会话不在当前可见标签页也能更新。主会话、后台子代理和本地前台目标分别调度，慢子代理不占用主会话刷新队列。
   子代理以有界小批采集并及时发布，后台仍覆盖未在本机显示的子代理，供 Remote Control 读取；实际刷新时长取决于日志和校验成本。
   全局最多 4 个快照并行发布，同一目标写入保持串行。等待开始的相同父绑定校验和全局发现可合并；每次仍重新检查会话登记和目录身份，耗时的 Git/进程查询按下述规则短暂复用。
@@ -137,13 +137,19 @@ Desktop fork 使用会话元数据中的父子关系，核对副本与源日志�
 - Git 工作树关联和进程查询最多复用 2 秒。工作目录、会话登记与目录身份继续实时检查；Git 控制文件及工作树登记变化会触发原生重查，无法安全确认缓存时也重新查询。
   缓存命中不会延长有效期；登记文件未反映的进程退出/复用，以及未纳入控制指纹的外部 Git 配置变化，最迟在该短窗口到期后重新确认。
   Desktop 仅更新标题、活动信息或计数时，重新读取稳定元数据并确认绑定语义未变，不再仅因文件版本变化而清掉统计。
-- 接收端通过当前 Desktop 页面已有登录态发送 `claudepp_session_stats` 控制请求，只指定组织和可选子代理 ID。
-  Claude++ 核心从原生连接取得真实会话 ID，调用已注册的统计 provider；tweak 核对唯一绑定，返回同一份已发布快照。
-  请求不传文件路径、不触发模型生成、不读取 Cookie/令牌、不开放额外服务，也不修改 Claude 的文件读取权限。
-  主会话和子代理共用该通道，分别校验身份；停用、取消或连接关闭后的旧请求不能返回统计。
-  核心适配按 Desktop 版本、模块哈希和明确调用点校验，当前支持运行端 Desktop `4.23118.0`。
-  未适配或未升级的运行端显示接口不支持，不回退到猜测目录或文件读取。
-  仅由独立 CLI 启动、没有 Claude++ Desktop 桥接的 Remote Control 会话不在该核心适配范围内。
+- 运行端复用 Electron 当前登录态，通过原生会话 API 把已验证的父/子代理快照写入
+  `client_metadata.claudepp_session_stats`，仅更新自己的字段。请求携带组织和 `X-Expected-Account` 账户约束；
+  每次先确认精确会话身份、非共享 bridge 和连接状态。接收端只需会话 ID，不需要知道运行端目录。
+  每个会话最多每 10 秒发布一次，最多两个会话并行；调度器保留最多 32 个会话状态，更多绑定轮转处理。
+  跨轮转保留最多 4096 条发布者和退避记录，达到上限时停止接纳新网络绑定，避免丢失旧发布者的退休记录。
+  失败采用有上限的退避。本地统计不依赖网络成功，停用会中止后续网络写入。
+- 接收页面沿用已有登录态 GET 会话元数据，选取当前主会话或精确子代理快照，并验证身份、大小、时效和版本。
+  读取结果替换显示，不累加快照、不重新计算远程日志，不发送聊天消息或控制请求。无需修改 CLI 或安装原生模块补丁。
+  单个快照仍限 16 KiB；每个会话元数据包含最多 128 个子代理，总大小限 256 KiB。
+  停用后保留最后一份云端数值摘要，其 30 秒有效期不会延长；不盲删可能已由新发布者接管的字段。
+  本地快照文件仍按原规则清理。未知元数据格式不会被覆盖，另一发布者的新鲜快照不会被抢写。
+  写入前用服务端 JSON Patch `test` 比较先前读到的值，冲突时重试读取，禁止无条件覆盖；字段不存在时比较元数据根对象。
+  热重载或重启产生新发布者时，须等待旧发布者快照过期后接管，首次同步可能延迟约 30 秒。
 - 默认每 5 秒刷新；同一身份只有一个进行中的请求，每次最多等待 12 秒，失败后等待 30 秒重试。
   底栏等待最多 750ms 后先返回已确认状态。网络传输会使两端暂时看到不同版本；同一快照版本的全部数值完全相同。
 - 快照最多 16 KiB；校验会话、组织、发布者、版本顺序和数值。超过 30 秒未更新或来自未来超过 5 秒的数据不可用。
@@ -185,7 +191,8 @@ npm run validate
 `src/fork-metadata.cjs` 核对 Desktop fork 的父子映射，`src/fork-history.cjs` 有界读取和验证继承来源，只扩展 TPS 样本。
 `src/snapshot.cjs` 定义两端共用的快照协议；`src/snapshot-bindings.cjs` 和 `src/snapshot-publisher.cjs` 负责运行端映射和后台发布。
 `src/cli-workspace.cjs` 核对 CLI 活动会话与工作树目录，避免 Desktop 初始目录与实际运行目录不一致。
-`src/remote-reader.cjs` 在当前页面通过 RC 获取快照，`src/remote-bridge.cjs` 负责主 frame 校验与 IPC 清理。
+`src/metadata-protocol.cjs` 定义有界会话元数据封装，`src/metadata-publisher.cjs` 负责经过账户校验的后台同步。
+`src/remote-reader.cjs` 在当前页面 GET 会话元数据，`src/remote-bridge.cjs` 负责主 frame 校验与 IPC 清理。
 
 本项目沿用 [Codex++ Session Stats](https://github.com/kpkhxlgy0/session-stats) 的五项显示、增量读取和安装脚本设计，
 保留其 MIT 许可；Claude 的数据口径、会话映射及 renderer 打包单独适配。

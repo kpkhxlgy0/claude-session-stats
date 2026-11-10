@@ -24,21 +24,16 @@ function startMain(api, options = {}) {
     const protocol = createSnapshotProtocol();
     let stopped = false;
     let stopping;
-    let registration;
+    let metadataPublisher;
     try {
         Promise.resolve(publisher.start()).catch(() => api.log.info('Session Stats snapshot publisher could not start'));
     } catch { api.log.info('Session Stats snapshot publisher could not start'); }
     try {
-        registration = api.sessionStats?.registerProvider(async context => {
-            if (stopped || context.signal.aborted) return null;
-            try {
-                const snapshot = await publisher.readRemoteSnapshot(context.bridgeSessionId, {
-                    organizationId: context.organizationId, agentId: context.agentId, signal: context.signal });
-                return stopped || context.signal.aborted ? null : snapshot;
-            } catch { return null; }
-        });
-        if (!registration) api.log.info('Session Stats Remote Control requires the core session-stats capability');
-    } catch { api.log.info('Session Stats Remote Control provider could not register'); }
+        metadataPublisher = options.metadataPublisher
+            ?? require('./metadata-publisher.cjs').createMetadataPublisher({ source: publisher,
+                fetch: options.metadataFetch ?? ((...args) => require('electron').net.fetch(...args)) });
+        Promise.resolve(metadataPublisher.start()).catch(() => api.log.info('Session Stats metadata publisher could not start'));
+    } catch { api.log.info('Session Stats metadata publisher could not start'); }
     api.ipc.handle('stats', async sessionId => {
         const unavailable = { threadId: isLocalId(sessionId) ? sessionId : null, status: 'unavailable', tps: null };
         if (stopped || !isLocalId(sessionId)) return unavailable;
@@ -105,9 +100,11 @@ function startMain(api, options = {}) {
     return { stop() {
         if (stopped) return stopping;
         stopped = true;
-        try { registration?.unregister(); } catch {}
-        try { stopping = Promise.resolve(publisher.stop()).catch(() => {}); }
-        catch { stopping = Promise.resolve(); }
+        const shutdown = [];
+        for (const target of [metadataPublisher, publisher]) {
+            try { shutdown.push(Promise.resolve(target?.stop()).catch(() => {})); } catch {}
+        }
+        stopping = Promise.all(shutdown).then(() => {});
         store.dispose(); remote.stop(); binding.stop(); remoteAgents.stop();
         // IPC 注册由 Claude++ 的 API lease 在 stop 后清理。
         return stopping;

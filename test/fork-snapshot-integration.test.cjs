@@ -6,8 +6,14 @@ const path = require('node:path');
 const { test } = require('node:test');
 const { JSDOM } = require('jsdom');
 const { startMain } = require('../src/main.cjs');
+const { createSessionStore } = require('../src/session-store.cjs');
+const { createDesktopForkResolver } = require('../src/fork-metadata.cjs');
+const { createCliWorkspaceResolver } = require('../src/cli-workspace.cjs');
+const { createSnapshotPublisher } = require('../src/snapshot-publisher.cjs');
+const { createMetadataPublisher } = require('../src/metadata-publisher.cjs');
 const { createSnapshotProtocol } = require('../src/snapshot.cjs');
 const { createRemoteReader } = require('../src/remote-reader.cjs');
+const { createMetadataApi } = require('./helpers/metadata-api.cjs');
 
 const PARENT = '11111111-1111-4111-8111-111111111111';
 const CHILD = '22222222-2222-4222-8222-222222222222';
@@ -49,66 +55,74 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         const editor = dom.window.document.querySelector('.ProseMirror');
         editor.getClientRects = () => [{ width: 100 }];
         editor.__reactFiber$test = { return: { memoizedProps: { value: { activeOrganization: { uuid: ORG } } } } };
-        let sequence = 0, handler, controller, remoteProvider;
-        const events = [];
-        dom.window.fetch = async (raw, init) => {
-            const url = new URL(raw); let body;
-            assert.equal(url.origin, 'https://claude.ai');
-            assert.equal(init.credentials, 'include');
-            assert.equal(init.headers['x-organization-uuid'], ORG);
-            if (url.pathname === '/v1/code/sessions/' + BRIDGE)
-                body = { session: { id: BRIDGE.replace('session_', 'cse_'), environment_kind: 'bridge', connection_status: 'connected' } };
-            else {
-                assert.equal(url.pathname, '/v1/code/sessions/' + BRIDGE + '/events');
-                if (init.method === 'POST') {
-                    const request = JSON.parse(init.body).events[0].payload;
-                    assert.deepEqual(request.request, { subtype: 'claudepp_session_stats', protocolVersion: 1, organizationId: ORG });
-                    const snapshot = await remoteProvider({ bridgeSessionId: BRIDGE, organizationId: ORG, signal: init.signal });
-                    assert.deepEqual(snapshot, JSON.parse(await fs.readFile(destination, 'utf8')));
-                    events.push({ sequence_num: ++sequence, payload: { type: 'control_response', response: {
-                        request_id: request.request_id, subtype: 'success', response: { protocolVersion: 1, snapshot } } } });
-                    body = {};
-                } else body = { data: url.searchParams.get('sort_order') === 'desc' ? events.slice(-1)
-                    : events.filter(e => e.sequence_num > Number(url.searchParams.get('cursor') ?? 0)), resume_cursor: String(sequence) };
-            }
-            return { ok: true, text: async () => JSON.stringify(body) };
-        };
-        const receiver = createRemoteReader(dom.window, createSnapshotProtocol, { pollMs: 0, errorBackoffMs: 0, responsePollMs: 0 });
+        let time = 100000, handler, controller, publisher, metadataPublisher;
+        const metadataApi = createMetadataApi({ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT });
+        dom.window.fetch = metadataApi.readerFetch;
+        const receiver = createRemoteReader(dom.window, createSnapshotProtocol,
+            { now: () => time, pollMs: 0, errorBackoffMs: 0 });
         const api = { manifest: { id: 'com.kpk.session-stats' }, log: { info() {} },
-            sessionStats: { registerProvider(provider) { remoteProvider = provider;
-                return { unregister() { remoteProvider = null; } }; } },
             ipc: { handle(name, fn) { if (name === 'stats') handler = fn; } } };
-        const options = { claudeData, claudeHome, ipcMain: { handle() {}, removeHandler() {} } };
+        function startController() {
+            const store = createSessionStore({ claudeHome,
+                resolveFork: createDesktopForkResolver({ claudeData }).resolveFork });
+            publisher = createSnapshotPublisher({ claudeData, claudeHome, store, now: () => time,
+                resolveWorkspace: createCliWorkspaceResolver({ claudeHome }), pollMs: 600000 });
+            metadataPublisher = createMetadataPublisher({ source: publisher, fetch: metadataApi.writerFetch,
+                now: () => time, pollMs: 600000 });
+            controller = startMain(api, { claudeData, claudeHome, store, publisher, metadataPublisher,
+                ipcMain: { handle() {}, removeHandler() {} } });
+        }
         t.after(async () => { receiver.stop(); dom.window.close(); await controller?.stop(); await fs.rm(root, { recursive: true }); });
-        controller = startMain(api, options);
+        startController();
         const fields = ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheHit',
             'tps', 'usageComplete', 'snapshotGeneratedAt', 'snapshotRevision', 'snapshotPublisherId'];
         async function compare(expected) {
             let local;
             const deadline = Date.now() + 5000;
             do {
+                await publisher.start();
                 local = await handler('local_' + CHILD);
                 if (local.status === 'ok' && local.tps === expected) break;
                 await new Promise(resolve => setTimeout(resolve, 20));
             } while (Date.now() < deadline);
+            await metadataPublisher.start();
             const remote = await receiver.read();
             assert.equal(local.status, 'ok');
             assert.equal(local.tps, expected);
             assert.equal(remote.status, 'ok');
             for (const field of fields) assert.equal(remote[field], local[field], field);
             await assert.rejects(fs.stat(path.join(workspace, '.claude', 'session-stats')), { code: 'ENOENT' });
-            assert.equal(JSON.parse(await fs.readFile(destination, 'utf8')).stats.tps, expected);
+            const snapshot = JSON.parse(await fs.readFile(destination, 'utf8'));
+            assert.equal(snapshot.stats.tps, expected);
+            assert.deepEqual(metadataApi.envelope().parent, snapshot);
+            assert.deepEqual(metadataApi.envelope().agents, []);
+            const writes = metadataApi.writes().length;
+            assert.deepEqual(await receiver.read(), remote);
+            await metadataPublisher.start();
+            assert.equal(metadataApi.writes().length, writes);
             return local;
         }
         const initial = await compare(200);
+        assert.equal(initial.totalTokens, mode === 'desktop-copy' ? null : 1100);
+        time += 10000;
         await fs.appendFile(parentFile, encode(turn(PARENT, 'parent-later', 10, 1, 10000, inherited.at(-1).uuid)));
         await fs.appendFile(childFile, encode(turn(CHILD, 'm2', 4000, 20, 1000, copied.at(-1).uuid)));
         const next = await compare(80);
         assert.ok(next.snapshotRevision > initial.snapshotRevision);
         assert.equal(next.steps, mode === 'desktop-copy' ? 1 : 2);
+        assert.equal(next.totalTokens, mode === 'desktop-copy' ? 1100 : 2200);
+        const beforeRestart = structuredClone(metadataApi.envelope());
         await controller.stop();
-        controller = startMain(api, options);
-        await compare(80);
+        assert.deepEqual(metadataApi.envelope(), beforeRestart, 'stop leaves the last cloud snapshot to expire');
+        startController();
+        await publisher.start();
+        await metadataPublisher.start();
+        assert.deepEqual(metadataApi.envelope(), beforeRestart, 'successor waits for the previous publisher to expire');
+        assert.equal((await receiver.read()).snapshotPublisherId, next.snapshotPublisherId);
+        time += 30001;
+        const restarted = await compare(80);
+        assert.notEqual(restarted.snapshotPublisherId, next.snapshotPublisherId);
+        time += 10000;
         await fs.unlink(parentFile);
         const missing = await compare(null);
         assert.equal(missing.steps, mode === 'desktop-copy' ? 1 : 2);

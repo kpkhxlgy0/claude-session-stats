@@ -1,14 +1,15 @@
 'use strict';
 
-// 此函数被序列化到调用方页面；原始事件、快照内容和登录态始终留在该页面内。
+const { createMetadataProtocol } = require('./metadata-protocol.cjs');
+
+// 此函数被序列化到调用方页面；会话元数据、快照内容和登录态始终留在该页面内。
 function createRemoteReader(win, createSnapshotProtocol, options = {}) {
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const protocol = createSnapshotProtocol();
+    const metadata = createMetadataProtocol(createSnapshotProtocol);
     const now = options.now ?? Date.now;
     const maxFiberDepth = 512;
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-    const sequence = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value
-        : typeof value === 'string' && /^\d{1,16}$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
     const failure = reason => Object.assign(new Error(reason), { reason });
     let state = null, stopped = false;
 
@@ -79,21 +80,8 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         }
         return current.result;
     }
-    function utf8Bytes(text) {
-        let size = 0;
-        for (const char of text) {
-            const point = char.codePointAt(0);
-            size += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
-        }
-        return size;
-    }
-    function accept(current, response) {
-        if (!record(response) || Object.keys(response).length !== 2
-            || !Object.hasOwn(response, 'protocolVersion') || response.protocolVersion !== 1
-            || !Object.hasOwn(response, 'snapshot') || !record(response.snapshot)) throw failure('snapshot-invalid');
-        const text = JSON.stringify(response.snapshot);
-        if (text.length > protocol.maxBytes || utf8Bytes(text) > protocol.maxBytes) throw failure('snapshot-invalid');
-        const parsed = protocol.parseSnapshot(text, { bridgeSessionId: current.bound.threadId,
+    function accept(current, value) {
+        const parsed = metadata.readSnapshot(value, { bridgeSessionId: current.bound.threadId,
             organizationId: current.bound.org, agentId: current.bound.agentId, now: now() });
         if (!parsed.ok) throw failure(`snapshot-${parsed.reason}`);
         const sample = parsed.snapshot, previous = current.accepted;
@@ -116,27 +104,6 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             snapshotGeneratedAt: sample.generatedAt, snapshotRevision: sample.revision,
             snapshotPublisherId: sample.publisherId };
     }
-    function readPage(value, cursor, descending = false) {
-        if (!record(value) || !Array.isArray(value.data) || value.data.length > (descending ? 1 : 500))
-            throw failure('snapshot-invalid');
-        let latest = cursor, previous = -1;
-        for (const event of value.data) {
-            const seq = sequence(event?.sequence_num);
-            if (!record(event) || !record(event.payload) || seq === null || seq <= previous)
-                throw failure('snapshot-invalid');
-            previous = seq; latest = Math.max(latest, seq);
-        }
-        for (const field of ['next_cursor', 'resume_cursor']) {
-            if (value[field] !== undefined && value[field] !== null && value[field] !== '') {
-                const parsed = sequence(value[field]);
-                if (parsed === null || parsed < latest) throw failure('snapshot-invalid');
-                latest = parsed;
-            }
-        }
-        const hasNext = value.next_cursor !== undefined && value.next_cursor !== null && value.next_cursor !== '';
-        if (!descending && hasNext && latest <= cursor) throw failure('snapshot-invalid');
-        return { events: value.data, cursor: latest, hasNext };
-    }
     async function update(current) {
         const controller = new AbortController(); current.controller = controller;
         let timedOut = false, rejectAbort;
@@ -147,30 +114,19 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         const headers = { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29',
             'anthropic-client-feature': 'ccr', 'x-organization-uuid': current.bound.org };
         const base = `https://claude.ai/v1/code/sessions/${current.bound.threadId}`;
-        async function request(url, body) {
+        async function request() {
             if (!valid(current) || controller.signal.aborted) throw failure('transport');
-            const response = await Promise.race([win.fetch(url, { method: body ? 'POST' : 'GET', credentials: 'include',
-                headers: body ? { ...headers, 'content-type': 'application/json' } : headers,
-                signal: controller.signal, cache: 'no-store', redirect: 'error', ...(body ? { body: JSON.stringify(body) } : {}) }), aborted]);
+            const response = await Promise.race([win.fetch(base, { method: 'GET', credentials: 'include', headers,
+                signal: controller.signal, cache: 'no-store', redirect: 'error' }), aborted]);
             if (!response.ok || !valid(current) || controller.signal.aborted) throw failure('transport');
-            if (body) return;
             const text = await Promise.race([response.text(), aborted]);
             if (!valid(current) || controller.signal.aborted) throw failure('transport');
             if (typeof text !== 'string' || text.length > 8 * 1024 * 1024) throw failure('snapshot-invalid');
             try { return JSON.parse(text); } catch { throw failure('snapshot-invalid'); }
         }
-        async function wait() {
-            await new Promise((resolve, reject) => {
-                let waiting;
-                const finish = () => { clearTimeout(waiting); controller.signal.removeEventListener('abort', abort); resolve(); };
-                const abort = () => { clearTimeout(waiting); controller.signal.removeEventListener('abort', abort); reject(failure('transport')); };
-                if (controller.signal.aborted) return abort();
-                controller.signal.addEventListener('abort', abort, { once: true });
-                waiting = setTimeout(finish, options.responsePollMs ?? 250);
-            });
-        }
         try {
-            const detail = await request(base);
+            const detail = await request();
+            if (!record(detail)) throw failure('snapshot-invalid');
             const session = detail.session ?? (record(detail.response_shape) && 'id' in detail.response_shape ? detail.response_shape : null);
             if (detail.shared || detail.is_shared || !record(session) || session.shared || session.is_shared
                 || protocol.normalizeBridgeId(session.id) !== current.bound.threadId
@@ -179,37 +135,9 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             }
             current.trusted = true;
             if ((session.connection_status ?? detail.connection_status) !== 'connected') throw failure('offline');
-            if (!current.result) current.result = unavailable(current, 'pending');
-            const initial = readPage(await request(`${base}/events?${new URLSearchParams({ limit: '1', sort_order: 'desc' })}`), 0, true);
-            let cursor = initial.cursor;
-            const requestId = win.crypto.randomUUID();
-            // 请求由会话自身处理；原生不支持时不尝试文件或其他数据源。
-            await request(`${base}/events`, { events: [{ payload: { type: 'control_request', uuid: win.crypto.randomUUID(),
-                request_id: requestId, request: { subtype: 'claudepp_session_stats', protocolVersion: 1,
-                    organizationId: current.bound.org, ...(current.bound.agentId ? { agentId: current.bound.agentId } : {}) } } }] });
-            for (let page = 0; page < (options.maxPages ?? 128); page++) {
-                const params = new URLSearchParams({ limit: '500', sort_order: 'asc', cursor: String(cursor) });
-                const data = readPage(await request(`${base}/events?${params}`), cursor);
-                for (const event of data.events) {
-                    if (sequence(event.sequence_num) <= cursor) continue;
-                    const payload = event.payload;
-                    if (payload.type !== 'control_response' || !record(payload.response) || payload.response.request_id !== requestId) continue;
-                    const reply = payload.response;
-                    if (reply.subtype === 'error') {
-                        const error = typeof reply.error === 'string' ? reply.error.toLowerCase() : '';
-                        throw failure(/denied|permission|eacces/.test(error) ? 'snapshot-denied'
-                            : /enoent|not found|no such file/.test(error) ? 'snapshot-missing'
-                                : /unsupported|unknown.*request|not implemented|does not handle control_request subtype/.test(error)
-                                    ? 'snapshot-unsupported' : error === 'session-stats-unavailable'
-                                        ? 'source-unavailable' : 'snapshot-invalid');
-                    }
-                    if (reply.subtype !== 'success') throw failure('snapshot-invalid');
-                    return accept(current, reply.response);
-                }
-                cursor = data.cursor;
-                if (!data.hasNext) await wait();
-            }
-            throw failure('timeout');
+            if (session.client_metadata !== undefined && session.client_metadata !== null
+                && !record(session.client_metadata)) throw failure('snapshot-invalid');
+            return accept(current, session.client_metadata?.[metadata.key]);
         } catch (error) {
             if (!valid(current)) return null;
             return current.trusted ? unavailable(current, timedOut ? 'timeout' : error.reason ?? 'transport') : null;
@@ -252,6 +180,7 @@ function buildRemoteScripts(owner) {
         return `(() => { const key = Symbol.for(${key});
             if (!window[key]) {
                 const protocol = (() => { const module = { exports: {} }; ${protocol}\nreturn module.exports; })();
+                const createMetadataProtocol = ${createMetadataProtocol.toString()};
                 const makeReader = ${createRemoteReader.toString()};
                 const bindings = (${createSubagentBindings.toString()})();
                 const parent = makeReader(window, protocol.createSnapshotProtocol), agents = new Map();

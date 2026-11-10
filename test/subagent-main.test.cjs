@@ -12,6 +12,7 @@ function fixture(t,extra={}) {
     const controller=startMain(api,{claudeData:'unused',claudeHome:'unused',
         ipcMain:{handle(){},removeHandler(){}},resolveSession:async()=>CLI,
         publisher:{start(){},stop(){},readLocal:async()=>null},
+        metadataPublisher:{start(){},stop(){}},
         store:{getStats(){assert.fail('must not substitute parent stats');},
             async getAgentStats(parent,agentId){calls.push([parent,agentId]);return{status:'ok',threadId:parent,agentId,turns:1,tps:42};},dispose(){}},
         ...extra});

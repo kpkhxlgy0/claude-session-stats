@@ -855,6 +855,73 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         finally { if (abort) signal.removeEventListener('abort', abort); }
     }
 
+    function listRemoteBindings() {
+        if (stopped) return [];
+        const ready = new Set([...states.values()].filter(state => state.snapshot)
+            .map(state => bindingKey(parentBinding(state.binding))));
+        return [...knownParents.values()].filter(binding => ready.has(bindingKey(binding))
+            && !invalidParents.has(bindingKey(binding))).map(binding => ({
+                bridgeSessionId: binding.bridgeSessionId, organizationId: binding.organizationId,
+                accountId: binding.accountId,
+            }));
+    }
+
+    async function readRemoteSnapshots(bridgeSessionId, { organizationId, signal } = {}) {
+        const bridge = protocol.normalizeBridgeId(bridgeSessionId);
+        if (!bridge || typeof organizationId !== 'string' || stopped || signal?.aborted
+            || signal && (typeof signal.addEventListener !== 'function'
+                || typeof signal.removeEventListener !== 'function')) return null;
+        const parents = [...knownParents.values()].filter(binding => binding.bridgeSessionId === bridge
+            && binding.organizationId === organizationId.toLowerCase() && !invalidParents.has(bindingKey(binding)));
+        if (parents.length !== 1) return null;
+        const parent = parents[0], key = bindingKey(parent), runEpoch = epoch;
+        const active = () => alive(runEpoch) && !signal?.aborted && knownParents.has(key)
+            && !invalidParents.has(key);
+        async function verify() {
+            if (!active()) return false;
+            const found = await scanParents([parent]);
+            return active() && found.parents.some(binding => bindingKey(binding) === key)
+                && await current(parent, runEpoch);
+        }
+        let abort;
+        const collect = async () => {
+            if (!await verify()) return null;
+            const children = new Set(await listChildren(parent, runEpoch));
+            const candidates = [...states.values()].filter(state => state.snapshot
+                && bindingKey(parentBinding(state.binding)) === key
+                && (state.binding.agentId === undefined || children.has(state.binding.agentId)));
+            if (!active() || candidates.length > MaxAgentsPerParent + 1) return null;
+            const samples = new Map();
+            // 复用已发布文件的所有权校验；批量读取前后统一确认全局会话身份。
+            await limited(candidates, async state => {
+                if (!active()) return;
+                const snapshot = await readPublished(state, {
+                    valid: active, verify: () => active() && current(parent, runEpoch),
+                });
+                if (snapshot) samples.set(state, snapshot);
+            }, runEpoch, MaxConcurrentPublications);
+            if (!await verify()) return null;
+            const confirmedChildren = new Set(await listChildren(parent, runEpoch));
+            if (!await verify()) return null;
+            // 最终身份确认期间的新失效发布不能复活较旧的成功样本。
+            const result = [...samples].filter(([state, snapshot]) => states.get(bindingKey(state.binding)) === state
+                && state.snapshot && (state.snapshot.revision === snapshot.revision
+                    || snapshot.stats.status === 'ok' && state.snapshot.stats.status === 'ok')
+                && (state.binding.agentId === undefined || confirmedChildren.has(state.binding.agentId)))
+                .map(([, snapshot]) => snapshot);
+            return result.length ? result : null;
+        };
+        try {
+            const aborted = signal && new Promise(resolve => {
+                abort = () => resolve(null);
+                signal.addEventListener('abort', abort, { once: true });
+            });
+            const result = await Promise.race([collect(), cancelled, ...(aborted ? [aborted] : [])]);
+            return active() ? result : null;
+        } catch { return null; }
+        finally { if (abort) signal.removeEventListener('abort', abort); }
+    }
+
     function stop() {
         if (stopPending) return stopPending;
         stopped = true; epoch++;
@@ -867,6 +934,6 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
         })();
         return stopPending;
     }
-    return { start, readLocal, readRemoteSnapshot, stop };
+    return { start, readLocal, readRemoteSnapshot, listRemoteBindings, readRemoteSnapshots, stop };
 }
 module.exports = { createSnapshotPublisher };

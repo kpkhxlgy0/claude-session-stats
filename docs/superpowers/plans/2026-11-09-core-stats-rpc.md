@@ -38,3 +38,20 @@ explicitly authorized after local installation and restart verification; Store p
   passive diagnostics were removed from the release source.
 - Live Remote Control validation of the cross-machine session remains pending the other endpoint's update. A local
   request timed out while that endpoint's installed core version was unknown; this is not a successful remote test.
+
+## Post-release finding and approved feasibility probe
+
+After both endpoints were updated, Desktop local Code was found to delegate its Remote Control bridge to its CLI
+child. The published Desktop adapters do not intercept that path. The inspected CLI SDK/headless bridge does not
+register the shared-request/read-file callbacks or forward unknown requests to its Desktop parent. The existing
+RPC implementation therefore does not establish support for this Desktop Remote Control path.
+
+The user subsequently approved testing a `client_metadata` transport and explicitly ruled out modifying the CLI.
+This approved experiment differs from Codex++ by storing the numeric payload on the authenticated session service
+rather than reading a producer-side file over native filesystem RPC. The live probe verified isolated-field add,
+update, main-to-receiver readback, sibling preservation and deletion; see the
+[validation record](../validation/2026-11-09-client-metadata-probe.md).
+
+That approval and result covered feasibility testing only. The user then explicitly approved implementation; see the
+[metadata implementation plan](2026-11-09-client-metadata-stats.md) and its linked validation. These working-tree
+changes have not been released. Do not describe the existing 0.8.0 release as a completed fix for the CLI-owned path.

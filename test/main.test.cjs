@@ -11,6 +11,7 @@ function fixture(extra = {}, apiExtra = {}) {
         ipc: { handle(name, fn) { if (name === 'stats') handler = fn; } }, log: { info() {} }, ...apiExtra };
     const options = { claudeData: 'unused', claudeHome: 'unused', ipcMain: { handle() {}, removeHandler() {} },
         publisher: { start() {}, readLocal: async () => null, stop() {} },
+        metadataPublisher: { start() {}, stop() {} },
         resolveSession: async (_, id) => id === LOCAL ? CLI : null,
         store: { getStats: async id => { calls.push(id); return { status: 'ok', threadId: id, turns: 3, tps: null }; },
             dispose() { disposed = true; } }, ...extra };
@@ -101,45 +102,37 @@ test('dispose during final identity confirmation also invalidates reply', async 
     assert.equal((await pending).status, 'unavailable');
 });
 
-test('core provider returns the publisher sample for the authenticated parent or child without recomputing', async () => {
-    let provider, unregistered = 0;
-    const seen = [], sample = { revision: 7, stats: { turns: 4, tps: 35.125 } };
-    const f = fixture({ publisher: { start() {}, stop() {}, readLocal: async () => null,
-        async readRemoteSnapshot(id, options) { seen.push({ id, options }); return sample; } } },
-    { sessionStats: { registerProvider(handler) { provider = handler; return { unregister() { unregistered++; } }; } } });
-    const signal = new AbortController().signal;
-    for (const agentId of [undefined, 'agent_A']) {
-        assert.equal(await provider({ bridgeSessionId: 'session_Test', organizationId: CLI, agentId, signal }), sample);
-        assert.deepEqual(seen.at(-1), { id: 'session_Test', options: { organizationId: CLI, agentId, signal } });
-    }
-    assert.deepEqual(f.calls, []);
-    f.controller.stop(); f.controller.stop();
-    assert.equal(unregistered, 1);
-    assert.equal(await provider({ bridgeSessionId: 'session_Test', organizationId: CLI, signal }), null);
-    assert.equal(seen.length, 2);
+test('metadata publisher starts and stops once without registering the obsolete core RPC', async () => {
+    const events = [];
+    let registrations = 0;
+    const f = fixture({
+        metadataPublisher: { start() { events.push('metadata-start'); }, stop() { events.push('metadata-stop'); } },
+        publisher: { start() { events.push('source-start'); }, readLocal: async () => null,
+            stop() { events.push('source-stop'); } },
+    }, { sessionStats: { registerProvider() { registrations++; } } });
+    assert.equal(registrations, 0);
+    assert.deepEqual(events, ['source-start', 'metadata-start']);
+    await f.controller.stop(); await f.controller.stop();
+    assert.deepEqual(events, ['source-start', 'metadata-start', 'metadata-stop', 'source-stop']);
 });
 
-test('core provider drops canceled and late replies after tweak stop', async () => {
-    let provider, finish, reads = 0;
-    const controller = new AbortController();
-    const f = fixture({ publisher: { start() {}, stop() {}, readLocal: async () => null,
-        readRemoteSnapshot() { reads++; return new Promise(resolve => { finish = resolve; }); } } },
-    { sessionStats: { registerProvider(handler) { provider = handler; return { unregister() {} }; } } });
-    const context = { bridgeSessionId: 'session_Test', organizationId: CLI, signal: controller.signal };
-    const pending = provider(context);
-    assert.equal(reads, 1);
-    controller.abort(); finish({ revision: 1 });
-    assert.equal(await pending, null);
-    assert.equal(await provider(context), null);
-    const fresh = { ...context, signal: new AbortController().signal };
-    const late = provider(fresh);
-    f.controller.stop(); finish({ revision: 2 });
-    assert.equal(await late, null);
-});
-
-test('unavailable core provider registration preserves local statistics and cleanup', async () => {
-    const f = fixture({}, { sessionStats: { registerProvider() { throw new Error('unsupported'); } } });
+test('failed metadata startup preserves local statistics and cleanup', async () => {
+    let stopped = 0;
+    const f = fixture({ metadataPublisher: { start() { throw Error('offline'); }, stop() { stopped++; } } });
     assert.equal((await f.read(LOCAL)).turns, 3);
     await f.controller.stop();
+    assert.equal(stopped, 1);
     assert.equal(f.disposed(), true);
+});
+
+test('tweak stop waits for metadata shutdown while immediately revoking local reads', async () => {
+    let finish;
+    const f = fixture({ metadataPublisher: { start() {}, stop() { return new Promise(resolve => { finish = resolve; }); } } });
+    let completed = false;
+    const pending = f.controller.stop().then(() => { completed = true; });
+    await Promise.resolve();
+    assert.equal(completed, false);
+    assert.equal((await f.read(LOCAL)).status, 'unavailable');
+    finish(); await pending;
+    assert.equal(completed, true);
 });

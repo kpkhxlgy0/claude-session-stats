@@ -119,7 +119,7 @@ const SnapshotUnavailable = {
     transport: '统计快照连接暂不可用',
     'snapshot-missing': '运行端尚未生成统计快照，请在运行端安装或更新 Session Stats',
     'snapshot-denied': '运行端未授权当前会话的统计请求',
-    'snapshot-unsupported': '运行端未启用统计接口，请更新 Claude++ 和 Session Stats 并重启运行端 Claude',
+    'snapshot-unsupported': '运行端尚未发布此版本的统计快照，请更新两端 Session Stats',
     'snapshot-invalid': '运行端统计快照数据无效',
     'snapshot-identity': '统计快照与当前会话或组织不匹配',
     'snapshot-expired': '统计快照已过期，等待运行端更新',
@@ -150,7 +150,7 @@ function makeBar(doc, remote, agentId) {
     fields.steps.title = `${scope}的模型响应次数，按消息 ID 去重；不等于工具调用次数`;
     fields.tps.title = (agentId ? '当前子代理平均 TPS（估算）：' : '整个会话平均 TPS（估算）：包含 fork 继承的已验证历史；')
         + '有效响应样本的输出 tokens 总和 ÷ 对应耗时总和；'
-        + (remote ? '由运行端原始会话日志计算，通过 RC 读取同一统计快照；同步可能有数秒延迟。' : '以已确认日志为范围。')
+        + (remote ? '由运行端原始会话日志计算，通过会话同步读取统计快照；通常约 10 秒更新一次。' : '以已确认日志为范围。')
         + '耗时从用户输入或工具返回计至响应记录，包含首 Token 等待和网络耗时。'
         + '新输入、工具执行和后续生成期间保留已有平均值；缺少有效样本时显示 —。';
     return { bar, fields };
