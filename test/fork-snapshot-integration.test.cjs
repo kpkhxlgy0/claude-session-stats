@@ -56,7 +56,7 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         editor.getClientRects = () => [{ width: 100 }];
         editor.__reactFiber$test = { return: { memoizedProps: { value: { activeOrganization: { uuid: ORG } } } } };
         let time = 100000, handler, controller, publisher, metadataPublisher;
-        const metadataApi = createMetadataApi({ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT });
+        const metadataApi = createMetadataApi({ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT, snapshotDirectory: path.dirname(destination) });
         dom.window.fetch = metadataApi.readerFetch;
         const receiver = createRemoteReader(dom.window, createSnapshotProtocol,
             { now: () => time, pollMs: 0, errorBackoffMs: 0 });
@@ -94,8 +94,10 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
             await assert.rejects(fs.stat(path.join(workspace, '.claude', 'session-stats')), { code: 'ENOENT' });
             const snapshot = JSON.parse(await fs.readFile(destination, 'utf8'));
             assert.equal(snapshot.stats.tps, expected);
-            assert.deepEqual(metadataApi.envelope().parent, snapshot);
-            assert.deepEqual(metadataApi.envelope().agents, []);
+            assert.equal(metadataApi.envelope().directory, path.dirname(destination).replaceAll('\\', '/'));
+            assert.equal(metadataApi.envelope().publisherId, snapshot.publisherId);
+            assert.equal(path.resolve(metadataApi.reads().at(-1).path), destination);
+            assert.equal('agents' in metadataApi.envelope() || 'parent' in metadataApi.envelope(), false);
             const writes = metadataApi.writes().length;
             assert.deepEqual(await receiver.read(), remote);
             await metadataPublisher.start();
@@ -113,12 +115,15 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         assert.equal(next.totalTokens, mode === 'desktop-copy' ? 1100 : 2200);
         const beforeRestart = structuredClone(metadataApi.envelope());
         await controller.stop();
-        assert.deepEqual(metadataApi.envelope(), beforeRestart, 'stop leaves the last cloud snapshot to expire');
+        assert.deepEqual(metadataApi.envelope(), beforeRestart, 'stop leaves the last cloud location to expire');
         startController();
         await publisher.start();
         await metadataPublisher.start();
         assert.deepEqual(metadataApi.envelope(), beforeRestart, 'successor waits for the previous publisher to expire');
-        assert.equal((await receiver.read()).snapshotPublisherId, next.snapshotPublisherId);
+        const handover = await receiver.read();
+        assert.equal(handover.status, 'unavailable');
+        assert.equal(handover.unavailableReason, 'snapshot-identity');
+        assert.equal(handover.totalTokens, null, 'new file cannot be read under the previous location owner');
         time += 30001;
         const restarted = await compare(80);
         assert.notEqual(restarted.snapshotPublisherId, next.snapshotPublisherId);

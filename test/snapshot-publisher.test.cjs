@@ -56,6 +56,8 @@ test('configured Claude directory owns publication while legacy user snapshots s
     const destination = path.join(f.root, 'custom-config', '.session-stats', `${BRIDGE}.json`);
     await f.publisher.start();
     assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory,
+        path.dirname(destination));
     await f.publisher.stop();
     await assert.rejects(fs.stat(destination), { code: 'ENOENT' });
     assert.deepEqual(await fs.readFile(legacyDestination), legacy);
@@ -95,6 +97,8 @@ test('publisher defaults to CLAUDE_CONFIG_DIR when the caller has not supplied a
     await f.publisher.start();
     const destination = path.join(claudeHome, '.session-stats', `${BRIDGE}.json`);
     assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory,
+        path.dirname(destination));
     await assert.rejects(fs.stat(f.directory), { code: 'ENOENT' });
 });
 
@@ -118,6 +122,8 @@ test('an unset CLAUDE_CONFIG_DIR publishes inside the default home Claude hidden
     await f.publisher.start();
     const destination = path.join(f.root, 'default-home', '.claude', '.session-stats', `${BRIDGE}.json`);
     assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
+    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory,
+        path.dirname(destination));
     await assert.rejects(fs.stat(f.directory), { code: 'ENOENT' });
 });
 
@@ -154,99 +160,67 @@ test('remote snapshots reject a newly ambiguous bridge before the next publicati
     assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), null);
 });
 
-test('metadata source exports verified parent and children without recomputing or sharing mutable samples', async t => {
-    let samples = 0;
+test('metadata source advertises only the real directory regardless of child count', async t => {
+    let samples = 0, lists = 0;
     const f = await fixture(t, { store: {
         async getStats() { samples++; return STATS; },
-        async listAgents() { return ['child_A']; },
+        async listAgents() { lists++; return Array.from({ length: 65 }, (_, i) => `child_${i}`); },
         async getAgentStats(id, agentId) { samples++; return { ...STATS, threadId: id, agentId }; },
     } });
     assert.deepEqual(f.publisher.listRemoteBindings(), []);
     await f.publisher.start();
     assert.deepEqual(f.publisher.listRemoteBindings(), [{ bridgeSessionId: BRIDGE,
         organizationId: ORG, accountId: ACCOUNT }]);
-    const before = samples;
-    const snapshots = await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG });
-    assert.equal(snapshots.length, 2);
-    assert.deepEqual(snapshots.find(value => value.schemaVersion === 1), await f.snapshot());
-    assert.equal(snapshots.find(value => value.schemaVersion === 2).agentId, 'child_A');
-    assert.equal(samples, before);
-    snapshots[0].stats.totalTokens = 999;
-    const again = await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG });
-    assert.equal(again.every(value => value.stats.totalTokens === STATS.totalTokens), true);
-    assert.equal(samples, before);
+    const before = { samples, lists }, published = await f.snapshot();
+    const location = await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG });
+    assert.deepEqual(location, { bridgeSessionId: BRIDGE, organizationId: ORG, publisherId: PUBLISHER,
+        generatedAt: published.generatedAt, directory: f.directory });
+    assert.deepEqual({ samples, lists }, before, 'directory lookup does not enumerate or recalculate children');
+    assert.equal(f.publisher.readRemoteSnapshots, undefined, 'bulk exporter is removed');
+    location.directory = 'changed';
+    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory, f.directory);
     await f.publisher.stop();
     assert.deepEqual(f.publisher.listRemoteBindings(), []);
-    assert.equal(await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG }), null);
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null);
 });
 
-test('metadata source excludes stale snapshots and rejects canceled or foreign bindings', async t => {
+test('metadata directory requires a fresh exact binding and honors cancellation', async t => {
     const f = await fixture(t);
     await f.publisher.start();
-    assert.equal(await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ACCOUNT }), null);
-    assert.equal(await f.publisher.readRemoteSnapshots('../foreign', { organizationId: ORG }), null);
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ACCOUNT }), null);
+    assert.equal(await f.publisher.readRemoteLocation('../foreign', { organizationId: ORG }), null);
     const controller = new AbortController(); controller.abort();
-    assert.equal(await f.publisher.readRemoteSnapshots(BRIDGE,
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE,
         { organizationId: ORG, signal: controller.signal }), null);
     f.setClock(131000);
-    assert.equal(await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG }), null);
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null);
 });
 
-test('metadata source cancellation releases file validation without losing the committed local sample', async t => {
+test('metadata directory lookup cancellation releases validation without altering the local sample', async t => {
     const f = await fixture(t), controller = new AbortController();
     await f.publisher.start();
     const published = await f.snapshot();
     const paused = await pauseLocalValidation(t, f, { stage: 'after-close', readSnapshot: () =>
-        f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG, signal: controller.signal }) });
+        f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG, signal: controller.signal }) });
     controller.abort();
     try { assert.equal(await within(paused.local), null); }
     finally { paused.release(); }
-    assert.deepEqual(await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG }), [published]);
+    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory, f.directory);
+    assert.deepEqual(await f.snapshot(), published);
 });
 
-test('metadata source rejects identity changes during snapshot file validation', async t => {
+test('metadata directory rejects identity changes during source verification', async t => {
     const f = await fixture(t);
     await f.publisher.start();
     const paused = await pauseLocalValidation(t, f, { stage: 'after-close', readSnapshot: () =>
-        f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG }) });
+        f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }) });
     try { await f.write({ ...f.row, cliSessionId: SECOND_CLI }); }
     finally { paused.release(); }
     assert.equal(await paused.local, null);
 });
 
-for (const status of ['unavailable', 'ok'])
-test(`metadata source rechecks a newer ${status} commit after collecting its successful snapshot`, async t => {
-    let stats = STATS, confirming = false, lists = 0, entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const blocked = new Promise(resolve => { release = resolve; });
-    t.after(() => release());
-    const f = await fixture(t, { store: {
-        async getStats() { return stats; },
-        async listAgents() {
-            if (confirming && ++lists === 2) { entered(); await blocked; }
-            return [];
-        },
-    } });
-    await f.publisher.start();
-    const published = await f.snapshot();
-    confirming = true;
-    const pending = f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG });
-    let latest;
-    try {
-        await within(ready, 1000);
-        stats = { ...STATS, turns: 4, status, usageComplete: status === 'ok' };
-        f.setClock(110000);
-        await f.publisher.start();
-        latest = await f.snapshot();
-        assert.ok(latest.revision > published.revision);
-        assert.equal(latest.stats.status, status);
-    } finally { release(); }
-    assert.deepEqual(await within(pending), status === 'ok' ? [published] : null);
-    assert.deepEqual(await f.snapshot(), latest);
-});
-
 for (const change of ['ambiguous', 'disabled', 'publisher'])
-test(`metadata source rejects ${change} ownership changes before the next poll`, async t => {
+test(`metadata directory rejects ${change} ownership changes before the next poll`, async t => {
     const f = await fixture(t);
     await f.publisher.start();
     if (change === 'ambiguous') {
@@ -254,7 +228,7 @@ test(`metadata source rejects ${change} ownership changes before the next poll`,
             sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI }));
     } else if (change === 'disabled') await f.write({ ...f.row, remoteControlUserEnabled: false });
     else await fs.writeFile(f.destination, JSON.stringify({ ...await f.snapshot(), publisherId: OTHER_PUBLISHER }));
-    assert.equal(await f.publisher.readRemoteSnapshots(BRIDGE, { organizationId: ORG }), null);
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null);
 });
 
 test('background publication writes allowlisted stats and local reads return the exact shared revision', async t => {

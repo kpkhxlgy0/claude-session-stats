@@ -14,7 +14,7 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 const failure = () => new Error('Metadata publication unavailable');
 
 function createMetadataPublisher({ source, fetch, now = Date.now, pollMs = 1000, timeoutMs = 5000 } = {}) {
-    if (typeof source?.listRemoteBindings !== 'function' || typeof source?.readRemoteSnapshots !== 'function'
+    if (typeof source?.listRemoteBindings !== 'function' || typeof source?.readRemoteLocation !== 'function'
         || typeof fetch !== 'function' || typeof now !== 'function') throw new TypeError('A metadata source and fetch are required');
     if (![pollMs, timeoutMs].every(value => Number.isSafeInteger(value) && value > 0))
         throw new RangeError('Invalid metadata publication interval');
@@ -109,7 +109,7 @@ function createMetadataPublisher({ source, fetch, now = Date.now, pollMs = 1000,
         const bound = state.bound;
         const url = `https://claude.ai/v1/code/sessions/${bound.bridgeSessionId}`;
         const serialized = body ? JSON.stringify(body) : null;
-        if (serialized && Buffer.byteLength(serialized, 'utf8') > MaxSessionBytes + metadata.maxBytes + 1024)
+        if (serialized && Buffer.byteLength(serialized, 'utf8') > MaxSessionBytes + metadata.legacyMaxBytes + 1024)
             throw failure();
         const headers = { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29',
             'anthropic-client-feature': 'ccr', 'x-organization-uuid': bound.organizationId,
@@ -138,13 +138,19 @@ function createMetadataPublisher({ source, fetch, now = Date.now, pollMs = 1000,
         if (container !== undefined && !record(container)) throw failure();
         if (!container || !Object.hasOwn(container, metadata.key))
             return { envelope: null, compare: { op: 'test', path: '', value: container ?? {} } };
-        const parsed = metadata.parseEnvelope(container[metadata.key], state.bound);
+        const value = container[metadata.key];
+        let descriptor = value;
+        if (typeof value === 'string') {
+            if (Buffer.byteLength(value, 'utf8') > metadata.legacyMaxBytes) throw failure();
+            try { descriptor = JSON.parse(value); } catch { throw failure(); }
+        }
+        const parsed = descriptor?.protocolVersion === 2
+            ? metadata.parseLocation(value, { ...state.bound, now: descriptor.generatedAt })
+            : metadata.parseEnvelope(value, state.bound);
         if (!parsed.ok) throw failure();
-        return { envelope: parsed.envelope,
+        return { envelope: parsed.location ?? parsed.envelope,
             compare: { op: 'test', path: `/${metadata.key}`, value: container[metadata.key] } };
     }
-
-    function samples(value) { return [...(value.parent ? [value.parent] : []), ...value.agents]; }
 
     function mayReplace(state, existing, candidate) {
         if (!existing) return true;
@@ -154,13 +160,9 @@ function createMetadataPublisher({ source, fetch, now = Date.now, pollMs = 1000,
             return now() - existing.generatedAt > protocol.maxAgeMs
                 && state.lostPublisher !== candidate.publisherId;
         }
-        const previous = new Map(samples(existing).map(value => [value.agentId ?? null, value]));
-        for (const sample of samples(candidate)) {
-            const old = previous.get(sample.agentId ?? null);
-            if (old && (sample.revision < old.revision || sample.generatedAt < old.generatedAt
-                || sample.revision === old.revision && JSON.stringify(sample) !== JSON.stringify(old))) return false;
-        }
-        return candidate.generatedAt >= existing.generatedAt;
+        if (existing.protocolVersion === 1) return now() - existing.generatedAt > protocol.maxAgeMs;
+        return candidate.generatedAt > existing.generatedAt
+            || candidate.generatedAt === existing.generatedAt && candidate.directory === existing.directory;
     }
 
     async function publish(state) {
@@ -169,10 +171,11 @@ function createMetadataPublisher({ source, fetch, now = Date.now, pollMs = 1000,
         try {
             const cloud = cloudEnvelope(await request(state), state), existing = cloud.envelope;
             if (!valid(state)) return;
-            const snapshots = await guarded(state, () => source.readRemoteSnapshots(state.bound.bridgeSessionId,
+            const raw = await guarded(state, () => source.readRemoteLocation(state.bound.bridgeSessionId,
                 { organizationId: state.bound.organizationId, signal: state.controller.signal }));
-            const candidate = metadata.makeEnvelope(snapshots, { ...state.bound, now: now() });
-            if (!candidate || !valid(state) || state.lostPublisher === candidate.publisherId
+            const candidate = metadata.makeLocation(raw);
+            if (!candidate || !metadata.parseLocation(candidate, { ...state.bound, now: now() }).ok) return;
+            if (!valid(state) || state.lostPublisher === candidate.publisherId
                 || !mayReplace(state, existing, candidate)) return;
             if (existing && JSON.stringify(existing) === JSON.stringify(candidate)) {
                 state.failures = 0;

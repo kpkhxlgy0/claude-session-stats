@@ -3,7 +3,11 @@
 function createMetadataProtocol(createSnapshotProtocol) {
     // 工厂也会序列化到已认证页面，不能依赖模块外的状态。
     const protocol = createSnapshotProtocol();
-    const key = 'claudepp_session_stats', maxBytes = 256 * 1024, maxAgents = 128;
+    const key = 'claudepp_session_stats', maxBytes = 8192, maxDirectoryChars = 4096;
+    const legacyMaxBytes = 256 * 1024, maxAgents = 128;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const locationKeys = ['protocolVersion', 'bridgeSessionId', 'organizationId', 'publisherId',
+        'generatedAt', 'directory'];
     const rootKeys = ['protocolVersion', 'bridgeSessionId', 'organizationId', 'publisherId',
         'generatedAt', 'parent', 'agents'];
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -32,7 +36,7 @@ function createMetadataProtocol(createSnapshotProtocol) {
     }
     function parseEnvelope(value, expected = {}) {
         if (value === undefined || value === null) return invalid('missing');
-        const text = encode(value, maxBytes);
+        const text = encode(value, legacyMaxBytes);
         if (!text) return invalid('invalid');
         let envelope;
         try { envelope = JSON.parse(text); } catch { return invalid('invalid'); }
@@ -100,9 +104,76 @@ function createMetadataProtocol(createSnapshotProtocol) {
         agents.sort((left, right) => left.agentId < right.agentId ? -1 : left.agentId > right.agentId ? 1 : 0);
         const envelope = { protocolVersion: 1, bridgeSessionId, organizationId, publisherId,
             generatedAt: newest, parent, agents };
-        return encode(envelope, maxBytes) ? envelope : null;
+        return encode(envelope, legacyMaxBytes) ? envelope : null;
     }
-    return { key, maxBytes, maxAgents, makeEnvelope, parseEnvelope, readSnapshot };
+    function normalizePath(value) {
+        if (typeof value !== 'string' || !value || value.startsWith('\\')
+            || /[\u0000-\u001f\u007f-\u009f]/.test(value)) return null;
+        for (const character of value) {
+            const point = character.codePointAt(0);
+            if (point >= 0xd800 && point <= 0xdfff) return null;
+        }
+        const path = value.replace(/\\/g, '/');
+        const windows = /^[A-Za-z]:\//.test(path);
+        if (!windows && (!path.startsWith('/') || value.includes('\\')) || path.startsWith('//')) return null;
+        const parts = path.slice(windows ? 3 : 1).split('/');
+        if (parts.some(part => !part || part === '.' || part === '..')) return null;
+        if (windows && parts.some(part => /[:<>"|?*]/.test(part) || /[. ]$/.test(part)
+            || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) return null;
+        return path;
+    }
+    function normalizeDirectory(value) {
+        if (typeof value !== 'string' || value.length > maxDirectoryChars) return null;
+        const directory = normalizePath(value);
+        return directory?.endsWith('/.session-stats') ? directory : null;
+    }
+    function makeLocation(value) {
+        const sourceKeys = locationKeys.slice(1);
+        if (!record(value) || Object.keys(value).length !== sourceKeys.length
+            || !sourceKeys.every(field => Object.hasOwn(value, field))) return null;
+        const bridgeSessionId = protocol.normalizeBridgeId(value.bridgeSessionId);
+        const directory = normalizeDirectory(value.directory);
+        if (!bridgeSessionId || !directory || !integer(value.generatedAt)
+            || typeof value.organizationId !== 'string' || !uuid.test(value.organizationId)
+            || typeof value.publisherId !== 'string' || !uuid.test(value.publisherId)) return null;
+        const location = { protocolVersion: 2, bridgeSessionId, organizationId: value.organizationId.toLowerCase(),
+            publisherId: value.publisherId.toLowerCase(), generatedAt: value.generatedAt, directory };
+        return encode(location, maxBytes) ? location : null;
+    }
+    function parseLocation(value, expected = {}) {
+        if (value === undefined || value === null) return invalid('missing');
+        if (!integer(expected.now)) return invalid('invalid');
+        const text = encode(value, maxBytes);
+        if (!text) return invalid('invalid');
+        let descriptor;
+        try { descriptor = JSON.parse(text); } catch { return invalid('invalid'); }
+        if (!record(descriptor) || Object.keys(descriptor).length !== locationKeys.length
+            || !locationKeys.every(field => Object.hasOwn(descriptor, field))
+            || descriptor.protocolVersion !== 2) return invalid('invalid');
+        const { protocolVersion, ...raw } = descriptor;
+        const location = makeLocation(raw);
+        if (!location || locationKeys.some(field => location[field] !== descriptor[field])) return invalid('invalid');
+        const organizationId = typeof expected.organizationId === 'string' ? expected.organizationId.toLowerCase() : null;
+        if (location.bridgeSessionId !== protocol.normalizeBridgeId(expected.bridgeSessionId)
+            || location.organizationId !== organizationId) return invalid('identity');
+        if (location.generatedAt - expected.now > protocol.futureSkewMs) return invalid('future');
+        if (expected.now - location.generatedAt > protocol.maxAgeMs) return invalid('expired');
+        return { ok: true, location };
+    }
+    function snapshotPath(location, agentId) {
+        const parsed = parseLocation(location, { bridgeSessionId: location?.bridgeSessionId,
+            organizationId: location?.organizationId, now: location?.generatedAt });
+        if (!parsed.ok) return null;
+        const filename = protocol.snapshotFilename(parsed.location.bridgeSessionId, agentId);
+        return filename ? `${parsed.location.directory}/${filename}` : null;
+    }
+    function samePath(actual, expected) {
+        const left = normalizePath(actual), right = normalizePath(expected);
+        if (!left || !right) return false;
+        return /^[A-Za-z]:\//.test(right) ? left.toLowerCase() === right.toLowerCase() : left === right;
+    }
+    return { key, maxBytes, legacyMaxBytes, maxAgents, makeLocation, parseLocation, snapshotPath, samePath,
+        makeEnvelope, parseEnvelope, readSnapshot };
 }
 
 module.exports = { createMetadataProtocol };

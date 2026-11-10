@@ -69,7 +69,7 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, metadata publ
     const resolveWorkspace = createCliWorkspaceResolver({ claudeHome, platform: 'win32', hostname: 'fixture-host',
         getProcessIdentities: async () => new Map([[101, { alive: true, procStart: '123456' }]]) });
     const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, resolveWorkspace, now: () => time, pollMs: 600000 });
-    const metadataApi = createMetadataApi({ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT,
+    const metadataApi = createMetadataApi({ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT, snapshotDirectory: path.dirname(destination),
         responseShape: moved === true ? 'response_shape' : 'session' });
     const metadataPublisher = createMetadataPublisher({ source: publisher, fetch: metadataApi.writerFetch,
         now: () => time, pollMs: 600000 });
@@ -98,7 +98,10 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, metadata publ
     for (const field of fields) assert.equal(remote[field], local[field], field);
     assert.equal(remote.status, 'ok');
     assert.equal(metadataApi.writes().length, 1);
-    assert.deepEqual(metadataApi.envelope().parent, JSON.parse(await fs.readFile(destination, 'utf8')));
+    assert.equal(metadataApi.envelope().directory, path.dirname(destination).replaceAll('\\', '/'));
+    assert.equal(metadataApi.envelope().protocolVersion, 2);
+    assert.equal(metadataApi.reads().length, 1);
+    assert.equal(path.resolve(metadataApi.reads()[0].path), destination);
     for (const duplicateChild of [false, true]) {
         if (duplicateChild) { time += 10000; await fs.appendFile(childFile, childRow); }
         await publisher.start();
@@ -112,10 +115,10 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, metadata publ
         assert.equal(childRemote.steps, 1);
         assert.equal(childRemote.tps, null);
         for (const field of fields) assert.equal(childRemote[field], childLocal[field], field);
-        assert.equal(metadataApi.envelope().parent.stats.totalTokens, 140);
-        assert.equal(metadataApi.envelope().agents.length, 1);
-        assert.deepEqual(metadataApi.envelope().agents[0], JSON.parse(await fs.readFile(
-            path.join(claudeHome, '.session-stats', `${BRIDGE}.agent-${agentId}.json`), 'utf8')));
+        assert.equal(metadataApi.envelope().directory, path.dirname(destination).replaceAll('\\', '/'));
+        assert.equal('agents' in metadataApi.envelope() || 'parent' in metadataApi.envelope(), false);
+        assert.equal(path.resolve(metadataApi.reads().at(-1).path),
+            path.join(claudeHome, '.session-stats', `${BRIDGE}.agent-${agentId}.json`));
         const writes = metadataApi.writes().length;
         assert.deepEqual(await childReceiver.read(), childRemote);
         await metadataPublisher.start();
@@ -160,7 +163,7 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, metadata publ
         assert.notEqual((await publisher.readLocal(LOCAL)).status, 'ok');
         await metadataPublisher.start();
         assert.deepEqual(metadataApi.envelope(), last);
-        time = last.parent.generatedAt + 30001;
+        time = last.generatedAt + 30001;
         const invalid = await receiver.read();
         assert.equal(invalid.status, 'unavailable');
         assert.equal(invalid.tps, null);

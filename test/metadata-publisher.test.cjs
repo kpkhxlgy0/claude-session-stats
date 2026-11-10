@@ -22,11 +22,14 @@ const sample = (generatedAt = 100000, options = {}) => snapshotProtocol.makeSnap
 const envelope = snapshot => ({ protocolVersion: 1, bridgeSessionId: snapshot.bridgeSessionId,
     organizationId: snapshot.organizationId, publisherId: snapshot.publisherId,
     generatedAt: snapshot.generatedAt, parent: snapshot, agents: [] });
+const location = (generatedAt = 100000, options = {}) => ({ bridgeSessionId: BRIDGE, organizationId: ORG,
+    publisherId: PUBLISHER, generatedAt, directory: 'D:/Claude 配置/.session-stats', ...options });
+const descriptor = (generatedAt = 100000, options = {}) => ({ protocolVersion: 2, ...location(generatedAt, options) });
 const defer = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
 function fixture(t, options = {}) {
-    let clock = 100000, bindings = [binding()], snapshots = [sample()];
+    let clock = 100000, bindings = [binding()], locationValue = location();
     const calls = [], sourceCalls = [], details = new Map();
     const detail = id => {
         if (!details.has(id)) details.set(id, { session: { id, environment_kind: 'bridge',
@@ -35,9 +38,9 @@ function fixture(t, options = {}) {
     };
     const source = {
         listRemoteBindings: () => bindings,
-        async readRemoteSnapshots(id, context) {
+        async readRemoteLocation(id, context) {
             sourceCalls.push({ id, context });
-            return typeof snapshots === 'function' ? snapshots(id, context) : snapshots;
+            return typeof locationValue === 'function' ? locationValue(id, context) : locationValue;
         },
     };
     const fetch = async (url, init) => {
@@ -69,7 +72,7 @@ function fixture(t, options = {}) {
     t.after(() => publisher.stop());
     return { publisher, source, calls, sourceCalls, detail,
         setClock(value) { clock = value; }, setBindings(value) { bindings = value; },
-        setSnapshots(value) { snapshots = value; }, writes: () => calls.filter(call => call.init.method === 'PUT') };
+        setLocation(value) { locationValue = value; }, writes: () => calls.filter(call => call.init.method === 'PUT') };
 }
 
 test('GET verifies the exact native binding before a namespace-only PUT preserves siblings', async t => {
@@ -88,7 +91,7 @@ test('GET verifies the exact native binding before a namespace-only PUT preserve
     const patch = JSON.parse(f.writes()[0].init.body).client_metadata_patch;
     assert.deepEqual(patch[0], { op: 'test', path: '', value: { sibling: { untouched: true } } });
     assert.deepEqual(metadata.sibling, { untouched: true });
-    assert.equal(metadata[KEY].parent.stats.totalTokens, 100);
+    assert.equal(metadata[KEY].directory, 'D:/Claude 配置/.session-stats');
     assert.deepEqual(f.sourceCalls.map(call => call.id), [BRIDGE]);
     assert.equal(f.sourceCalls[0].context.organizationId, ORG);
 });
@@ -99,9 +102,9 @@ for (const [name, change] of [
     ['shared response', detail => { detail.shared = true; }],
     ['offline bridge', detail => { detail.session.connection_status = 'disconnected'; }],
     ['wrong environment', detail => { detail.session.environment_kind = 'container'; }],
-    ['future metadata schema', detail => { detail.session.client_metadata[KEY] = { protocolVersion: 2 }; }],
+    ['future metadata schema', detail => { detail.session.client_metadata[KEY] = { protocolVersion: 3 }; }],
     ['null namespace', detail => { detail.session.client_metadata[KEY] = null; }],
-]) test(`does not read local snapshots or PUT for ${name}`, async t => {
+]) test(`does not read local location or PUT for ${name}`, async t => {
     const f = fixture(t); change(f.detail(BRIDGE));
     await f.publisher.start();
     assert.equal(f.writes().length, 0);
@@ -127,7 +130,7 @@ test('invalid, conflicting and revoked source bindings cannot publish', async t 
     await f.publisher.start();
     assert.equal(f.calls.length, 0);
     f.setBindings([binding()]);
-    f.setSnapshots(async () => { f.setBindings([]); return [sample()]; });
+    f.setLocation(async () => { f.setBindings([]); return location(); });
     await f.publisher.start();
     assert.equal(f.writes().length, 0);
 });
@@ -158,11 +161,11 @@ test('stop aborts a blocked GET synchronously and its late completion never PUTs
 
 test('stop during source I/O prevents PUT even when the source ignores cancellation', async t => {
     const gate = defer();
-    const f = fixture(t); f.setSnapshots(() => gate.promise);
+    const f = fixture(t); f.setLocation(() => gate.promise);
     const pending = f.publisher.start(); await turn();
     const stopped = f.publisher.stop();
     assert.equal(f.sourceCalls[0].context.signal.aborted, true);
-    gate.resolve([sample()]); await Promise.all([pending, stopped]);
+    gate.resolve(location()); await Promise.all([pending, stopped]);
     assert.equal(f.writes().length, 0);
 });
 
@@ -176,11 +179,11 @@ test('timeouts abort ignored network work and do not leave refresh waiting forev
     assert.equal(f.writes().length, 0);
 });
 
-test('coalesced refreshes never write twice within ten seconds and skip identical envelopes', async t => {
+test('coalesced refreshes never write twice within ten seconds and skip identical locations', async t => {
     const f = fixture(t);
     await Promise.all([f.publisher.start(), f.publisher.start(), f.publisher.start()]);
     assert.equal(f.writes().length, 1);
-    f.setClock(109999); f.setSnapshots([sample(109999, { revision: 2 })]);
+    f.setClock(109999); f.setLocation(location(109999));
     await f.publisher.start(); assert.equal(f.calls.length, 2);
     f.setClock(110000); await f.publisher.start(); assert.equal(f.writes().length, 2);
     f.setClock(120000); await f.publisher.start(); assert.equal(f.writes().length, 2);
@@ -192,7 +195,7 @@ test('a slow successful PUT still reserves ten seconds after its completion', as
         if (init.method === 'PUT') f.setClock(109000);
     } });
     await f.publisher.start();
-    f.setClock(110000); f.setSnapshots([sample(110000, { revision: 2 })]);
+    f.setClock(110000); f.setLocation(location(110000));
     await f.publisher.start();
     assert.equal(f.writes().length, 1);
 });
@@ -218,39 +221,64 @@ test('repeated failed PUTs back off as well as GET failures', async t => {
 
 test('a fresh foreign publisher is preserved and a stale one permits handover', async t => {
     const f = fixture(t);
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample(99999, { publisherId: OTHER }));
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor(99999, { publisherId: OTHER });
     await f.publisher.start(); assert.equal(f.writes().length, 0);
-    f.setClock(140000); f.setSnapshots([sample(140000, { revision: 2 })]);
+    f.setClock(140000); f.setLocation(location(140000));
     await f.publisher.start(); assert.equal(f.writes().length, 1);
 });
 
 test('an old publisher cannot overwrite a newer publisher after its own prior publication', async t => {
     const f = fixture(t); await f.publisher.start();
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample(110000, { publisherId: OTHER }));
-    f.setClock(110000); f.setSnapshots([sample(110000, { revision: 2 })]);
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor(110000, { publisherId: OTHER });
+    f.setClock(110000); f.setLocation(location(110000));
     await f.publisher.start();
-    f.setClock(150000); f.setSnapshots([sample(150000, { revision: 3 })]);
+    f.setClock(150000); f.setLocation(location(150000));
     await f.publisher.start();
     assert.equal(f.writes().length, 1);
     assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].publisherId, OTHER);
 });
 
-test('same-publisher revision rollback and altered equal revisions cannot overwrite cloud snapshots', async t => {
+test('same-publisher timestamp rollback and altered equal timestamps cannot overwrite cloud locations', async t => {
     const f = fixture(t);
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample(100000, { revision: 2 }));
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor(100001);
     await f.publisher.start(); assert.equal(f.writes().length, 0);
-    f.setClock(110000); f.setSnapshots([sample(110000, { revision: 2 })]);
+    f.setClock(110000); f.setLocation(location(100001, { directory: '/other/.session-stats' }));
     await f.publisher.start(); assert.equal(f.writes().length, 0);
+    f.setClock(120000); f.setLocation(location(120000, { directory: '/other/.session-stats' }));
+    await f.publisher.start(); assert.equal(f.writes().length, 1);
+    assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].directory, '/other/.session-stats');
 });
 
-test('parent and child snapshots are transported independently without adding counters', async t => {
+test('publishes only a bounded directory descriptor without reading parent or child snapshots', async t => {
     const f = fixture(t);
-    f.setSnapshots([sample(), sample(100001, { agentId: 'agent-child' })]);
+    f.source.readRemoteSnapshots = () => { throw new Error('Bulk snapshot reads are forbidden'); };
     await f.publisher.start();
     const value = f.detail(BRIDGE).session.client_metadata[KEY];
-    assert.equal(value.parent.stats.totalTokens, 100);
-    assert.equal(value.agents[0].stats.totalTokens, 100);
-    assert.equal(value.agents[0].agentId, 'agent-child');
+    assert.deepEqual(value, descriptor());
+    assert.deepEqual(Object.keys(value).sort(), ['bridgeSessionId', 'directory', 'generatedAt',
+        'organizationId', 'protocolVersion', 'publisherId']);
+    assert.ok(Buffer.byteLength(JSON.stringify(value)) < 1024);
+});
+
+test('valid expired numeric metadata is migrated with the exact legacy comparison', async t => {
+    const f = fixture(t);
+    const legacy = envelope(sample(69999, { publisherId: OTHER }));
+    const original = JSON.stringify(legacy, null, 2);
+    f.detail(BRIDGE).session.client_metadata[KEY] = original;
+    await f.publisher.start();
+    assert.equal(f.writes().length, 1);
+    assert.deepEqual(JSON.parse(f.writes()[0].init.body).client_metadata_patch[0],
+        { op: 'test', path: '/claudepp_session_stats', value: original });
+    assert.deepEqual(f.detail(BRIDGE).session.client_metadata[KEY], descriptor());
+});
+
+test('fresh legacy metadata is protected even for the same publisher', async t => {
+    const f = fixture(t);
+    const legacy = envelope(sample(70000));
+    f.detail(BRIDGE).session.client_metadata[KEY] = legacy;
+    await f.publisher.start();
+    assert.equal(f.writes().length, 0);
+    assert.deepEqual(f.detail(BRIDGE).session.client_metadata[KEY], legacy);
 });
 
 test('oversized session streams are cancelled before parsing or writing', async t => {
@@ -276,7 +304,7 @@ test('the timeout covers the response body and cancels a stream which never fini
     assert.equal(f.writes().length, 0);
 });
 
-test('declared oversized content and malformed UTF-8 never reach local snapshots', async t => {
+test('declared oversized content and malformed UTF-8 never reach local location', async t => {
     let response = new Response('{}', { headers: { 'content-length': String(1024 * 1024 + 1) } });
     const f = fixture(t, { request: () => response });
     await f.publisher.start();
@@ -288,23 +316,23 @@ test('declared oversized content and malformed UTF-8 never reach local snapshots
 
 test('oversized or foreign namespaces are protected even inside an otherwise valid session', async t => {
     const f = fixture(t);
-    const existing = envelope(sample());
+    const existing = descriptor();
     existing.extra = 'x'.repeat(262144);
     f.detail(BRIDGE).session.client_metadata[KEY] = existing;
     await f.publisher.start(); assert.equal(f.writes().length, 0);
     assert.equal(f.sourceCalls.length, 0);
     f.setClock(110000);
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample(110000, { organizationId: OTHER }));
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor(110000, { organizationId: OTHER });
     await f.publisher.start(); assert.equal(f.writes().length, 0);
 });
 
-test('stale, future and mismatched source snapshots never PUT', async t => {
+test('stale, future and mismatched source locations never PUT', async t => {
     const f = fixture(t);
-    f.setSnapshots([sample(69999)]); await f.publisher.start();
+    f.setLocation(location(69999)); await f.publisher.start();
     assert.equal(f.writes().length, 0);
-    f.setClock(110000); f.setSnapshots([sample(115001)]); await f.publisher.start();
+    f.setClock(110000); f.setLocation(location(115001)); await f.publisher.start();
     assert.equal(f.writes().length, 0);
-    f.setClock(120000); f.setSnapshots([sample(120000, { organizationId: OTHER })]);
+    f.setClock(120000); f.setLocation(location(120000, { organizationId: OTHER }));
     await f.publisher.start(); assert.equal(f.writes().length, 0);
 });
 
@@ -320,11 +348,11 @@ test('account changes receive independent binding state without inheriting backo
     assert.equal(f.writes()[0].init.headers['X-Expected-Account'], OTHER);
 });
 
-test('stop leaves the last cloud summary to expire without a delete request', async t => {
+test('stop leaves the last cloud location to expire without a delete request', async t => {
     const f = fixture(t);
     await f.publisher.start();
     await f.publisher.stop();
-    assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].parent.stats.totalTokens, 100);
+    assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].directory, 'D:/Claude 配置/.session-stats');
     assert.deepEqual(f.calls.map(call => call.init.method), ['GET', 'PUT']);
 });
 
@@ -335,7 +363,7 @@ test('more than 32 bindings are rotated fairly with at most two concurrent sessi
         active++; maximum = Math.max(maximum, active); await turn(); active--;
     } });
     f.setBindings(Array.from({ length: 70 }, (_, index) => binding(`session_fair_${index}`)));
-    f.setSnapshots(id => [sample(100000, { bridgeSessionId: id })]);
+    f.setLocation(id => location(100000, { bridgeSessionId: id }));
     await f.publisher.start();
     f.setClock(110000); await f.publisher.start();
     f.setClock(120000); await f.publisher.start();
@@ -348,10 +376,10 @@ test('publisher retirement survives repeated rotations through 70 bindings', asy
     const f = fixture(t, { publisherOptions: { now: () => clock } });
     const target = 'session_rotated_0';
     f.setBindings(Array.from({ length: 70 }, (_, index) => binding(`session_rotated_${index}`)));
-    f.setSnapshots(id => [sample(clock, { bridgeSessionId: id, revision: clock })]);
+    f.setLocation(id => location(clock, { bridgeSessionId: id }));
     await f.publisher.start();
-    f.detail(target).session.client_metadata[KEY] = envelope(sample(110000,
-        { bridgeSessionId: target, publisherId: OTHER }));
+    f.detail(target).session.client_metadata[KEY] = descriptor(110000,
+        { bridgeSessionId: target, publisherId: OTHER });
     for (const time of [110000, 120000, 130000, 150001]) {
         clock = time;
         await f.publisher.start();
@@ -366,7 +394,7 @@ test('failure backoff survives eviction from the active scheduling window', asyn
     const f = fixture(t, { publisherOptions: { now: () => clock }, request: ({ url }) =>
         url.endsWith(`/${target}`) ? new Response('{}', { status: 503 }) : undefined });
     f.setBindings(Array.from({ length: 70 }, (_, index) => binding(`session_backoff_${index}`)));
-    f.setSnapshots(id => [sample(clock, { bridgeSessionId: id, revision: clock })]);
+    f.setLocation(id => location(clock, { bridgeSessionId: id }));
     for (const time of [100000, 110000, 120000, 130000, 140000, 150000, 160000]) {
         clock = time;
         await f.publisher.start();
@@ -377,24 +405,24 @@ test('failure backoff survives eviction from the active scheduling window', asyn
 test('temporary binding removal never forgets that a newer publisher took ownership', async t => {
     const f = fixture(t);
     await f.publisher.start();
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample(110000, { publisherId: OTHER }));
-    f.setClock(110000); f.setSnapshots([sample(110000, { revision: 2 })]);
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor(110000, { publisherId: OTHER });
+    f.setClock(110000); f.setLocation(location(110000));
     await f.publisher.start();
     f.setBindings([]); f.setClock(120000); await f.publisher.start();
-    f.setBindings([binding()]); f.setClock(150001); f.setSnapshots([sample(150001, { revision: 3 })]);
+    f.setBindings([binding()]); f.setClock(150001); f.setLocation(location(150001));
     await f.publisher.start();
     assert.equal(f.writes().length, 1);
     assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].publisherId, OTHER);
 });
 
-test('observing an identical owned envelope still remembers ownership before a successor appears', async t => {
+test('observing an identical owned location still remembers ownership before a successor appears', async t => {
     const f = fixture(t);
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample());
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor();
     await f.publisher.start(); assert.equal(f.writes().length, 0);
-    f.detail(BRIDGE).session.client_metadata[KEY] = envelope(sample(110000, { publisherId: OTHER }));
-    f.setClock(110000); f.setSnapshots([sample(110000, { revision: 2 })]);
+    f.detail(BRIDGE).session.client_metadata[KEY] = descriptor(110000, { publisherId: OTHER });
+    f.setClock(110000); f.setLocation(location(110000));
     await f.publisher.start();
-    f.setClock(150001); f.setSnapshots([sample(150001, { revision: 3 })]);
+    f.setClock(150001); f.setLocation(location(150001));
     await f.publisher.start();
     assert.equal(f.writes().length, 0);
     assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].publisherId, OTHER);
@@ -419,12 +447,12 @@ test('the bounded history rejects new bindings at capacity while preserving earl
 
 test('a namespace replaced during source I/O is atomically preserved by the failed comparison', async t => {
     const f = fixture(t);
-    const original = envelope(sample(99999));
-    const successor = envelope(sample(100000, { publisherId: OTHER }));
+    const original = descriptor(99999);
+    const successor = descriptor(100000, { publisherId: OTHER });
     f.detail(BRIDGE).session.client_metadata[KEY] = original;
-    f.setSnapshots(() => {
+    f.setLocation(() => {
         f.detail(BRIDGE).session.client_metadata[KEY] = successor;
-        return [sample(100000, { revision: 2 })];
+        return location(100000);
     });
     await f.publisher.start();
     assert.equal(f.writes().length, 1);
@@ -436,10 +464,10 @@ test('a namespace replaced during source I/O is atomically preserved by the fail
 
 test('a namespace created after an empty GET is protected by whole-metadata comparison', async t => {
     const f = fixture(t);
-    const successor = envelope(sample(100000, { publisherId: OTHER }));
-    f.setSnapshots(() => {
+    const successor = descriptor(100000, { publisherId: OTHER });
+    f.setLocation(() => {
         f.detail(BRIDGE).session.client_metadata[KEY] = successor;
-        return [sample()];
+        return location();
     });
     await f.publisher.start();
     assert.equal(f.writes().length, 1);
@@ -452,9 +480,9 @@ test('a namespace created after an empty GET is protected by whole-metadata comp
 test('an unrelated metadata change blocks an absent-namespace write until a new GET', async t => {
     const f = fixture(t);
     let changed = false;
-    f.setSnapshots(() => {
+    f.setLocation(() => {
         if (!changed) { changed = true; f.detail(BRIDGE).session.client_metadata.sibling = { updated: true }; }
-        return [sample()];
+        return location();
     });
     await f.publisher.start();
     assert.equal(Object.hasOwn(f.detail(BRIDGE).session.client_metadata, KEY), false);
@@ -466,13 +494,13 @@ test('an unrelated metadata change blocks an absent-namespace write until a new 
 
 test('comparison uses the exact string namespace from GET rather than its parsed envelope', async t => {
     const f = fixture(t);
-    const original = JSON.stringify(envelope(sample(99999)), null, 2);
+    const original = JSON.stringify(descriptor(99999), null, 2);
     f.detail(BRIDGE).session.client_metadata[KEY] = original;
-    f.setSnapshots([sample(100000, { revision: 2 })]);
+    f.setLocation(location(100000));
     await f.publisher.start();
     const patch = JSON.parse(f.writes()[0].init.body).client_metadata_patch;
     assert.deepEqual(patch[0], { op: 'test', path: '/claudepp_session_stats', value: original });
-    assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].parent.revision, 2);
+    assert.equal(f.detail(BRIDGE).session.client_metadata[KEY].generatedAt, 100000);
 });
 
 test('failed comparisons are never retried with an unconditional add', async t => {
@@ -493,5 +521,19 @@ test('a comparison whose JSON expands beyond the write budget is never sent', as
         init.method === 'GET' ? new Response(compact) : undefined });
     await f.publisher.start();
     assert.equal(f.sourceCalls.length, 1);
+    assert.equal(f.writes().length, 0);
+});
+
+test('source location identity, path, shape and freshness are checked after asynchronous reading', async t => {
+    for (const value of [null, location(100000, { bridgeSessionId: 'session_foreign' }),
+        location(100000, { directory: 'relative/.session-stats' }), location(100000, { agents: [] }),
+        { protocolVersion: 2, ...location() }]) {
+        const f = fixture(t); f.setLocation(value);
+        await f.publisher.start();
+        assert.equal(f.writes().length, 0);
+    }
+    const f = fixture(t);
+    f.setLocation(() => { f.setClock(130001); return location(); });
+    await f.publisher.start();
     assert.equal(f.writes().length, 0);
 });
