@@ -22,7 +22,8 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
     const domain = `${platform}:${hostname.toLowerCase()}`;
     const gitTtl = Number.isFinite(gitCacheMs) ? Math.min(2000, Math.max(0, gitCacheMs)) : 0;
     const gitAssociations = new Map();
-    let processBatch;
+    let processBatch, registryChecks, cacheGeneration = 0, registryBytes = 0, cacheEnabled = true;
+    const registryRecords = new Map();
     function samePath(left, right) {
         if (!path.isAbsolute(left) || !path.isAbsolute(right)) return false;
         const normalizedLeft = path.resolve(left), normalizedRight = path.resolve(right);
@@ -57,6 +58,8 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
     async function processes(pids) {
         const key = [...pids].sort((a, b) => a - b).join(',');
         const time = now();
+        if (!cacheEnabled) return Promise.resolve().then(() =>
+            (getProcessIdentities || nativeProcessIdentities)(pids)).catch(() => new Map());
         if (!processBatch || processBatch.key !== key || time < processBatch.time
             || time - processBatch.time >= Math.max(0, processCacheMs)) {
             const batch = { key, time, result: Promise.resolve().then(() =>
@@ -82,20 +85,44 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
     }
 
     async function readRegistry(file) {
+        const generation = cacheGeneration;
         const before = await fs.lstat(file);
         if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maxRegistryBytes)
             throw new Error('Unsafe session registry');
+        const cached = cacheEnabled && registryRecords.get(file);
+        if (cached && unchanged(before, cached.info))
+            return cached.record;
         const handle = await fs.open(file, 'r');
         try {
             const opened = await handle.stat();
             if (!opened.isFile() || opened.nlink !== 1 || !unchanged(before, opened)) throw new Error('Registry changed');
-            const buffer = Buffer.alloc(maxRegistryBytes + 1);
-            const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-            if (bytesRead > maxRegistryBytes || !unchanged(opened, await handle.stat())
+            const buffer = Buffer.alloc(opened.size + 1);
+            let bytesRead = 0;
+            while (bytesRead < buffer.length) {
+                const next = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+                if (!next.bytesRead) break;
+                bytesRead += next.bytesRead;
+            }
+            if (bytesRead !== opened.size || !unchanged(opened, await handle.stat())
                 || !unchanged(opened, await fs.lstat(file))) throw new Error('Registry changed');
             const row = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
             if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Invalid registry');
-            return { row, bytes: bytesRead };
+            const record = { row, bytes: bytesRead };
+            if (cacheEnabled && generation === cacheGeneration) {
+                const previous = registryRecords.get(file);
+                if (previous) { registryBytes -= previous.record.bytes; registryRecords.delete(file); }
+                while (registryRecords.size && (registryRecords.size >= maxRegistryEntries
+                    || registryBytes + bytesRead > maxRegistryTotalBytes)) {
+                    const key = registryRecords.keys().next().value;
+                    registryBytes -= registryRecords.get(key).record.bytes;
+                    registryRecords.delete(key);
+                }
+                if (bytesRead <= maxRegistryTotalBytes) {
+                    registryRecords.set(file, { info: opened, record });
+                    registryBytes += bytesRead;
+                }
+            }
+            return record;
         } finally { await handle.close(); }
     }
 
@@ -117,10 +144,10 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             row.startedAt, row.kind, row.entrypoint]);
     }
 
-    async function scan(binding) {
+    async function scan() {
         const home = await directory(claudeHome);
         const sessions = await directory(path.join(home.path, 'sessions'));
-        const found = [], pids = [];
+        const records = [], pids = [];
         let count = 0, bytes = 0;
         const handle = await fs.opendir(sessions.path);
         for await (const child of handle) {
@@ -131,15 +158,44 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             pids.push(pid);
             const record = await readRegistry(path.join(sessions.path, child.name));
             if ((bytes += record.bytes) > maxRegistryTotalBytes) throw new Error('Registry byte limit');
-            if (matches(record.row, binding))
-                found.push({ pid, cwd: record.row.cwd, procStart: record.row.procStart,
-                    hostSessionId: record.row.hostSessionId, bridgeSessionId: record.row.bridgeSessionId,
-                    pidDomain: record.row.pidDomain, startedAt: record.row.startedAt,
-                    semantic: semantic(record.row, pid, binding) });
+            records.push({ pid, row: record.row });
         }
         if (home.identity !== (await directory(home.path)).identity
             || sessions.identity !== (await directory(sessions.path)).identity) throw new Error('Registry directory changed');
-        return { found, pids, home, sessions };
+        return { records, pids, home, sessions };
+    }
+
+    function scanRegistry(binding) {
+        let checks = registryChecks;
+        if (!checks) {
+            checks = { waiting: [] };
+            registryChecks = checks;
+            queueMicrotask(async () => {
+                while (checks.waiting.length) {
+                    // Gather callers from separate filesystem completions before
+                    // freezing this cohort. No proof I/O has started for it yet.
+                    await new Promise(resolve => setImmediate(resolve));
+                    // Only callers present before I/O starts share this proof.
+                    // A later caller needs a new scan after its preceding I/O.
+                    const cohort = checks.waiting.splice(0);
+                    try {
+                        const result = await scan();
+                        for (const caller of cohort) caller.resolve(result);
+                    } catch (error) {
+                        for (const caller of cohort) caller.reject(error);
+                    }
+                }
+                if (registryChecks === checks) registryChecks = undefined;
+            });
+        }
+        return new Promise((resolve, reject) => { checks.waiting.push({ resolve, reject }); }).then(result => ({
+            ...result,
+            found: result.records.filter(({ row }) => matches(row, binding)).map(({ pid, row }) => ({
+                pid, cwd: row.cwd, procStart: row.procStart, hostSessionId: row.hostSessionId,
+                bridgeSessionId: row.bridgeSessionId, pidDomain: row.pidDomain, startedAt: row.startedAt,
+                semantic: semantic(row, pid, binding)
+            }))
+        }));
     }
 
     async function gitDirectories(cwd) {
@@ -268,8 +324,8 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
     async function association(desktop, active, cacheAllowed = true) {
         if (!await nestedGit(desktop, active)) return ['desktop', desktop.path, desktop.identity];
         const key = JSON.stringify([desktop.path, desktop.identity, active.path, active.identity]);
-        const time = now(), cached = gitAssociations.get(key);
-        if (cacheAllowed && cached) {
+        const time = now(), generation = cacheGeneration, cached = gitAssociations.get(key);
+        if (cacheEnabled && cacheAllowed && cached) {
             if (time >= cached.time && time - cached.time < gitTtl
                 && await fingerprint(desktop, active, cached.git) === cached.fingerprint) {
                 const checked = now();
@@ -284,7 +340,7 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             throw new Error('Unrelated Git workspace');
         const git = ['git', sourceCommon.path, sourceCommon.identity, sourceTop.path, sourceTop.identity,
             activeTop.path, activeTop.identity];
-        const before = gitTtl && cacheAllowed ? await fingerprint(desktop, active, git) : null;
+        const before = cacheEnabled && gitTtl && cacheAllowed ? await fingerprint(desktop, active, git) : null;
         const output = await run('git', ['-C', desktop.path, 'worktree', 'list', '--porcelain', '-z']);
         const registered = output.split('\0').filter(field => field.startsWith('worktree ')).map(field => field.slice(9));
         if (!registered.some(value => samePath(value, sourceTop.path))
@@ -294,6 +350,7 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
                 return association(desktop, active, false);
             const checked = now();
             if (checked < time) return git;
+            if (!cacheEnabled || generation !== cacheGeneration) return git;
             if (gitAssociations.size >= 32 && !gitAssociations.has(key))
                 gitAssociations.delete(gitAssociations.keys().next().value);
             gitAssociations.set(key, { git, fingerprint: before, time: checked });
@@ -305,7 +362,7 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
         if (typeof claudeHome !== 'string' || !path.isAbsolute(claudeHome)) return null;
         let matched = false;
         try {
-            const first = await scan(binding);
+            const first = await scanRegistry(binding);
             if (!first.found.length) return null;
             matched = true;
             const desktop = await directory(binding.workspaceRoot);
@@ -342,7 +399,7 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
                     : samePath(relocationCwd, desktop.path) ? desktop : await directory(relocationCwd);
                 relocationGit = relocation === active ? git : await association(desktop, relocation);
             }
-            const second = await scan(binding);
+            const second = await scanRegistry(binding);
             const candidates = records => records.map(record => record.semantic).sort().join('\n');
             if (candidates(first.found) !== candidates(second.found)
                 || first.home.identity !== second.home.identity || first.sessions.identity !== second.sessions.identity
@@ -373,6 +430,45 @@ function createCliWorkspaceResolver({ claudeHome, fs = nativeFs, execFile = nati
             return !!current && !current.unavailable && current.evidenceKey === resolved.evidenceKey;
         } };
     }
+    let registryIndex, registryDirty = true, registryWatcher, homeWatcher;
+    function watchRegistry() {
+        if (fs !== nativeFs || registryWatcher || !cacheEnabled) return;
+        const watch = require('node:fs').watch;
+        try {
+            registryWatcher = watch(path.join(claudeHome, 'sessions'), { persistent: false }, () => { registryDirty = true; });
+            registryWatcher.on('error', () => { registryDirty = true; registryWatcher?.close(); registryWatcher = null; });
+        } catch { /* A missing registry is retried on a home-directory change. */ }
+        if (!homeWatcher) try {
+            homeWatcher = watch(claudeHome, { persistent: false }, (_kind, name) => {
+                if (!name || String(name) === 'sessions') { registryDirty = true; registryWatcher?.close(); registryWatcher = null; }
+            });
+            homeWatcher.on('error', () => { registryDirty = true; });
+        } catch { /* An absent home cannot produce a live session. */ }
+    }
+    resolveWorkspace.listActiveSessions = async () => {
+        if (!cacheEnabled) return [];
+        watchRegistry();
+        try {
+            if (registryDirty || !registryIndex) {
+                registryDirty = false;
+                registryIndex = await scan();
+            }
+            const observed = await processes(registryIndex.pids);
+            return registryIndex.records.filter(({ pid, row }) => row.pid === pid
+                && typeof row.hostSessionId === 'string' && /^local_[0-9a-f-]{36}$/i.test(row.hostSessionId)
+                && /^[0-9a-f-]{36}$/i.test(row.sessionId || '') && row.pidDomain === domain
+                && observed.get(pid)?.alive === true && observed.get(pid).procStart === row.procStart)
+                .map(({ row }) => ({ localSessionId: row.hostSessionId, cliSessionId: row.sessionId,
+                    ...(row.bridgeSessionId ? { bridgeSessionId: row.bridgeSessionId } : {}) }));
+        } catch { registryIndex = undefined; return []; }
+    };
+    resolveWorkspace.clearCache = () => {
+        cacheGeneration++;
+        registryRecords.clear(); registryBytes = 0;
+        gitAssociations.clear(); processBatch = undefined;
+    };
+    resolveWorkspace.dispose = () => { cacheEnabled = false; resolveWorkspace.clearCache();
+        registryWatcher?.close(); homeWatcher?.close(); registryIndex = undefined; };
     // Each call owns fresh registry/root checks. Git association reuse is separately
     // bounded by its TTL and unchanged control fingerprint.
     resolveWorkspace.resolveVerified = inspect;

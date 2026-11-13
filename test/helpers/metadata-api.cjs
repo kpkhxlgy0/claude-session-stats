@@ -8,6 +8,7 @@ const KEY = 'claudepp_session_stats';
 
 function createMetadataApi({ bridgeSessionId, organizationId, accountId, snapshotDirectory, responseShape = 'session' }) {
     const calls = [], events = [], reads = [];
+    let demandListener;
     const sibling = { untouched: true, nested: { revision: 7 } };
     const session = { id: bridgeSessionId.replace('session_', 'cse_'), environment_kind: 'bridge',
         connection_status: 'connected', client_metadata: { sibling: structuredClone(sibling) } };
@@ -23,7 +24,7 @@ function createMetadataApi({ bridgeSessionId, organizationId, accountId, snapsho
             assert.equal(init.headers['x-organization-uuid'], organizationId);
             assert.ok(init.signal instanceof AbortSignal);
             if (role === 'writer') assert.equal(init.headers['X-Expected-Account'], accountId);
-            else assert.notEqual(init.method, 'PUT', 'receiver never writes metadata');
+            // Receiving viewers now own only their independent demand keys.
             calls.push({ role, method: init.method });
             if (url.pathname.endsWith('/events')) {
                 assert.equal(role, 'renderer');
@@ -62,29 +63,27 @@ function createMetadataApi({ bridgeSessionId, organizationId, accountId, snapsho
             if (init.method === 'PUT') {
                 const body = JSON.parse(init.body);
                 assert.deepEqual(Object.keys(body), ['client_metadata_patch']);
-                assert.equal(body.client_metadata_patch.length, 2);
-                const comparison = body.client_metadata_patch[0];
-                assert.deepEqual(Object.keys(comparison).sort(), ['op', 'path', 'value']);
-                assert.equal(comparison.op, 'test');
-                const present = Object.hasOwn(session.client_metadata, KEY);
-                assert.equal(comparison.path, present ? '/' + KEY : '');
-                try { assert.deepEqual(comparison.value, present ? session.client_metadata[KEY] : session.client_metadata); }
-                catch { return new Response(JSON.stringify({ error: { type: 'invalid_request_error' } }), { status: 400 }); }
-                const patch = body.client_metadata_patch[1];
-                assert.deepEqual(Object.keys(patch).sort(), ['op', 'path', 'value']);
-                assert.equal(patch.op, 'add');
-                assert.equal(patch.path, '/' + KEY);
-                assert.equal(patch.value.protocolVersion, 2);
-                assert.equal('parent' in patch.value || 'agents' in patch.value || 'stats' in patch.value, false);
-                session.client_metadata[KEY] = structuredClone(patch.value);
+                for (const patch of body.client_metadata_patch) {
+                    const name = patch.path.startsWith('/') ? patch.path.slice(1) : null;
+                    if (role === 'renderer') assert.match(name || '', /^claudepp_session_stats_request_[A-Za-z0-9_-]+$/);
+                    else if (patch.op !== 'test') assert.equal(name, KEY);
+                    if (patch.op === 'test') {
+                        try { assert.deepEqual(patch.value, name ? session.client_metadata[name] : session.client_metadata); }
+                        catch { return new Response('{}', { status: 409 }); }
+                    } else if (patch.op === 'add') session.client_metadata[name] = structuredClone(patch.value);
+                    else if (patch.op === 'remove') delete session.client_metadata[name];
+                    else assert.fail('Unexpected metadata patch');
+                }
                 assert.deepEqual(session.client_metadata.sibling, sibling);
+                if (role === 'renderer') await demandListener?.();
             } else assert.equal(init.method, 'GET');
             return new Response(JSON.stringify({ [responseShape]: session }), { status: 200 });
         };
     }
 
     return { session, writerFetch: fetchFor('writer'), readerFetch: fetchFor('renderer'),
-        writes: () => calls.filter(call => call.method === 'PUT'),
+        writes: () => calls.filter(call => call.method === 'PUT' && call.role === 'writer'),
+        onDemand(listener) { demandListener = listener; },
         reads: () => [...reads],
         envelope: () => session.client_metadata[KEY] };
 }

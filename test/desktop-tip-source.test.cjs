@@ -166,6 +166,8 @@ test('publisher global confirmation rejects a tip sample when another account cl
         return stats;
     } };
     const publisher = createSnapshotPublisher({ claudeData: f.claudeData, claudeHome, store, pollMs: 600000 });
+    publisher.setInterest('tip_viewer', [{ localSessionId: LOCAL }]);
+
     t.after(() => publisher.stop());
     await publisher.start();
     assert.equal(changed, true);

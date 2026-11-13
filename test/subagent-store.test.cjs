@@ -583,3 +583,23 @@ test('parent and duplicate peer versions are rechecked after the final binding c
         else assert.notEqual((await store.getAgentStatsBatch(ID, [AGENT], context))[0].status, 'ok');
     }
 });
+
+test('exact membership checks inspect only the requested child and preserve fresh parent proof boundaries', async t => {
+    const { store, write, home, subagents } = await setup(t);
+    await write(); await write('unselected', lines(assistant('other', 99, { agentId: 'unselected' })));
+    let checks = 0;
+    const context = { workspaceRoot: home, verify: async () => { checks++; return true; } };
+    const realpath = fs.realpath, opendir = fs.opendir;
+    t.mock.method(fs, 'realpath', async (file, ...args) => {
+        assert.notEqual(file, path.join(subagents, 'agent-unselected.jsonl'));
+        return realpath(file, ...args);
+    });
+    t.mock.method(fs, 'opendir', async (directory, ...args) => {
+        assert.notEqual(directory, subagents, 'Exact membership must not enumerate siblings');
+        return opendir(directory, ...args);
+    });
+    assert.equal(await store.verifyAgentMembership(ID, AGENT, context), true);
+    assert.equal(checks, 2);
+    await fs.unlink(path.join(subagents, `agent-${AGENT}.jsonl`));
+    assert.equal(await store.verifyAgentMembership(ID, AGENT, context), false);
+});

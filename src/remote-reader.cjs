@@ -1,12 +1,15 @@
 'use strict';
 
 const { createMetadataProtocol } = require('./metadata-protocol.cjs');
+const { createDemandProtocol } = require('./demand-protocol.cjs');
 
 // 此函数被序列化到调用方页面；原始事件、文件内容和登录态始终留在该页面内。
 function createRemoteReader(win, createSnapshotProtocol, options = {}) {
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const protocol = createSnapshotProtocol();
+    const document = win.document;
     const metadata = createMetadataProtocol(createSnapshotProtocol);
+    const demand = createDemandProtocol();
     const now = options.now ?? Date.now;
     const maxFiberDepth = 512;
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -21,7 +24,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         if (url.username || url.password || !(url.origin === 'https://claude.ai'
             || url.protocol === 'app:' && url.hostname === 'localhost' && !url.port)) return null;
         const match = /^\/(?:epitaxy|code)\/(session_[A-Za-z0-9_-]{1,128})\/?$/.exec(url.pathname);
-        if (!match) return null;
+        if (!match || win.document.visibilityState === 'hidden') return null;
         const editors = [...win.document.querySelectorAll(
             '.ProseMirror[contenteditable], [contenteditable="true"][role="textbox"], textarea')]
             .filter(node => node.getClientRects().length
@@ -61,7 +64,35 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         return bound;
     }
     const same = (a, b) => a && b && a.threadId === b.threadId && a.org === b.org && a.agentId === b.agentId;
-    function cancel() { state?.controller?.abort(); state = null; }
+    function releaseDemand(current) {
+        if (!current?.announced || !current.requestKey) return;
+        const releaseController = new AbortController();
+        const deadline = setTimeout(() => releaseController.abort(), 2000);
+        void win.fetch(`https://claude.ai/v1/code/sessions/${current.bound.threadId}`, {
+            method: 'PUT', credentials: 'include', cache: 'no-store', redirect: 'error', keepalive: true, signal: releaseController.signal,
+            headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29',
+                'anthropic-client-feature': 'ccr', 'x-organization-uuid': current.bound.org, 'content-type': 'application/json' },
+            body: JSON.stringify({ client_metadata_patch: [{ op: 'test', path: '/' + current.requestKey, value: current.demandValue },
+                { op: 'remove', path: '/' + current.requestKey }] }) }).catch(() => {}).finally(() => clearTimeout(deadline));
+    }
+    function renewPendingDemand(current) {
+        if (!current.announced || !current.trusted || current.renewal || !valid(current)
+            || now() - current.demandAt < 3000 || current.controller?.signal.aborted) return;
+        current.demandAt = now();
+        const value = { ...current.demandValue, expiresAt: now() + demand.leaseMs };
+        current.demandValue = value;
+        current.renewal = Promise.resolve(win.fetch(`https://claude.ai/v1/code/sessions/${current.bound.threadId}`, {
+            method: 'PUT', credentials: 'include', cache: 'no-store', redirect: 'error', signal: current.controller.signal,
+            headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29',
+                'anthropic-client-feature': 'ccr', 'x-organization-uuid': current.bound.org, 'content-type': 'application/json' },
+            body: JSON.stringify({ client_metadata_patch: [{ op: 'add', path: '/' + current.requestKey, value }] })
+        })).catch(() => {}).finally(() => { current.renewal = null; if (!valid(current)) releaseDemand(current); });
+    }
+    function cancel() { const previous = state; state = null; previous?.controller?.abort(); releaseDemand(previous); }
+    const visibility = () => { if (!identity()) cancel(); };
+    win.document.addEventListener('visibilitychange', visibility);
+    win.addEventListener('popstate', visibility);
+    win.addEventListener('hashchange', visibility);
     function valid(current) {
         if (stopped || current !== state) return false;
         if (!same(current.bound, identity())) { cancel(); return false; }
@@ -151,9 +182,9 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         const headers = { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29',
             'anthropic-client-feature': 'ccr', 'x-organization-uuid': current.bound.org };
         const base = `https://claude.ai/v1/code/sessions/${current.bound.threadId}`;
-        async function request(url, body) {
+        async function request(url, body, method = body ? 'POST' : 'GET') {
             if (!valid(current) || controller.signal.aborted) throw failure('transport');
-            const response = await Promise.race([win.fetch(url, { method: body ? 'POST' : 'GET', credentials: 'include',
+            const response = await Promise.race([win.fetch(url, { method, credentials: 'include',
                 headers: body ? { ...headers, 'content-type': 'application/json' } : headers,
                 signal: controller.signal, cache: 'no-store', redirect: 'error', ...(body ? { body: JSON.stringify(body) } : {}) }), aborted]);
             if (!response.ok || !valid(current) || controller.signal.aborted) throw failure('transport');
@@ -174,6 +205,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             });
         }
         try {
+            let announced = false;
             async function locate() {
                 const detail = await request(base);
                 if (!record(detail)) throw failure('snapshot-invalid');
@@ -189,10 +221,23 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
                 if (container !== undefined && !record(container)) throw failure('snapshot-invalid');
                 const parsed = metadata.parseLocation(container?.[metadata.key], {
                     bridgeSessionId: current.bound.threadId, organizationId: current.bound.org, now: now() });
-                if (!parsed.ok) throw failure(`snapshot-${parsed.reason}`);
+                if (!parsed.ok && parsed.reason !== 'missing') throw failure(`snapshot-${parsed.reason}`);
+                if (!announced) {
+                    if (!current.requestKey) throw failure('snapshot-invalid');
+                    current.announced = true; current.demandAt = now();
+                    current.demandValue = { protocolVersion: 1, viewerId: current.leaseId, leaseId: current.leaseId,
+                        bridgeSessionId: current.bound.threadId, organizationId: current.bound.org,
+                        expiresAt: now() + demand.leaseMs,
+                        ...(current.bound.agentId !== undefined ? { agentId: current.bound.agentId } : {}) };
+                    await request(base, { client_metadata_patch: [{ op: 'add', path: '/' + current.requestKey,
+                        value: current.demandValue }] }, 'PUT');
+                    announced = true;
+                }
+                if (!parsed.ok) return null;
                 return parsed.location;
             }
-            const location = await locate();
+            let location = await locate();
+            while (!location) { await wait(); location = await locate(); }
             if (!current.result) current.result = unavailable(current, 'pending');
             const path = metadata.snapshotPath(location, current.bound.agentId);
             if (!path) throw failure('snapshot-invalid');
@@ -219,7 +264,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
                     }
                     if (reply.subtype !== 'success') throw failure('snapshot-invalid');
                     const latest = await locate();
-                    if (latest.publisherId !== location.publisherId
+                    if (!latest || latest.publisherId !== location.publisherId
                         || !metadata.samePath(metadata.snapshotPath(latest, current.bound.agentId), path))
                         throw failure('snapshot-identity');
                     if (latest.generatedAt < location.generatedAt) throw failure('snapshot-replay');
@@ -235,6 +280,7 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
         } finally {
             clearTimeout(timer); controller.signal.removeEventListener('abort', onAbort);
             current.controller = null;
+            if (current !== state || stopped) releaseDemand(current);
         }
     }
     return {
@@ -243,21 +289,27 @@ function createRemoteReader(win, createSnapshotProtocol, options = {}) {
             const bound = identity();
             if (!bound) { cancel(); return Promise.resolve(null); }
             if (!same(state?.bound, bound)) {
-                cancel(); state = { bound, trusted: false, controller: null, inflight: null,
+                // Each visible target generation owns a separate metadata key.
+                // Delayed initial writes, renewals and cleanup can touch only
+                // their old lease, never a successor in this window or pane.
+                const leaseId = win.crypto.randomUUID();
+                cancel(); state = { bound, leaseId, requestKey: demand.key(leaseId), trusted: false, controller: null, inflight: null,
                     result: null, accepted: null, acceptedText: null, retired: new Set(), nextCheck: -Infinity };
             }
             const current = state;
-            if (current.inflight) return current.inflight;
+            if (current.inflight) { renewPendingDemand(current); return current.inflight; }
             if (now() < current.nextCheck) return Promise.resolve(peek(current));
             current.inflight = update(current).then(result => {
                 if (!valid(current)) return null;
                 current.result = result;
-                current.nextCheck = now() + (result?.status === 'ok' ? options.pollMs ?? 5000 : options.errorBackoffMs ?? 30000);
+                current.nextCheck = now() + (result?.status === 'ok' ? options.pollMs ?? 2000 : options.errorBackoffMs ?? 1000);
                 return peek(current);
             }).finally(() => { current.inflight = null; });
             return current.inflight;
         },
-        stop() { stopped = true; cancel(); },
+        stop() { if (stopped) return; stopped = true; cancel();
+            document.removeEventListener('visibilitychange', visibility);
+            win.removeEventListener('popstate', visibility); win.removeEventListener('hashchange', visibility); },
         peek() { return peek(state); },
     };
 }
@@ -272,10 +324,12 @@ function buildRemoteScripts(owner) {
             if (!window[key]) {
                 const protocol = (() => { const module = { exports: {} }; ${protocol}\nreturn module.exports; })();
                 const createMetadataProtocol = ${createMetadataProtocol.toString()};
+                const createDemandProtocol = ${createDemandProtocol.toString()};
                 const makeReader = ${createRemoteReader.toString()};
                 const bindings = (${createSubagentBindings.toString()})();
                 const parent = makeReader(window, protocol.createSnapshotProtocol), agents = new Map();
                 window[key] = { read: () => parent.read(), peek: () => parent.peek(),
+                    releaseAgent(paneKey) { const reader = agents.get(paneKey); reader?.stop(); agents.delete(paneKey); return true; },
                     forAgent(paneKey) {
                         const selected = bindings.readBindings(window);
                         for (const [id, reader] of agents) if (!selected.some(item => item.key === id)) {
@@ -308,6 +362,10 @@ function buildRemoteScripts(owner) {
         script: scriptFor(),
         agentScript(paneKey) {
             return typeof paneKey === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(paneKey) ? scriptFor(paneKey) : null;
+        },
+        agentReleaseScript(paneKey) {
+            return typeof paneKey === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(paneKey)
+                ? `(() => { const key = Symbol.for(${key}); return window[key]?.releaseAgent(${JSON.stringify(paneKey)}) ?? true; })()` : null;
         },
         cleanupScript: `(() => { const key = Symbol.for(${key}); window[key]?.stop(); delete window[key]; })()`,
     };

@@ -22,6 +22,8 @@ function createDesktopForkResolver(options = {}) {
     const { claudeData, fs = defaultFs } = options || {};
     const dataRoot = typeof claudeData === 'string' && path.isAbsolute(claudeData)
         ? path.resolve(claudeData) : null;
+    const recordCache = new Map();
+    let cacheEnabled = true, scanChecks;
 
     async function safeDirectory(directory) {
         const info = await fs.lstat(directory);
@@ -33,6 +35,9 @@ function createDesktopForkResolver(options = {}) {
         const before = await fs.lstat(file);
         if (!before.isFile() || before.isSymbolicLink() || before.size > MaxBytes)
             throw new Error('Unsafe metadata record');
+        const cached = cacheEnabled && recordCache.get(file);
+        if (cached && sameVersion(before, cached.info))
+            return cached;
         const handle = await fs.open(file, 'r');
         try {
             const opened = await handle.stat();
@@ -45,10 +50,27 @@ function createDesktopForkResolver(options = {}) {
                 length += bytesRead;
             }
             const after = await fs.lstat(file);
-            if (length > MaxBytes || after.isSymbolicLink() || !after.isFile()
+            if (length !== opened.size || after.isSymbolicLink() || !after.isFile()
                 || !sameVersion(opened, await handle.stat()) || !sameVersion(opened, after))
                 throw new Error('Metadata record changed');
-            return { record: JSON.parse(buffer.subarray(0, length).toString('utf8')), info: after };
+            const record = JSON.parse(buffer.subarray(0, length).toString('utf8'));
+            const localId = path.basename(file, '.json');
+            const cliId = typeof record?.cliSessionId === 'string' && UUID.test(record.cliSessionId)
+                ? record.cliSessionId.toLowerCase() : null;
+            const pointer = record?.forkedFromSessionId, cutoff = record?.forkedAtMessageUuid;
+            // Cache only bounded identity/fork semantics, never metadata bodies or titles.
+            const result = { info: after, cliId,
+                pointer: pointer == null ? pointer : isLocalId(pointer) ? pointer.toLowerCase() : false,
+                cutoff: cutoff == null ? cutoff : typeof cutoff === 'string' && UUID.test(cutoff)
+                    ? cutoff.toLowerCase() : false,
+                valid: record !== null && typeof record === 'object' && !Array.isArray(record)
+                    && record.sessionId === localId && cliId !== null };
+            if (cacheEnabled) {
+                recordCache.delete(file);
+                while (recordCache.size >= MaxRecords) recordCache.delete(recordCache.keys().next().value);
+                recordCache.set(file, result);
+            }
+            return result;
         } finally { await handle.close(); }
     }
 
@@ -78,17 +100,10 @@ function createDesktopForkResolver(options = {}) {
             if (records.length >= MaxRecords) throw new Error('Metadata record limit reached');
             if (!child.isFile() || child.isSymbolicLink()) throw new Error('Unsafe metadata record');
             const file = path.join(directory, child.name);
-            const { record, info } = await readRecord(file);
+            const record = await readRecord(file);
             const localId = child.name.slice(0, -5);
-            const cliId = typeof record?.cliSessionId === 'string' && UUID.test(record.cliSessionId)
-                ? record.cliSessionId.toLowerCase() : null;
-            const pointer = record?.forkedFromSessionId, cutoff = record?.forkedAtMessageUuid;
-            records.push({ file, info, localId: localId.toLowerCase(), cliId,
-                pointer: typeof pointer === 'string' || pointer == null ? pointer : false,
-                cutoff: typeof cutoff === 'string' || cutoff == null ? cutoff : false,
-                accountId: accountId.toLowerCase(), organizationId: organizationId?.toLowerCase() ?? null,
-                valid: record !== null && typeof record === 'object' && !Array.isArray(record)
-                    && record.sessionId === localId && cliId !== null });
+            records.push({ ...record, file, localId: localId.toLowerCase(),
+                accountId: accountId.toLowerCase(), organizationId: organizationId?.toLowerCase() ?? null });
         }
 
         await rememberDirectory(dataRoot);
@@ -97,6 +112,7 @@ function createDesktopForkResolver(options = {}) {
         catch (error) {
             if (error.code !== 'ENOENT') throw error;
             if (!sameVersion(directories.get(dataRoot), await safeDirectory(dataRoot))) throw error;
+            recordCache.clear();
             return { records, directories };
         }
         for await (const account of entries(root)) {
@@ -122,7 +138,31 @@ function createDesktopForkResolver(options = {}) {
         }
         for (const [directory, info] of directories)
             if (!sameVersion(info, await safeDirectory(directory))) throw new Error('Metadata directory changed');
+        const seen = new Set(records.map(record => record.file));
+        for (const file of recordCache.keys()) if (!seen.has(file)) recordCache.delete(file);
         return { records, directories };
+    }
+
+    function freshScan() {
+        let checks = scanChecks;
+        if (!checks) {
+            checks = { waiting: [] };
+            scanChecks = checks;
+            queueMicrotask(async () => {
+                while (checks.waiting.length) {
+                    // Only callers queued before I/O starts may share a fresh scan.
+                    const cohort = checks.waiting.splice(0);
+                    try {
+                        const result = await scan();
+                        for (const caller of cohort) caller.resolve(result);
+                    } catch (error) {
+                        for (const caller of cohort) caller.reject(error);
+                    }
+                }
+                if (scanChecks === checks) scanChecks = undefined;
+            });
+        }
+        return new Promise((resolve, reject) => { checks.waiting.push({ resolve, reject }); });
     }
 
     function findFork({ records, directories }, cliId) {
@@ -160,13 +200,13 @@ function createDesktopForkResolver(options = {}) {
         if (typeof cliId !== 'string' || !UUID.test(cliId) || !dataRoot) return { incomplete: true };
         const normalized = cliId.toLowerCase();
         let binding;
-        try { binding = findFork(await scan(), normalized); }
+        try { binding = findFork(await freshScan(), normalized); }
         catch { return { incomplete: true }; }
         if (!binding || binding.incomplete) return binding;
         return { parentSessionId: binding.parentSessionId, cutoffMessageUuid: binding.cutoffMessageUuid,
             async verify() {
                 try {
-                    const current = findFork(await scan(), normalized);
+                    const current = findFork(await freshScan(), normalized);
                     if (!current || current.incomplete) return false;
                     return ['parentSessionId', 'cutoffMessageUuid', 'childFile', 'parentFile',
                         'childLocalId', 'parentLocalId'].every(key => current[key] === binding[key])
@@ -180,7 +220,9 @@ function createDesktopForkResolver(options = {}) {
             } };
     }
 
-    return { resolveFork };
+    function dispose() { cacheEnabled = false; recordCache.clear(); }
+    resolveFork.dispose = dispose;
+    return { resolveFork, dispose };
 }
 
 module.exports = { createDesktopForkResolver };

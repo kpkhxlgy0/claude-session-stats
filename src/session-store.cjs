@@ -503,7 +503,8 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
     }
 
     return { getStats, getAgentStats: subagents.getAgentStats,
-        getAgentStatsBatch: subagents.getAgentStatsBatch, listAgents: subagents.listAgents, dispose };
+        getAgentStatsBatch: subagents.getAgentStatsBatch, listAgents: subagents.listAgents,
+        verifyAgentMembership: subagents.verifyAgentMembership, dispose };
 }
 
 module.exports = { createSessionStore };

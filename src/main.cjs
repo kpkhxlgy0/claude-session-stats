@@ -4,7 +4,7 @@ const os = require('node:os');
 const { createSessionStore } = require('./session-store.cjs');
 const { createDesktopForkResolver } = require('./fork-metadata.cjs');
 const { createCliWorkspaceResolver } = require('./cli-workspace.cjs');
-const { resolveSession, isLocalId } = require('./session-map.cjs');
+const { isLocalId } = require('./session-map.cjs');
 const { createRemoteBridge, projectStats } = require('./remote-bridge.cjs');
 const { buildRemoteScripts } = require('./remote-reader.cjs');
 const { createSnapshotProtocol } = require('./snapshot.cjs');
@@ -14,9 +14,9 @@ const { randomUUID } = require('node:crypto');
 function startMain(api, options = {}) {
     const claudeData = options.claudeData ?? require('electron').app.getPath('userData');
     const claudeHome = options.claudeHome ?? (process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
-    const resolve = options.resolveSession ?? resolveSession;
+    const forkResolver = !options.store && !options.resolveFork ? createDesktopForkResolver({ claudeData }) : null;
     const store = options.store ?? createSessionStore({ claudeHome,
-        resolveFork: options.resolveFork ?? createDesktopForkResolver({ claudeData }).resolveFork });
+        resolveFork: options.resolveFork ?? forkResolver.resolveFork });
     const resolveWorkspace = options.resolveWorkspace ?? createCliWorkspaceResolver({ claudeHome,
         processCacheMs: 2000, gitCacheMs: 2000 });
     const publisher = options.publisher ?? require('./snapshot-publisher.cjs').createSnapshotPublisher({
@@ -31,7 +31,7 @@ function startMain(api, options = {}) {
     } catch { api.log.info('Session Stats snapshot publisher could not start'); }
     try {
         metadataPublisher = options.metadataPublisher
-            ?? require('./metadata-publisher.cjs').createMetadataPublisher({ source: publisher,
+            ?? require('./remote-demand.cjs').createRemoteDemand({ source: publisher,
                 fetch: options.metadataFetch ?? ((...args) => require('electron').net.fetch(...args)) });
         Promise.resolve(metadataPublisher.start()).catch(() => api.log.info('Session Stats metadata publisher could not start'));
     } catch { api.log.info('Session Stats metadata publisher could not start'); }
@@ -42,19 +42,14 @@ function startMain(api, options = {}) {
                 log: message => api.log.info(message) });
         Promise.resolve(snapshotAccess.start()).catch(() => api.log.info('Session Stats snapshot directory access could not start'));
     } catch { api.log.info('Session Stats snapshot directory access could not start'); }
-    api.ipc.handle('stats', async sessionId => {
+    api.ipc.handle('stats', async request => {
+        const sessionId = request?.sessionId;
         const unavailable = { threadId: isLocalId(sessionId) ? sessionId : null, status: 'unavailable', tps: null };
         if (stopped || !isLocalId(sessionId)) return unavailable;
         try {
-            const shared = await publisher.readLocal(sessionId, { waitForPoll: false });
+            const shared = await publisher.readLocal(sessionId, { owner: request.owner });
             if (stopped) return unavailable;
-            if (shared !== null) return { ...shared, threadId: sessionId };
-            const cliSessionId = await resolve(claudeData, sessionId);
-            if (stopped || !cliSessionId) return unavailable;
-            const stats = await store.getStats(cliSessionId);
-            const confirmedId = await resolve(claudeData, sessionId);
-            if (stopped || confirmedId !== cliSessionId) return unavailable;
-            return { ...stats, threadId: sessionId };
+            return shared ? { ...shared, threadId: sessionId } : unavailable;
         } catch { return unavailable; }
     });
     api.ipc.handle('agent-stats', async request => {
@@ -64,20 +59,16 @@ function startMain(api, options = {}) {
             agentId, status: 'unavailable', tps: null };
         if (stopped || !isLocalId(sessionId) || !agentId) return unavailable;
         try {
-            const shared = await publisher.readLocal(sessionId, { agentId, waitForPoll: false });
+            const shared = await publisher.readLocal(sessionId, { owner: request.owner, agentId });
             if (stopped) return unavailable;
-            if (shared !== null) return shared.agentId === agentId ? { ...shared, threadId: sessionId } : unavailable;
-            const cliSessionId = await resolve(claudeData, sessionId);
-            if (stopped || !cliSessionId) return unavailable;
-            const stats = await store.getAgentStats(cliSessionId, agentId);
-            const confirmedId = await resolve(claudeData, sessionId);
-            if (stopped || confirmedId !== cliSessionId || stats?.agentId !== agentId
-                || stats.threadId !== cliSessionId) return unavailable;
-            return { ...stats, threadId: sessionId };
+            return shared?.agentId === agentId ? { ...shared, threadId: sessionId } : unavailable;
         } catch { return unavailable; }
     });
     const ipcMain = options.ipcMain ?? require('electron').ipcMain;
     const scripts = buildRemoteScripts(randomUUID());
+    const interests = require('./interest-bridge.cjs').createInterestBridge({ ipcMain,
+        manifestId: api.manifest.id, publisher,
+        onRelease(frame) { try { Promise.resolve(frame.executeJavaScript(scripts.cleanupScript)).catch(() => {}); } catch {} } });
     const remote = createRemoteBridge({ ipcMain,
         manifestId: api.manifest.id, onReady: stats => api.log.info(
             `Session Stats Remote Control snapshot ready; revision=${stats.snapshotRevision}; usageComplete=${stats.usageComplete}`),
@@ -104,6 +95,9 @@ function startMain(api, options = {}) {
             const agentId = protocol.normalizeAgentId(value?.agentId);
             return stats && agentId ? { ...stats, agentId } : null;
         } });
+    const releaseAgent = createRemoteBridge({ ipcMain, manifestId: api.manifest.id,
+        channelName: 'stats-agent-release', script: request => scripts.agentReleaseScript(request?.key),
+        project: value => value === true });
     api.log.info('Session Stats started; local statistics and Remote Control snapshot synchronization');
     return { stop() {
         if (stopped) return stopping;
@@ -113,7 +107,7 @@ function startMain(api, options = {}) {
             try { shutdown.push(Promise.resolve(target?.stop()).catch(() => {})); } catch {}
         }
         stopping = Promise.all(shutdown).then(() => {});
-        store.dispose(); remote.stop(); binding.stop(); remoteAgents.stop();
+        interests.stop(); store.dispose(); forkResolver?.dispose?.(); remote.stop(); binding.stop(); remoteAgents.stop(); releaseAgent.stop();
         // IPC 注册由 Claude++ 的 API lease 在 stop 后清理。
         return stopping;
     } };

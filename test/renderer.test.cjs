@@ -2,7 +2,18 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { JSDOM } = require('jsdom');
-const { parseSessionId, findComposer, startRenderer } = require('../src/renderer.cjs');
+const { parseSessionId, findComposer, startRenderer: startActualRenderer } = require('../src/renderer.cjs');
+// These cases verify presentation and native selection correlation. Lease
+// lifecycle is exercised against the actual IPC shape in on-demand-renderer.
+function startRenderer(api, options) {
+    return startActualRenderer({ ...api, ipc: { ...api.ipc, invoke(channel, argument) {
+        if (channel === 'stats-interest' || channel === 'stats-release') return Promise.resolve(true);
+        if (channel === 'stats-agent-release') return Promise.resolve(true);
+        if (channel === 'stats' && argument && typeof argument === 'object') argument = argument.sessionId;
+        if (channel === 'agent-stats' && argument) { const { owner, ...request } = argument; argument = request; }
+        return argument === undefined ? api.ipc.invoke(channel) : api.ipc.invoke(channel, argument);
+    } } }, options);
+}
 const ID = 'local_11111111-1111-4111-8111-111111111111';
 const OTHER = 'local_22222222-2222-4222-8222-222222222222';
 const REMOTE = 'session_Abc123-remote_01';

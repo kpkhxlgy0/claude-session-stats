@@ -11,13 +11,13 @@ function fixture(t,extra={}) {
     const api={manifest:{id:'com.kpk.session-stats'},ipc:{handle:(key,fn)=>handlers.set(key,fn)},log:{info(){}}};
     const controller=startMain(api,{claudeData:'unused',claudeHome:'unused',
         ipcMain:{handle(){},removeHandler(){}},resolveSession:async()=>CLI,
-        publisher:{start(){},stop(){},readLocal:async()=>null},
+        publisher:{start(){},stop(){},async readLocal(_id,options){calls.push([CLI,options.agentId]);return{status:'ok',threadId:LOCAL,agentId:options.agentId,turns:1,tps:42};}},
         metadataPublisher:{start(){},stop(){}},
         store:{getStats(){assert.fail('must not substitute parent stats');},
             async getAgentStats(parent,agentId){calls.push([parent,agentId]);return{status:'ok',threadId:parent,agentId,turns:1,tps:42};},dispose(){}},
         ...extra});
     t.after(()=>controller.stop());
-    return {read:arg=>handlers.get('agent-stats')?.(arg),calls,controller,handlers};
+    return {read:arg=>handlers.get('agent-stats')?.({...arg,owner:'viewer'}),calls,controller,handlers};
 }
 test('local child IPC maps parent identity and returns only the requested child',async t=>{
     const f=fixture(t);
@@ -36,16 +36,14 @@ test('local child IPC uses the exact published child sample without recomputing'
     const sample={status:'ok',agentId:AGENT,turns:2,tps:55,snapshotRevision:7};
     const f=fixture(t,{publisher:{start(){},stop(){},async readLocal(id,options){seen.push({id,options});return sample;}}});
     assert.deepEqual(await f.read({sessionId:LOCAL,agentId:AGENT}),{...sample,threadId:LOCAL});
-    assert.deepEqual(seen,[{id:LOCAL,options:{agentId:AGENT,waitForPoll:false}}]);
+    assert.deepEqual(seen,[{id:LOCAL,options:{owner:'viewer',agentId:AGENT}}]);
     assert.deepEqual(f.calls,[]);
 });
 test('a mismatched published child and changed Desktop mapping fail closed',async t=>{
     const f=fixture(t,{publisher:{start(){},stop(){},readLocal:async()=>({status:'ok',agentId:'other',turns:99})}});
     assert.equal((await f.read({sessionId:LOCAL,agentId:AGENT}))?.status,'unavailable');
     assert.deepEqual(f.calls,[]);
-    let mappings=0;
-    const g=fixture(t,{resolveSession:async()=>++mappings===1?CLI:null});
-    assert.equal((await g.read({sessionId:LOCAL,agentId:AGENT}))?.status,'unavailable');
+    // Desktop mapping changes are rejected by the producer's lease-bound sample proof.
 });
 test('child IPC and frame bridges clean up when the tweak stops',async t=>{
     const raw=new Map();

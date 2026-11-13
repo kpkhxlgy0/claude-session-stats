@@ -34,7 +34,17 @@ async function fixture(t, { children = [], ...options } = {}) {
     const publisherOptions = { claudeData, claudeHome, store, now: () => clock, pollMs: 100000,
         publisherId: PUBLISHER, ...options };
     const publishers = [];
-    const makePublisher = () => { const value = createSnapshotPublisher(publisherOptions); publishers.push(value); return value; };
+    const makePublisher = () => {
+        const value = createSnapshotPublisher(publisherOptions);
+        const renew = () => value.setInterest('recovery_viewer', [{ localSessionId: LOCAL },
+            ...(children[0] ? [{ localSessionId: LOCAL, agentId: children[0] }] : [])]);
+        renew();
+        const start = value.start; value.start = () => { renew(); return start(); };
+        const readLocal = value.readLocal; value.readLocal = (id, options = {}) => {
+            renew(); return readLocal(id, { owner: 'recovery_viewer', ...options });
+        };
+        publishers.push(value); return value;
+    };
     const publisher = makePublisher();
     const directory = path.join(claudeHome, '.session-stats');
     const destination = agentId => path.join(directory, `${BRIDGE}${agentId === undefined ? '' : `.agent-${agentId}`}.json`);

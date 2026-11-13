@@ -187,6 +187,7 @@ function startRenderer(api, options = {}) {
     const win = options.window ?? window;
     const doc = win.document;
     let entry = null;
+    const interestOwner = `viewer_${win.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
     const remoteRequests = new WeakMap();
     const agentEntries = new Map();
     const paneKeys = new Map();
@@ -219,7 +220,18 @@ function startRenderer(api, options = {}) {
     `;
     doc.head.append(style);
 
-    function remove() { entry?.bar.remove(); entry = null; }
+    function releaseInterest() { void api.ipc.invoke('stats-release', { owner: interestOwner }).catch(() => {}); }
+    async function syncInterest() {
+        if (stopped || doc.visibilityState === 'hidden') { releaseInterest(); return false; }
+        const sessionId = parseSessionId(win.location.href);
+        const targets = [];
+        if (entry && isCurrent(entry) && !entry.remote) targets.push({ localSessionId: sessionId });
+        const child = [...agentEntries.values()].find(value => !value.remote && value.sessionId === sessionId
+            && value.root.isConnected && isVisible(value.root, win));
+        if (child) targets.push({ localSessionId: sessionId, agentId: child.agentId });
+        return await api.ipc.invoke('stats-interest', { owner: interestOwner, targets }) === true;
+    }
+    function remove() { if (entry) releaseInterest(); entry?.bar.remove(); entry = null; }
     function mountAgent(current) {
         current.root.dataset.sessionStatsFooter = '';
         if (!current.bar.isConnected) current.root.append(current.bar);
@@ -229,8 +241,12 @@ function startRenderer(api, options = {}) {
     }
     function removeAgent(root) {
         const current = agentEntries.get(root);
-        if (current) unmountAgent(current);
+        if (current) {
+            unmountAgent(current);
+            if (current.remote) void api.ipc.invoke('stats-agent-release', { key: current.key }).catch(() => {});
+        }
         agentEntries.delete(root);
+        if (current) void syncInterest();
     }
     function forgetPane(root) {
         removeAgent(root);
@@ -274,8 +290,9 @@ function startRenderer(api, options = {}) {
         const epoch = childRevision;
         const revision = current.revision;
         try {
+            if (!await syncInterest() || !isCurrentAgent(current, epoch, revision)) return;
             const stats = await api.ipc.invoke(current.remote ? 'remote-agent-stats' : 'agent-stats',
-                current.remote ? { key: current.key } : { sessionId: current.sessionId, agentId: current.agentId });
+                current.remote ? { key: current.key } : { sessionId: current.sessionId, agentId: current.agentId, owner: interestOwner });
             if (!isCurrentAgent(current, epoch, revision)) return;
             const matches = stats?.threadId === current.sessionId && stats.agentId === current.agentId;
             if (current.remote && (!matches || stats.source !== 'remote_control'
@@ -369,8 +386,9 @@ function startRenderer(api, options = {}) {
         const request = {};
         current.inflight = request;
         try {
+            if (!await syncInterest() || !isCurrent(current)) return;
             const stats = await (current.remote ? api.ipc.invoke('remote-stats')
-                : api.ipc.invoke('stats', current.sessionId));
+                : api.ipc.invoke('stats', { sessionId: current.sessionId, owner: interestOwner }));
             if (!isCurrent(current) || current.root !== requestedRoot || current.inflight !== request) return;
             if (current.remote) {
                 if (stats?.threadId !== current.sessionId || stats.source !== 'remote_control'
@@ -418,12 +436,14 @@ function startRenderer(api, options = {}) {
         if (entry.root !== root) entry.inflight = false;
         entry.root = root; entry.composerMissingAt = null;
         if (!entry.remote || entry.confirmed) mountFooter(entry);
+        // Renewal is independent of a potentially slow source/RPC invocation.
+        void syncInterest();
         void refresh(entry);
     }
     function schedule() {
         if (!stopped && scheduled === null) scheduled = win.setTimeout(reconcile, options.debounceMs ?? 100);
     }
-    function invalidate() { childRevision++; schedule(); }
+    function invalidate() { childRevision++; releaseInterest(); schedule(); }
     function invalidatePanes(mutation) {
         const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
         const pane = target?.closest('[data-pane-root]');
@@ -441,7 +461,10 @@ function startRenderer(api, options = {}) {
                 && [...m.addedNodes, ...m.removedNodes].every(node => node.nodeType === 1
                     && node.matches('[data-session-stats]'))));
         for (const mutation of relevant) invalidatePanes(mutation);
-        if (relevant.length) schedule();
+        if (relevant.length) {
+            try { if (entry && !isCurrent(entry)) releaseInterest(); } catch { releaseInterest(); }
+            schedule();
+        }
     });
     observer.observe(doc.documentElement, { childList: true, subtree: true, attributes: true,
         attributeFilter: ['hidden', 'inert', 'aria-hidden', 'contenteditable', 'class', 'style',
@@ -453,7 +476,7 @@ function startRenderer(api, options = {}) {
     reconcile();
     return { stop() {
         if (stopped) return;
-        stopped = true; observer.disconnect(); win.clearInterval(timer);
+        stopped = true; releaseInterest(); observer.disconnect(); win.clearInterval(timer);
         if (scheduled !== null) win.clearTimeout(scheduled);
         for (const event of ['popstate', 'hashchange']) win.removeEventListener(event, invalidate, true);
         for (const event of ['resize', 'scroll']) win.removeEventListener(event, schedule, true);

@@ -26,19 +26,41 @@ async function safeDirectory(directory) {
     return info;
 }
 
-async function readRecord(file, withVersion = false) {
+async function readRecord(file, withVersion = false, cache) {
     const info = await fs.lstat(file);
     if (!info.isFile() || info.isSymbolicLink() || info.size > MaxBytes) return null;
+    const cached = cache?.enabled && cache.records.get(file);
+    if (cached && sameVersion(info, cached.info))
+        return withVersion ? cached : cached.record;
     const handle = await fs.open(file, 'r');
     try {
         const opened = await handle.stat();
         if (!opened.isFile() || !sameVersion(info, opened)) return null;
-        const buffer = Buffer.alloc(MaxBytes + 1);
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-        if (bytesRead > MaxBytes || !sameVersion(opened, await handle.stat())
+        // Keep one extra byte to detect growth, without allocating the maximum
+        // metadata size for every small record. A filesystem read may be partial.
+        const buffer = Buffer.alloc(opened.size + 1);
+        let bytesRead = 0;
+        while (bytesRead < buffer.length) {
+            const next = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+            if (!next.bytesRead) break;
+            bytesRead += next.bytesRead;
+        }
+        if (bytesRead !== opened.size || !sameVersion(opened, await handle.stat())
             || !sameVersion(opened, await fs.lstat(file))) return null;
         const record = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
-        return withVersion ? { record, info: opened } : record;
+        const value = { record, info: opened };
+        if (cache?.enabled) {
+            const previous = cache.records.get(file);
+            if (previous) { cache.bytes -= previous.info.size; cache.records.delete(file); }
+            while (cache.records.size && (cache.records.size >= MaxRecords || cache.bytes + opened.size > 8 * 1024 * 1024)) {
+                const key = cache.records.keys().next().value;
+                cache.bytes -= cache.records.get(key).info.size;
+                cache.records.delete(key);
+            }
+            cache.records.set(file, value);
+            cache.bytes += opened.size;
+        }
+        return withVersion ? value : record;
     } finally { await handle.close(); }
 }
 
@@ -89,14 +111,14 @@ async function resolveBindingWorkspace(binding, resolveWorkspace, relocationCwd)
     } catch { return null; }
 }
 
-async function inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd } = {}) {
+async function inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd, recordCache } = {}) {
     try {
         const org = path.dirname(binding.metadataFile);
         const account = path.dirname(org);
         const root = path.dirname(account);
         const directories = [path.dirname(root), root, account, org];
         const identities = await Promise.all(directories.map(safeDirectory));
-        const read = await readRecord(binding.metadataFile, true);
+        const read = await readRecord(binding.metadataFile, true, recordCache);
         if (!read) return false;
         const context = {
             localSessionId: path.basename(binding.metadataFile, '.json'),
@@ -115,7 +137,7 @@ async function inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd
         }
         let checked = read;
         if (!sameVersion(read.info, await fs.lstat(binding.metadataFile))) {
-            checked = await readRecord(binding.metadataFile, true);
+            checked = await readRecord(binding.metadataFile, true, recordCache);
             // Compare declared bindings before a live workspace can supersede their roots.
             if (!checked || snapshotBindingSetKey(candidates)
                 !== snapshotBindingSetKey(await recordBindings(checked.record, context))) return false;
@@ -130,25 +152,26 @@ async function recheckSnapshotBinding(binding, options) {
     return await inspectSnapshotBinding(binding, options) === true;
 }
 
-async function resolveSnapshotAssistantTip(binding, options) {
+async function resolveSnapshotAssistantTip(binding, options = {}) {
+    const { recordCache } = options;
     // Attest this exact record only. The caller must bracket sampling with its
     // global local/bridge identity discovery (as the publisher does).
     try {
-        const before = await readRecord(binding.metadataFile, true);
+        const before = await readRecord(binding.metadataFile, true, recordCache);
         const tip = before?.record.lastAssistantUuid;
         if (typeof tip !== 'string' || !UUID.test(tip) || before.record.sessionId !== binding.localSessionId
             || before.record.cliSessionId !== binding.cliSessionId
             || !await recheckSnapshotBinding(binding, options)) return null;
-        const after = await readRecord(binding.metadataFile, true);
+        const after = await readRecord(binding.metadataFile, true, recordCache);
         return after && sameVersion(before.info, after.info) && after.record.lastAssistantUuid === tip
             && after.record.sessionId === binding.localSessionId && after.record.cliSessionId === binding.cliSessionId
             ? tip : null;
     } catch { return null; }
 }
 
-async function resolveSnapshotRelocation(binding, relocationCwd, { resolveWorkspace } = {}) {
+async function resolveSnapshotRelocation(binding, relocationCwd, { resolveWorkspace, recordCache } = {}) {
     if (typeof relocationCwd !== 'string' || !path.isAbsolute(relocationCwd)) return null;
-    const proof = await inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd });
+    const proof = await inspectSnapshotBinding(binding, { resolveWorkspace, relocationCwd, recordCache });
     return typeof proof === 'string' ? proof : null;
 }
 
@@ -163,11 +186,11 @@ function snapshotBindingSetKey(bindings) {
 }
 
 async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavailableWorkspace,
-    onlyBindings, onIdentityScan } = {}) {
+    onlyBindings, onlyLocalSessionIds, onLocalSession, onIdentityScan, recordCache } = {}) {
     if (typeof claudeData !== 'string' || !path.isAbsolute(claudeData)) return [];
     if (onlyBindings !== undefined && (!Array.isArray(onlyBindings) || onlyBindings.length > MaxRecords * 128)) return [];
     const selected = onlyBindings === undefined ? null : new Set(onlyBindings.map(snapshotBindingIdentity));
-    const found = [], localCounts = new Map(), bridgeCounts = new Map();
+    const found = [], localSessions = [], localCounts = new Map(), bridgeCounts = new Map();
     let directoryCount = 0, entryCount = 0, recordCount = 0;
     async function* entries(directory) {
         if (++directoryCount > MaxDirectories) throw new Error('Metadata directory limit reached');
@@ -197,8 +220,13 @@ async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavai
                     if (!child.isFile() || child.isSymbolicLink()) continue;
                     const metadataFile = path.join(orgPath, child.name);
                     let record;
-                    try { record = await readRecord(metadataFile); }
+                    try { record = await readRecord(metadataFile, false, recordCache); }
                     catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) continue; throw error; }
+                    if (record?.sessionId === localSessionId && UUID.test(record?.cliSessionId || ''))
+                        localSessions.push({ localSessionId: localKey, cliSessionId: record.cliSessionId.toLowerCase(), metadataFile,
+                            available: record.isArchived !== true && record.transcriptUnavailable !== true
+                                && record.remoteControlUserEnabled !== false
+                                && (record.bridgeSessionIds === undefined || Array.isArray(record.bridgeSessionIds) && record.bridgeSessionIds.length === 0) });
                     for (const binding of await recordBindings(record, { localSessionId,
                         accountId: account.name, organizationId: org.name, metadataFile })) {
                         bridgeCounts.set(binding.bridgeSessionId, (bridgeCounts.get(binding.bridgeSessionId) || 0) + 1);
@@ -210,16 +238,37 @@ async function discoverSnapshotBindings(claudeData, { resolveWorkspace, onUnavai
     } catch { return []; }
     const eligible = found.filter(binding => localCounts.get(binding.localSessionId) === 1
         && bridgeCounts.get(binding.bridgeSessionId) === 1);
+    for (const session of localSessions) if (localCounts.get(session.localSessionId) === 1) onLocalSession?.(session);
     onIdentityScan?.(eligible);
+    const targets = eligible.filter(binding => (!selected || selected.has(snapshotBindingIdentity(binding)))
+        && (!onlyLocalSessionIds || onlyLocalSessionIds.includes(binding.localSessionId)));
     const resolved = [];
-    for (const binding of eligible) {
-        if (selected && !selected.has(snapshotBindingIdentity(binding))) continue;
-        const current = await resolveBindingWorkspace(binding, resolveWorkspace);
-        if (current) resolved.push(current);
-        else onUnavailableWorkspace?.(binding.localSessionId);
-    }
+    let next = 0;
+    // A bounded cohort lets the CLI resolver share fresh registry enumeration
+    // across bindings, without spawning an unbounded number of Git processes.
+    await Promise.all(Array.from({ length: Math.min(8, targets.length) }, async () => {
+        while (next < targets.length) {
+            const binding = targets[next++];
+            const current = await resolveBindingWorkspace(binding, resolveWorkspace);
+            if (current) resolved.push(current);
+            else onUnavailableWorkspace?.(binding.localSessionId);
+        }
+    }));
     return resolved.sort((a, b) => a.metadataFile.localeCompare(b.metadataFile)
         || a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
-module.exports = { discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation,
+function createSnapshotBindingAccess() {
+    // Content belongs to this publisher only. Every use still checks the exact
+    // pathname version, and all directory/identity/workspace proofs remain fresh.
+    const recordCache = { records: new Map(), bytes: 0, enabled: true };
+    const options = value => ({ ...value, recordCache });
+    return {
+        discoverSnapshotBindings: (root, value) => discoverSnapshotBindings(root, options(value)),
+        recheckSnapshotBinding: (binding, value) => recheckSnapshotBinding(binding, options(value)),
+        resolveSnapshotRelocation: (binding, cwd, value) => resolveSnapshotRelocation(binding, cwd, options(value)),
+        resolveSnapshotAssistantTip: (binding, value) => resolveSnapshotAssistantTip(binding, options(value)),
+        dispose() { recordCache.enabled = false; recordCache.records.clear(); recordCache.bytes = 0; }
+    };
+}
+module.exports = { createSnapshotBindingAccess, discoverSnapshotBindings, recheckSnapshotBinding, resolveSnapshotRelocation,
     resolveSnapshotAssistantTip, snapshotBindingIdentity };

@@ -399,3 +399,87 @@ test('another metadata update after the stable reread rejects without repeating 
     assert.equal(proofs, 2);
     assert.equal(reads, 2);
 });
+
+test('metadata reads allocate for the file and tolerate partial filesystem reads', async t => {
+    const f = await fixture(t);
+    const file = await f.write();
+    const size = (await fs.stat(file)).size;
+    const open = fs.open;
+    let largest = 0;
+    t.mock.method(fs, 'open', async (target, ...args) => {
+        const handle = await open(target, ...args);
+        if (target !== file) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (buffer, offset, length, position) => {
+            largest = Math.max(largest, buffer.length);
+            return handle.read(buffer, offset, Math.min(length, 23), position);
+        } };
+    });
+    assert.equal((await discoverSnapshotBindings(f.claudeData)).length, 1);
+    assert.ok(largest <= size + 1, `Allocated ${largest} bytes for ${size}-byte metadata`);
+});
+
+test('warm identity discovery fingerprints unchanged metadata once and observes the next write', async t => {
+    const f = await fixture(t), file = await f.write();
+    const access = require('../src/snapshot-bindings.cjs').createSnapshotBindingAccess();
+    t.after(() => access.dispose());
+    assert.equal((await access.discoverSnapshotBindings(f.claudeData)).length, 1);
+    const lstat = fs.lstat;
+    let fingerprints = 0;
+    t.mock.method(fs, 'lstat', async (candidate, ...args) => {
+        if (candidate === file) fingerprints++;
+        return lstat(candidate, ...args);
+    });
+    assert.equal((await access.discoverSnapshotBindings(f.claudeData)).length, 1);
+    assert.equal(fingerprints, 1, 'Cached immutable content needs one fresh version observation');
+    await f.write({ ...f.row, isArchived: true });
+    assert.deepEqual(await access.discoverSnapshotBindings(f.claudeData), []);
+});
+
+test('an early zero-byte metadata read cannot accept a valid JSON prefix', async t => {
+    const f = await fixture(t);
+    const file = await f.write();
+    const end = (await fs.stat(file)).size;
+    await fs.appendFile(file, ' invalid suffix');
+    const open = fs.open;
+    t.mock.method(fs, 'open', async (target, ...args) => {
+        const handle = await open(target, ...args);
+        if (target !== file) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (buffer, offset, length, position) =>
+            position >= end ? { bytesRead: 0, buffer } : handle.read(buffer, offset, Math.min(length, end - position), position) };
+    });
+    assert.deepEqual(await discoverSnapshotBindings(f.claudeData), []);
+});
+
+test('metadata disposal during a read prevents reuse by an old or a new publisher scope', async t => {
+    const { createSnapshotBindingAccess } = require('../src/snapshot-bindings.cjs');
+    const f = await fixture(t);
+    const file = await f.write();
+    const access = createSnapshotBindingAccess();
+    t.after(() => access.dispose());
+    let entered, release, pause = true, reads = 0;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const resume = new Promise(resolve => { release = resolve; });
+    const open = fs.open;
+    t.mock.method(fs, 'open', async (target, ...args) => {
+        const handle = await open(target, ...args);
+        if (target !== file) return handle;
+        reads++;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...values) => {
+            const result = await handle.read(...values);
+            if (pause) { pause = false; entered(); await resume; }
+            return result;
+        } };
+    });
+    const first = access.discoverSnapshotBindings(f.claudeData);
+    await waiting;
+    try { access.dispose(); } finally { release(); }
+    assert.equal((await first).length, 1);
+    assert.equal((await access.discoverSnapshotBindings(f.claudeData)).length, 1);
+    assert.equal(reads, 2);
+    const next = createSnapshotBindingAccess();
+    t.after(() => next.dispose());
+    assert.equal((await next.discoverSnapshotBindings(f.claudeData)).length, 1);
+    assert.equal(reads, 3);
+    assert.equal((await next.discoverSnapshotBindings(f.claudeData)).length, 1);
+    assert.equal(reads, 3);
+});

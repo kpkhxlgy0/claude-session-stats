@@ -291,6 +291,9 @@ test('local snapshot reads use six Git calls and a fresh proof after snapshot I/
         store: { getStats: async () => ({ status: 'ok', usageComplete: true, turns: 1, steps: 1,
             totalTokens: 10, inputTokens: 4, outputTokens: 6, cachedInputTokens: 0, cacheHit: 0, tps: 3 }) } });
     t.after(() => publisher.stop());
+    publisher.setInterest('workspace_viewer', [{ localSessionId: LOCAL }]);
+    const readLocal = publisher.readLocal;
+    publisher.readLocal = (id, value = {}) => readLocal(id, { owner: 'workspace_viewer', ...value });
     await publisher.start();
     // Select once and drain its immediate background refresh before measuring
     // the two fresh proofs performed by a subsequent snapshot read itself.
@@ -697,4 +700,158 @@ test('unsupported native process platforms never guess moved-workspace birth for
             hostname: 'fixture-host', execFile: f.execFile });
         assert.deepEqual(await resolver(f.binding), { unavailable: true });
     }
+});
+
+test('concurrent workspace proofs share fresh registry scans and unchanged file reads', async t => {
+    let scans = 0, reads = 0;
+    const counted = { ...fs, opendir: async (...args) => {
+        if (path.basename(args[0]) === 'sessions') scans++;
+        return fs.opendir(...args);
+    }, open: async (...args) => {
+        if (/^10[12]\.json$/.test(path.basename(args[0]))) reads++;
+        return fs.open(...args);
+    } };
+    let f;
+    const pending = [];
+    let hold = true;
+    f = await fixture(t, { fs: counted, execFile: (...args) => {
+        if (hold && args[1].includes('worktree')) {
+            pending.push(() => f.execFile(...args));
+            if (pending.length === 12) { hold = false; for (const release of pending) release(); }
+        } else f.execFile(...args);
+    } });
+    await f.write();
+    const other = { ...f.binding, cliSessionId: '88888888-8888-4888-8888-888888888888',
+        localSessionId: 'local_99999999-9999-4999-8999-999999999999', bridgeSessionId: 'session_other' };
+    await f.write({ pid: 102, sessionId: other.cliSessionId, hostSessionId: other.localSessionId,
+        bridgeSessionId: other.bridgeSessionId, cwd: f.second }, '102.json');
+    f.processes.set(102, { alive: true, procStart: BIRTH });
+    const first = await Promise.all(Array.from({ length: 12 }, (_, index) =>
+        f.resolver.resolveVerified(index % 2 ? other : f.binding)));
+    assert.ok(first.every((value, index) => value?.workspaceRoot === (index % 2 ? f.second : f.active)));
+    assert.equal(scans, 2, 'One fresh pre/post registry enumeration for this proof cohort');
+    assert.equal(reads, 2, 'The second scan should freshly fingerprint, rather than reopen, unchanged registry files');
+    scans = 0;
+    const absent = { ...f.binding, cliSessionId: f.binding.accountId, localSessionId: 'local_77777777-7777-4777-8777-777777777777',
+        bridgeSessionId: 'session_absent' };
+    assert.deepEqual(await Promise.all(Array.from({ length: 12 }, () => f.resolver.resolveVerified(absent))), Array(12).fill(null));
+    assert.equal(scans, 1);
+    assert.equal(reads, 2);
+    await f.write({ cwd: f.second });
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.second);
+    assert.equal(reads, 3, 'Registry writes must be visible immediately without a cache TTL');
+});
+
+test('registry reads allocate for the file and tolerate partial filesystem reads', async t => {
+    let largest = 0;
+    const counted = { ...fs, open: async (file, ...args) => {
+        const handle = await fs.open(file, ...args);
+        if (path.basename(file) !== '101.json') return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (buffer, offset, length, position) => {
+            largest = Math.max(largest, buffer.length);
+            return handle.read(buffer, offset, Math.min(length, 23), position);
+        } };
+    } };
+    const f = await fixture(t, { fs: counted });
+    const file = await f.write();
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.active);
+    assert.ok(largest <= (await fs.stat(file)).size + 1);
+});
+
+test('warm registry cache rejects a symlink replacement before serving cached content', async t => {
+    const f = await fixture(t);
+    const file = await f.write();
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.active);
+    const replacement = path.join(f.root, 'replacement.json');
+    await fs.rename(file, replacement);
+    await fs.symlink(replacement, file, 'file');
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), { unavailable: true });
+});
+
+test('a proof queued after registry I/O begins gets a fresh scan after the old read fails', async t => {
+    let entered, release, pause = true;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const resume = new Promise(resolve => { release = resolve; });
+    const guarded = { ...fs, open: async (file, ...args) => {
+        const handle = await fs.open(file, ...args);
+        if (path.basename(file) !== '101.json') return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...values) => {
+            const result = await handle.read(...values);
+            if (pause) { pause = false; entered(); await resume; }
+            return result;
+        } };
+    } };
+    const f = await fixture(t, { fs: guarded });
+    await f.write();
+    const first = f.resolver.resolveVerified(f.binding);
+    await waiting;
+    let second;
+    try {
+        await f.write({ cwd: f.second });
+        second = f.resolver.resolveVerified(f.binding);
+        await Promise.resolve();
+    } finally { release(); }
+    assert.deepEqual(await first, { unavailable: true });
+    assert.equal((await second).workspaceRoot, f.second);
+});
+
+test('registry disposal during a read prevents pending scans from repopulating the content cache', async t => {
+    let entered, release, pause = true, reads = 0;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const resume = new Promise(resolve => { release = resolve; });
+    const guarded = { ...fs, open: async (file, ...args) => {
+        const handle = await fs.open(file, ...args);
+        if (path.basename(file) !== '101.json') return handle;
+        reads++;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...values) => {
+            const result = await handle.read(...values);
+            if (pause) { pause = false; entered(); await resume; }
+            return result;
+        } };
+    } };
+    const f = await fixture(t, { fs: guarded });
+    await f.write();
+    const first = f.resolver.resolveVerified(f.binding);
+    await waiting;
+    try { f.resolver.dispose(); } finally { release(); }
+    assert.equal((await first).workspaceRoot, f.active);
+    assert.equal(reads, 2);
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.active);
+    assert.equal(reads, 4, 'A disposed resolver must not retain content from an in-flight or later proof');
+});
+
+test('an early zero-byte registry read cannot accept a valid JSON prefix', async t => {
+    let end;
+    const guarded = { ...fs, open: async (file, ...args) => {
+        const handle = await fs.open(file, ...args);
+        if (path.basename(file) !== '101.json') return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (buffer, offset, length, position) =>
+            position >= end ? { bytesRead: 0, buffer } : handle.read(buffer, offset, Math.min(length, end - position), position) };
+    } };
+    const f = await fixture(t, { fs: guarded });
+    const file = await f.write();
+    end = (await fs.stat(file)).size;
+    await fs.appendFile(file, ' invalid suffix');
+    assert.deepEqual(await f.resolver.resolveVerified(f.binding), { unavailable: true });
+});
+
+test('each warm registry scan checks an unchanged pathname once without reopening its content', async t => {
+    let fingerprints = 0, reads = 0;
+    const counted = { ...fs, lstat: async (file, ...args) => {
+        if (path.basename(file) === '101.json') fingerprints++;
+        return fs.lstat(file, ...args);
+    }, open: async (file, ...args) => {
+        if (path.basename(file) === '101.json') reads++;
+        return fs.open(file, ...args);
+    } };
+    const f = await fixture(t, { fs: counted });
+    await f.write();
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.active);
+    fingerprints = 0;
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.active);
+    assert.equal(fingerprints, 2, 'One fresh pathname check in each independent pre/post scan');
+    assert.equal(reads, 1);
+    await f.write({ cwd: f.second });
+    assert.equal((await f.resolver.resolveVerified(f.binding)).workspaceRoot, f.second);
+    assert.equal(reads, 2);
 });

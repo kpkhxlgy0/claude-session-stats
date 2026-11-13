@@ -69,9 +69,20 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, metadata publ
     const resolveWorkspace = createCliWorkspaceResolver({ claudeHome, platform: 'win32', hostname: 'fixture-host',
         getProcessIdentities: async () => new Map([[101, { alive: true, procStart: '123456' }]]) });
     const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, resolveWorkspace, now: () => time, pollMs: 600000 });
+    const startPublisher = publisher.start;
+    publisher.start = () => { publisher.setInterest('integration_viewer', [{ localSessionId: LOCAL },
+        { localSessionId: LOCAL, agentId }]); return startPublisher(); };
+    const readLocal = publisher.readLocal;
+    publisher.readLocal = (id, options = {}) => readLocal(id, { owner: 'integration_viewer', ...options });
     const metadataApi = createMetadataApi({ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT, snapshotDirectory: path.dirname(destination),
         responseShape: moved === true ? 'response_shape' : 'session' });
-    const metadataPublisher = createMetadataPublisher({ source: publisher, fetch: metadataApi.writerFetch,
+    const metadataPublisher = createMetadataPublisher({ source: {
+        listRemoteBindings: () => [{ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT }],
+        async readRemoteLocation() {
+            const sample = await publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG });
+            return sample ? { bridgeSessionId: BRIDGE, organizationId: ORG, publisherId: sample.publisherId,
+                generatedAt: sample.generatedAt, directory: path.dirname(destination) } : null;
+        } }, fetch: metadataApi.writerFetch,
         now: () => time, pollMs: 600000 });
     const dom = new JSDOM('<div class="ProseMirror" contenteditable="true"></div>', { url: 'https://claude.ai/code/' + BRIDGE });
     const editor = dom.window.document.querySelector('.ProseMirror');
@@ -89,9 +100,6 @@ for (const moved of [false, true, 'duplicate']) test(`local JSONL, metadata publ
     const fields = ['turns', 'steps', 'totalTokens', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheHit', 'tps',
         'usageComplete', 'snapshotGeneratedAt', 'snapshotRevision', 'snapshotPublisherId'];
     const local = await publisher.readLocal(LOCAL);
-    const unpublished = await receiver.read();
-    assert.equal(unpublished.status, 'unavailable');
-    assert.equal(unpublished.totalTokens, null);
     await metadataPublisher.start();
     const remote = await receiver.read();
     assert.equal(local.tps, 4); assert.equal(local.totalTokens, 140);
@@ -188,17 +196,20 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
         getProcessIdentities: async () => new Map([[101, { alive: true, procStart: '123456' }]]) });
     const sample = { status: 'ok', turns: 1, steps: 1, totalTokens: 10, inputTokens: 4,
         outputTokens: 6, cachedInputTokens: 0, cacheHit: 0, tps: 3, usageComplete: true };
-    let read;
+    let read; const rawHandlers = new Map();
     const controller = startMain({ manifest: { id: 'com.kpk.session-stats' },
         ipc: { handle(name, handler) { if (name === 'stats') read = handler; } }, log: { info() {} } }, {
         claudeData, claudeHome, resolveWorkspace, store: { getStats: async () => sample, dispose() {} },
         metadataPublisher: { start() {}, stop() {} },
-        ipcMain: { handle() {}, removeHandler() {} } });
+        ipcMain: { handle(key, handler) { rawHandlers.set(key, handler); }, removeHandler(key) { rawHandlers.delete(key); } } });
     t.after(async () => { await controller.stop(); await fs.rm(root, { recursive: true, force: true }); });
+    const frame = { url: `https://claude.ai/code/${LOCAL}`, executeJavaScript: async () => null };
+    await rawHandlers.get('claudepp:com.kpk.session-stats:stats-interest')({ senderFrame: frame,
+        sender: { mainFrame: frame } }, { owner: 'main_viewer', targets: [{ localSessionId: LOCAL }] });
     let local;
     const deadline = Date.now() + 5000;
     do {
-        local = await read(LOCAL);
+        local = await read({ sessionId: LOCAL, owner: 'main_viewer' });
         if (local.status === 'ok') break;
         await new Promise(resolve => setTimeout(resolve, 20));
     } while (Date.now() < deadline);
@@ -211,7 +222,7 @@ test('main wires the CLI workspace resolver into its real publisher', async t =>
     await fs.writeFile(path.join(claudeHome, 'sessions', '101.json'), JSON.stringify({ pid: 101,
         sessionId: CLI, hostSessionId: 'local_conflict', bridgeSessionId: BRIDGE, cwd: active,
         startedAt: 1000, procStart: '123456', pidDomain: 'win32:fixture-host' }));
-    const invalid = await read(LOCAL);
+    const invalid = await read({ sessionId: LOCAL, owner: 'main_viewer' });
     assert.equal(invalid.status, 'unavailable');
     assert.equal(invalid.tps, null);
 });
@@ -249,6 +260,9 @@ for (const returned of [true, false]) test(`bridge-less registry publishes prove
         } });
     const store = createSessionStore({ claudeHome });
     const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, resolveWorkspace, pollMs: 600000 });
+    publisher.setInterest('copies_viewer', [{ localSessionId: LOCAL }]);
+    const readSelected = publisher.readLocal;
+    publisher.readLocal = (id, value = {}) => readSelected(id, { owner: 'copies_viewer', ...value });
     t.after(async () => { await publisher.stop(); store.dispose(); await fs.rm(root, { recursive: true, force: true }); });
     await publisher.start();
     const local = await publisher.readLocal(LOCAL);

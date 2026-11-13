@@ -332,8 +332,8 @@ test('stop cancels a response-poll wait without sending another request', async 
         polled = true; signal = init.signal; return response({ data: [], resume_cursor: '10' });
     });
     const pending = f.reader.read(); await waitFor(() => polled); await flush();
-    const calls = f.requests.length; f.reader.stop();
-    assert.equal(await pending, null); assert.equal(signal.aborted, true); assert.equal(f.requests.length, calls);
+    const calls = f.requests.filter(value => value.init.method !== 'PUT').length; f.reader.stop();
+    assert.equal(await pending, null); assert.equal(signal.aborted, true); assert.equal(f.requests.filter(value => value.init.method !== 'PUT').length, calls);
 });
 
 test('a missing response times out with bound unavailable statistics', async t => {
@@ -380,8 +380,8 @@ test('switching organizations discards cached numbers and a missing provider nev
     assert.equal(f.reader.peek(), null);
     assert.equal((await f.reader.read()).unavailableReason, 'snapshot-identity');
     f.editor.__reactFiber$test.return = null;
-    const calls = f.requests.length;
-    assert.equal(await f.reader.read(), null); assert.equal(f.requests.length, calls);
+    const calls = f.requests.filter(value => value.init.method !== 'PUT').length;
+    assert.equal(await f.reader.read(), null); assert.equal(f.requests.filter(value => value.init.method !== 'PUT').length, calls);
 });
 
 test('the current account provider can be above a deeply nested composer', async t => {
@@ -463,9 +463,8 @@ test('a denied advertised read never tries another path, anchor or data source',
         { subtype: 'read_file', path: PATH, max_bytes: 16384, encoding: 'utf-8' });
 });
 
-test('missing, legacy and malformed locations never request any file or write metadata', async t => {
+test('legacy and malformed locations never request any file or publish demand', async t => {
     for (const [mutate, reason] of [
-        [() => undefined, 'snapshot-missing'],
         [value => ({ ...value, protocolVersion: 1 }), 'snapshot-invalid'],
         [value => ({ protocolVersion: 1, bridgeSessionId: ID, organizationId: ORG,
             publisherId: PUBLISHER, generatedAt: NOW, parent: createSnapshotProtocol().makeSnapshot({
@@ -512,7 +511,7 @@ test('present session metadata never falls back to a different root descriptor',
             client_metadata: { [KEY]: f.location() } });
         const result = await f.reader.read();
         assert.equal(result.status, 'unavailable'); assert.equal(result.tps, null);
-        assert.equal(f.requests.length, 1);
+        assert.equal(f.requests.some(value => value.init.method === 'POST'), false);
     }
 });
 
@@ -578,7 +577,7 @@ test('identical repeated file reads replace totals and preserve the same revisio
         const result = await f.reader.read(); assert.equal(result.totalTokens, 1400); assert.equal(result.snapshotRevision, 1);
     }
     assert.equal(f.requests.filter(value => value.init.method === 'POST').length, 3);
-    assert.equal(f.requests.some(value => value.init.method === 'PUT'), false);
+    assert.equal(f.requests.filter(value => value.init.method === 'PUT').length, 3);
 });
 
 test('concurrent main and visible child panes keep file paths and correlated responses separate', async t => {
@@ -643,4 +642,97 @@ test('navigation and stop also abort a pending metadata body read without furthe
         const pending = f.reader.read(); await waitFor(() => reading); action(f);
         assert.equal(await pending, null); assert.equal(signal.aborted, true); assert.equal(f.requests.length, 1);
     }
+});
+
+test('receiving viewer renews an independent remote demand before read_file and removes it on stop', async t => {
+    const f = fixture(t, { viewerId: 'viewer_test' });
+    await f.reader.read();
+    const put = f.requests.find(request => request.init.method === 'PUT');
+    assert.ok(put, 'An exact lease must be sent before asking the producer for a snapshot');
+    const patch = JSON.parse(put.init.body).client_metadata_patch;
+    assert.equal(patch[0].path, '/claudepp_session_stats_request_' + patch[0].value.viewerId);
+    assert.equal(patch[0].value.bridgeSessionId, ID);
+    assert.equal(patch[0].value.expiresAt, NOW + 8000);
+    assert.ok(f.requests.indexOf(put) < f.requests.findIndex(request => request.init.method === 'POST'));
+    f.reader.stop();
+    await flush();
+    const release = f.requests.filter(request => request.init.method === 'PUT').at(-1);
+    assert.equal(JSON.parse(release.init.body).client_metadata_patch[0].op, 'test');
+    assert.deepEqual(JSON.parse(release.init.body).client_metadata_patch.at(-1), { op: 'remove', path: patch[0].path });
+});
+
+test('the same installed remote script gives each window its own demand key', async t => {
+    const vm=require('node:vm'), a=fixture(t),b=fixture(t),scripts=buildRemoteScripts('same-install');
+    for(const f of [a,b]){f.advance(Date.now()-NOW);f.setSample(1,Date.now());}
+    const context=f=>vm.createContext({window:f.win,URL,URLSearchParams,AbortController,setTimeout,clearTimeout});
+    const ca=context(a),cb=context(b);
+    await Promise.all([vm.runInContext(scripts.script,ca),vm.runInContext(scripts.script,cb)]);
+    const key=f=>JSON.parse(f.requests.find(r=>r.init.method==='PUT').init.body).client_metadata_patch[0].path;
+    assert.notEqual(key(a),key(b));
+    vm.runInContext(scripts.cleanupScript,ca);await flush();
+    assert.equal(JSON.parse(a.requests.filter(r=>r.init.method==='PUT').at(-1).init.body).client_metadata_patch.at(-1).path,key(a));
+    assert.equal(b.requests.filter(r=>r.init.method==='PUT').length,1);
+    vm.runInContext(scripts.cleanupScript,cb);
+});
+
+test('delayed cleanup of an old child lease cannot remove a newer target in the same viewer', async t => {
+    let selected='a',release; const container=new Map();
+    const blocked=new Promise(resolve=>release=resolve);
+    const f=fixture(t,{viewerId:'same_viewer',sampleAgentId:'a',resolveAgent:()=>({sessionId:ID,agentId:selected,remote:true})});
+    f.setSnapshot(value=>({...value,agentId:selected}));
+    f.setFetch(async({init})=>{
+        if(init.method!=='PUT')return;
+        const patches=JSON.parse(init.body).client_metadata_patch;
+        if(patches[0].op==='add')container.set(patches[0].path,patches[0].value);
+        else {
+            await blocked;
+            const test=patches.find(patch=>patch.op==='test');
+            if(!test||JSON.stringify(test.value)===JSON.stringify(container.get(test.path)))container.delete(test.path);
+        }
+        return response({});
+    });
+    await f.reader.read();selected='b';
+    await f.reader.read();assert.ok([...container.values()].some(value=>value.agentId==='b'));
+    release();await flush();
+    assert.deepEqual([...container.values()].map(value=>value.agentId),['b']);
+});
+
+test('a late old renewal cannot overwrite the newly selected child lease', async t => {
+    let selected='a',releaseRenewal,releaseResponse;
+    const container=new Map(),f=fixture(t,{sampleAgentId:'a',timeoutMs:1000,
+        resolveAgent:()=>({sessionId:ID,agentId:selected,remote:true})});
+    f.setSnapshot(value=>({...value,agentId:selected}));
+    f.setFetch(async({init,url})=>{
+        if(init.method==='PUT') {
+            const patches=JSON.parse(init.body).client_metadata_patch;
+            const add=patches.find(patch=>patch.op==='add');
+            if(add?.value.agentId==='a'&&add.value.expiresAt>NOW+8000)
+                await new Promise(resolve=>releaseRenewal=resolve);
+            const check=patches.find(patch=>patch.op==='test');
+            if(check&&JSON.stringify(check.value)!==JSON.stringify(container.get(check.path)))return response({},false);
+            for(const patch of patches)if(patch.op==='add')container.set(patch.path,patch.value);else if(patch.op==='remove')container.delete(patch.path);
+            return response({});
+        }
+        if(selected==='a'&&url.searchParams.get('sort_order')==='asc')return new Promise(resolve=>releaseResponse=()=>resolve(response({data:[]})));
+    });
+    const first=f.reader.read();await waitFor(()=>releaseResponse);
+    f.advance(4000);f.reader.read();await waitFor(()=>releaseRenewal);
+    selected='b';assert.equal((await f.reader.read()).agentId,'b');
+    const newer=[...container].find(([,value])=>value.agentId==='b');assert.ok(newer);
+    releaseRenewal();releaseResponse();await first;await flush();
+    assert.deepEqual(container.get(newer[0]),newer[1]);
+});
+
+test('a visible viewer renews its eight-second demand while its native response is pending', async t => {
+    const f = fixture(t, { viewerId: 'waiting_viewer', timeoutMs: 1000 }); let release;
+    f.setFetch(({ url }) => url.searchParams.get('sort_order') === 'asc' ? new Promise(resolve => { release = resolve; }) : undefined);
+    const pending = f.reader.read(); await waitFor(() => release);
+    const before = f.requests.filter(value => value.init.method === 'PUT').length;
+    let joined;
+    for (let tick = 0; tick < 3; tick++) { f.advance(4000); joined = f.reader.read(); await flush(); }
+    assert.equal(f.requests.filter(value => value.init.method === 'PUT').length, before + 3);
+    assert.equal(f.requests.filter(value => value.init.method === 'POST').length, 1);
+    const renewal = JSON.parse(f.requests.filter(value => value.init.method === 'PUT').at(-1).init.body).client_metadata_patch[0].value;
+    assert.equal(renewal.expiresAt, NOW + 20000);
+    f.reader.stop(); release(response({ data: [] })); await Promise.all([pending, joined]);
 });

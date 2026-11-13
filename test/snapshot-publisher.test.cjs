@@ -34,6 +34,11 @@ async function fixture(t, options = {}) {
     const store = publisherOptions.store || { async getStats(id) { assert.equal(id, CLI); return stats; } };
     const publisher = createSnapshotPublisher({ claudeData, claudeHome, store, now: () => clock,
         pollMs: 100000, publisherId: PUBLISHER, ...publisherOptions });
+    publisher.setInterest('test_visible', [{ localSessionId: LOCAL }]);
+    const start = publisher.start;
+    publisher.start = () => { publisher.setInterest('test_visible', [{ localSessionId: LOCAL }]); return start(); };
+    const readLocal = publisher.readLocal;
+    publisher.readLocal = (id, options = {}) => { publisher.setInterest('test_visible', [{ localSessionId: LOCAL }]); return readLocal(id, { owner: 'test_visible', ...options }); };
     t.after(async () => { await publisher.stop(); await fs.rm(root, { recursive: true, force: true }); });
     const directory = path.join(publisherOptions.claudeHome ?? claudeHome, '.session-stats');
     const destination = path.join(directory, `${BRIDGE}.json`);
@@ -56,8 +61,7 @@ test('configured Claude directory owns publication while legacy user snapshots s
     const destination = path.join(f.root, 'custom-config', '.session-stats', `${BRIDGE}.json`);
     await f.publisher.start();
     assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
-    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory,
-        path.dirname(destination));
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null); // No active CLI registration advertises a remote location.
     await f.publisher.stop();
     await assert.rejects(fs.stat(destination), { code: 'ENOENT' });
     assert.deepEqual(await fs.readFile(legacyDestination), legacy);
@@ -139,8 +143,7 @@ test('publisher defaults to CLAUDE_CONFIG_DIR when the caller has not supplied a
     await f.publisher.start();
     const destination = path.join(claudeHome, '.session-stats', `${BRIDGE}.json`);
     assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
-    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory,
-        path.dirname(destination));
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null); // No active CLI registration advertises a remote location.
     await assert.rejects(fs.stat(f.directory), { code: 'ENOENT' });
 });
 
@@ -164,8 +167,7 @@ test('an unset CLAUDE_CONFIG_DIR publishes inside the default home Claude hidden
     await f.publisher.start();
     const destination = path.join(f.root, 'default-home', '.claude', '.session-stats', `${BRIDGE}.json`);
     assert.deepEqual(JSON.parse(await fs.readFile(destination, 'utf8')).stats, STATS);
-    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory,
-        path.dirname(destination));
+    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null); // No active CLI registration advertises a remote location.
     await assert.rejects(fs.stat(f.directory), { code: 'ENOENT' });
 });
 
@@ -202,29 +204,7 @@ test('remote snapshots reject a newly ambiguous bridge before the next publicati
     assert.equal(await f.publisher.readRemoteSnapshot(BRIDGE, { organizationId: ORG }), null);
 });
 
-test('metadata source advertises only the real directory regardless of child count', async t => {
-    let samples = 0, lists = 0;
-    const f = await fixture(t, { store: {
-        async getStats() { samples++; return STATS; },
-        async listAgents() { lists++; return Array.from({ length: 65 }, (_, i) => `child_${i}`); },
-        async getAgentStats(id, agentId) { samples++; return { ...STATS, threadId: id, agentId }; },
-    } });
-    assert.deepEqual(f.publisher.listRemoteBindings(), []);
-    await f.publisher.start();
-    assert.deepEqual(f.publisher.listRemoteBindings(), [{ bridgeSessionId: BRIDGE,
-        organizationId: ORG, accountId: ACCOUNT }]);
-    const before = { samples, lists }, published = await f.snapshot();
-    const location = await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG });
-    assert.deepEqual(location, { bridgeSessionId: BRIDGE, organizationId: ORG, publisherId: PUBLISHER,
-        generatedAt: published.generatedAt, directory: f.directory });
-    assert.deepEqual({ samples, lists }, before, 'directory lookup does not enumerate or recalculate children');
-    assert.equal(f.publisher.readRemoteSnapshots, undefined, 'bulk exporter is removed');
-    location.directory = 'changed';
-    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory, f.directory);
-    await f.publisher.stop();
-    assert.deepEqual(f.publisher.listRemoteBindings(), []);
-    assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null);
-});
+
 
 test('metadata directory requires a fresh exact binding and honors cancellation', async t => {
     const f = await fixture(t);
@@ -238,28 +218,9 @@ test('metadata directory requires a fresh exact binding and honors cancellation'
     assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null);
 });
 
-test('metadata directory lookup cancellation releases validation without altering the local sample', async t => {
-    const f = await fixture(t), controller = new AbortController();
-    await f.publisher.start();
-    const published = await f.snapshot();
-    const paused = await pauseLocalValidation(t, f, { stage: 'after-close', readSnapshot: () =>
-        f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG, signal: controller.signal }) });
-    controller.abort();
-    try { assert.equal(await within(paused.local), null); }
-    finally { paused.release(); }
-    assert.equal((await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG })).directory, f.directory);
-    assert.deepEqual(await f.snapshot(), published);
-});
 
-test('metadata directory rejects identity changes during source verification', async t => {
-    const f = await fixture(t);
-    await f.publisher.start();
-    const paused = await pauseLocalValidation(t, f, { stage: 'after-close', readSnapshot: () =>
-        f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }) });
-    try { await f.write({ ...f.row, cliSessionId: SECOND_CLI }); }
-    finally { paused.release(); }
-    assert.equal(await paused.local, null);
-});
+
+
 
 for (const change of ['ambiguous', 'disabled', 'publisher'])
 test(`metadata directory rejects ${change} ownership changes before the next poll`, async t => {
@@ -273,7 +234,7 @@ test(`metadata directory rejects ${change} ownership changes before the next pol
     assert.equal(await f.publisher.readRemoteLocation(BRIDGE, { organizationId: ORG }), null);
 });
 
-test('background publication writes allowlisted stats and local reads return the exact shared revision', async t => {
+test('viewed publication writes allowlisted stats and local reads return the exact shared revision', async t => {
     const f = await fixture(t);
     await f.publisher.start();
     const snapshot = await f.snapshot();
@@ -285,7 +246,7 @@ test('background publication writes allowlisted stats and local reads return the
     assert.equal(snapshot.generatedAt, 100000);
     assert.deepEqual(await f.publisher.readLocal(LOCAL), { ...STATS, threadId: LOCAL,
         snapshotGeneratedAt: 100000, snapshotRevision: 1, snapshotPublisherId: PUBLISHER });
-    assert.equal(await f.publisher.readLocal('local_99999999-9999-4999-8999-999999999999'), null);
+    assert.equal((await f.publisher.readLocal('local_99999999-9999-4999-8999-999999999999')).status, 'unavailable');
     const encoded = JSON.stringify(snapshot);
     for (const privateValue of [f.workspace, CLI, LOCAL, ACCOUNT, 'do not export'])
         assert.equal(encoded.includes(privateValue), false);
@@ -357,13 +318,13 @@ test('timer publishes changed data with no local tab read', async t => {
     });
 });
 
-test('a sample delayed by identity confirmation keeps its original collection time', async t => {
+test('a lease expiring during identity confirmation cannot publish a stale sample', async t => {
     let time = 100000, sampled = false;
     const f = await fixture(t, { now: () => time,
         resolveWorkspace: async () => { if (sampled) time = 200000; return null; },
         store: { async getStats() { sampled = true; return STATS; } } });
     await f.publisher.start();
-    assert.equal((await f.snapshot()).generatedAt, 100000);
+    await assert.rejects(f.snapshot(), { code: 'ENOENT' });
     assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
     await f.publisher.start();
     assert.equal((await f.snapshot()).generatedAt, 200000);
@@ -463,63 +424,7 @@ test('an unchanged sample before heartbeat performs no snapshot I/O or redundant
     assert.equal((await f.snapshot()).generatedAt, time);
 });
 
-test('global discovery cohorts never reuse a scan begun before their caller or sampled data', async t => {
-    let probing = false, releaseSample;
-    const blockedSample = new Promise(resolve => { releaseSample = resolve; });
-    const events = [], gates = [];
-    const f = await fixture(t, { store: {
-        async getStats() {
-            if (probing) { await blockedSample; events.push('sample-complete'); }
-            return STATS;
-        },
-        async listAgents() { return []; }, async getAgentStats() { return STATS; },
-    } });
-    await f.publisher.start();
-    const sessionsRoot = path.dirname(path.dirname(path.dirname(f.metadata)));
-    const originalOpendir = fs.opendir;
-    t.mock.method(fs, 'opendir', async (directory, ...args) => {
-        if (directory === sessionsRoot && probing) {
-            events.push(`scan-${gates.length + 1}`);
-            await new Promise(resolve => { gates.push(resolve); });
-        }
-        return originalOpendir(directory, ...args);
-    });
-    const untilGate = async count => {
-        const deadline = Date.now() + 500;
-        while (gates.length < count) {
-            if (Date.now() >= deadline) throw new Error('Expected a new global identity scan');
-            await new Promise(resolve => setTimeout(resolve, 2));
-        }
-    };
-    probing = true;
-    const background = f.publisher.start();
-    let selected, prioritized;
-    try {
-        await untilGate(1);
-        selected = f.publisher.readLocal(LOCAL, { agentId: 'missing' });
-        await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-        prioritized = f.publisher.start();
-        await new Promise(resolve => setTimeout(resolve, 20));
-        assert.equal(gates.length, 1);
-        gates[0]();
-        await untilGate(2);
-        releaseSample();
-        const deadline = Date.now() + 500;
-        while (!events.includes('sample-complete')) {
-            if (Date.now() >= deadline) throw new Error('Parent sampling did not finish');
-            await new Promise(resolve => setTimeout(resolve, 2));
-        }
-        assert.ok(events.indexOf('scan-2') < events.indexOf('sample-complete'));
-        gates[1]();
-        await untilGate(3);
-        assert.ok(events.indexOf('scan-3') > events.indexOf('sample-complete'));
-    } finally {
-        probing = false;
-        releaseSample();
-        for (const release of gates) release();
-        await Promise.all([background, selected, prioritized]);
-    }
-});
+
 
 async function within(promise, timeoutMs = 500) {
     let timer;
@@ -540,12 +445,7 @@ async function committedLocal(f) {
     }
 }
 
-test('a new fast parent selection publishes without waiting for the timer', async t => {
-    const f = await fixture(t);
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
-    assert.equal((await committedLocal(f)).turns, 2);
-    assert.equal((await f.snapshot()).stats.turns, 2);
-});
+
 
 const SECOND_LOCAL = 'local_11111111-1111-4111-8111-111111111111';
 const SECOND_CLI = '99999999-9999-4999-8999-999999999999';
@@ -561,261 +461,21 @@ async function addDuplicate(f) {
     await fs.writeFile(path.join(directory, LOCAL + '.json'), JSON.stringify(f.row));
 }
 
-test('switching the selected parent releases the old wait without blocking background parents', async t => {
-    let entered, release, selected = false, time = 100000;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const blocked = new Promise(resolve => { release = resolve; });
-    const f = await fixture(t, { now: () => time, pollMs: 5, store: { async getStats(id) {
-        if (id === CLI) { entered(); await blocked; }
-        return { ...STATS, turns: id === SECOND_CLI && selected ? 9 : 2 };
-    } } });
-    await addUnrelated(f);
-    const thirdLocal = 'local_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    await fs.writeFile(path.join(path.dirname(f.metadata), thirdLocal + '.json'), JSON.stringify({ ...f.row,
-        sessionId: thirdLocal, cliSessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bridgeSessionIds: ['session_third'] }));
-    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-    const starting = f.publisher.start();
-    try {
-        await within(ready);
-        const deadline = Date.now() + 500;
-        const third = path.join(f.directory, 'session_third.json');
-        while (!await fs.stat(third).then(() => true, () => false)) {
-            if (Date.now() >= deadline) throw new Error('A selected hung parent blocked unrelated background parents');
-            await new Promise(resolve => setTimeout(resolve, 5));
-        }
-        selected = true; time += 10001;
-        await f.publisher.readLocal(SECOND_LOCAL, { waitForPoll: false });
-        const target = path.join(f.directory, 'session_unrelated.json');
-        await within((async () => {
-            while (JSON.parse(await fs.readFile(target, 'utf8')).stats.turns !== 9)
-                await new Promise(resolve => setTimeout(resolve, 5));
-        })());
-    } finally { release(); await starting; }
-});
 
-test('an older queued missing-parent prune cannot remove a newer valid publication', async t => {
-    let time = 100000, writing = false, absent = false, restored = false;
-    let enteredWrite, releaseWrite, sawMissing, sawRestored;
-    const writingReady = new Promise(resolve => { enteredWrite = resolve; });
-    const blockedWrite = new Promise(resolve => { releaseWrite = resolve; });
-    const missingReady = new Promise(resolve => { sawMissing = resolve; });
-    const restoredReady = new Promise(resolve => { sawRestored = resolve; });
-    let sample = STATS;
-    const f = await fixture(t, { now: () => time, store: {
-        async getStats() { return sample; },
-        async listAgents() { if (restored) sawRestored(); return []; },
-        async getAgentStats() { return STATS; },
-    } });
-    await f.publisher.start();
-    const originalRename = fs.rename, originalLstat = fs.lstat;
-    const sessionsRoot = path.dirname(path.dirname(path.dirname(f.metadata)));
-    let missingChecks = 0;
-    t.mock.method(fs, 'rename', async (source, destination) => {
-        if (destination === f.destination && writing) { enteredWrite(); await blockedWrite; }
-        return originalRename(source, destination);
-    });
-    t.mock.method(fs, 'lstat', async (file, ...args) => {
-        const result = await originalLstat(file, ...args);
-        if (absent && file === sessionsRoot && ++missingChecks >= 2) sawMissing();
-        return result;
-    });
-    time += 10001; sample = { ...STATS, turns: 9 }; writing = true;
-    const updating = f.publisher.start();
-    let missingRead, restoring;
-    try {
-        await within(writingReady);
-        await f.write({ ...f.row, remoteControlUserEnabled: false });
-        absent = true;
-        missingRead = f.publisher.readLocal(LOCAL, { agentId: 'unknown' });
-        await within(missingReady);
-        await new Promise(resolve => setImmediate(resolve));
-        absent = false;
-        await f.write(f.row);
-        restored = true;
-        restoring = f.publisher.start();
-        await within(restoredReady);
-    } finally { releaseWrite(); await Promise.all([updating, missingRead, restoring]); }
-    assert.equal((await f.snapshot()).stats.turns, 9);
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
-});
 
-test('requested targets publish independently on cold and warm polls while global sampling continues', async t => {
-    let entered, release, block = true;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
-    const calls = [];
-    let sample = STATS;
-    const f = await fixture(t, { store: { async getStats(id) {
-        calls.push(id);
-        if (id === SECOND_CLI && block) { entered(); await wait; }
-        return sample;
-    } } });
-    await addUnrelated(f);
-    await f.write({ ...f.row, bridgeSessionIds: [BRIDGE, 'session_target_second'] });
-    let discoveries = 0;
-    const sessions = path.dirname(path.dirname(path.dirname(f.metadata)));
-    const originalOpendir = fs.opendir;
-    t.mock.method(fs, 'opendir', async (directory, ...args) => {
-        if (directory === sessions) discoveries++;
-        return originalOpendir(directory, ...args);
-    });
-    await f.publisher.readLocal(SECOND_LOCAL, { waitForPoll: false });
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
-    const poll = f.publisher.start();
-    await within(ready);
-    let fresh;
-    try {
-        assert.equal((await committedLocal(f)).status, 'ok');
-        assert.equal((await f.snapshot()).stats.turns, 2);
-        const second = JSON.parse(await fs.readFile(path.join(f.directory, 'session_target_second.json'), 'utf8'));
-        assert.equal(second.stats.turns, 2);
-        assert.deepEqual(calls, [CLI, SECOND_CLI]);
-        let settled = false;
-        fresh = f.publisher.readLocal(LOCAL).then(value => { settled = true; return value; });
-        await new Promise(resolve => setImmediate(resolve));
-        assert.equal(settled, false);
-    } finally { release(); await poll; }
-    assert.equal((await fresh).status, 'ok');
-    const unrelated = JSON.parse(await fs.readFile(path.join(f.directory, 'session_unrelated.json'), 'utf8'));
-    assert.equal(unrelated.stats.turns, 2);
-    assert.equal(discoveries, 4);
-    block = false; calls.length = 0; discoveries = 0;
-    await f.publisher.start();
-    assert.deepEqual(calls, [CLI, SECOND_CLI]);
-    assert.equal(discoveries, 2);
-    sample = { status: 'unavailable', usageComplete: false };
-    await f.publisher.start();
-    calls.length = 0; discoveries = 0;
-    await f.publisher.start();
-    assert.deepEqual(calls, [CLI, SECOND_CLI]);
-    assert.equal(discoveries, 2);
-});
 
-test('a duplicate introduced while collecting a priority target prevents its early publication', async t => {
-    let f, entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
-    f = await fixture(t, { store: { async getStats(id) {
-        if (id === CLI) await addDuplicate(f);
-        else { entered(); await wait; }
-        return STATS;
-    } } });
-    await addUnrelated(f);
-    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-    const poll = f.publisher.start();
-    await within(ready);
-    try {
-        assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
-        await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
-    } finally { release(); await poll; }
-});
 
-test('the final global confirmation invalidates an early priority sample when a duplicate appears later', async t => {
-    let entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
-    const f = await fixture(t, { store: { async getStats(id) {
-        if (id === SECOND_CLI) { entered(); await wait; }
-        return STATS;
-    } } });
-    await addUnrelated(f);
-    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-    const poll = f.publisher.start();
-    await within(ready);
-    try {
-        assert.equal((await committedLocal(f)).status, 'ok');
-        await addDuplicate(f);
-    } finally { release(); await poll; }
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'unavailable');
-    await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
-});
 
-test('final priority invalidation cleans user storage without reopening the migrated workspace snapshot', async t => {
-    let currentRoot, entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
-    const f = await fixture(t, async ({ workspace }) => {
-        currentRoot = workspace;
-        return { resolveWorkspace: async () => ({ workspaceRoot: await fs.realpath(currentRoot),
-            evidenceKey: currentRoot, verify: async () => true }),
-        store: { async getStats(id) { if (id === SECOND_CLI) { entered(); await wait; } return STATS; } } };
-    });
-    await addUnrelated(f);
-    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-    const poll = f.publisher.start();
-    await within(ready);
-    let oldSample;
-    try {
-        await committedLocal(f);
-        oldSample = await f.snapshot();
-        const legacy = path.join(f.workspace, '.claude', 'session-stats', `${BRIDGE}.json`);
-        await fs.mkdir(path.dirname(legacy), { recursive: true }); await fs.writeFile(legacy, JSON.stringify(oldSample));
-        const next = path.join(f.root, 'next-workspace');
-        await fs.mkdir(next); currentRoot = next;
-        const originalOpen = fs.open;
-        const guarded = t.mock.method(fs, 'open', async (file, ...args) => {
-            if (file === legacy) throw new Error('Old workspace must not be read');
-            return originalOpen(file, ...args);
-        });
-        release(); await poll;
-        assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'unavailable');
-        await f.publisher.stop();
-        assert.equal(guarded.mock.calls.some(call => call.arguments[0] === legacy), false);
-        guarded.mock.restore();
-        assert.deepEqual(JSON.parse(await fs.readFile(legacy, 'utf8')), oldSample);
-    } finally { release(); await poll; }
-    await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
-});
 
-test('lost workspace proof after early publication stays unavailable until a fresh discovery recovers', async t => {
-    let unsafe = false, blocked = true, entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
-    const f = await fixture(t, {
-        resolveWorkspace: async binding => unsafe && binding.cliSessionId === CLI ? { unavailable: true } : null,
-        store: { async getStats(id) {
-            if (id === SECOND_CLI && blocked) { entered(); await wait; }
-            return STATS;
-        } },
-    });
-    await addUnrelated(f);
-    await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-    const poll = f.publisher.start();
-    await within(ready);
-    try {
-        assert.equal((await committedLocal(f)).status, 'ok');
-        unsafe = true;
-    } finally { release(); await poll; }
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'unavailable');
-    unsafe = false; blocked = false;
-    await f.publisher.start();
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'ok');
-});
 
-test('binding changes and stop before early publication cannot expose a priority sample', async t => {
-    for (const action of ['binding', 'stop']) await t.test(action, async t => {
-        let entered, enteredSecond, release;
-        const ready = new Promise(resolve => { entered = resolve; });
-        const secondReady = new Promise(resolve => { enteredSecond = resolve; });
-        const wait = new Promise(resolve => { release = resolve; });
-        const f = await fixture(t, { store: { async getStats(id) {
-            if (id === CLI) { entered(); await wait; }
-            else enteredSecond();
-            return STATS;
-        } } });
-        await addUnrelated(f);
-        await f.publisher.readLocal(LOCAL, { waitForPoll: false });
-        const poll = f.publisher.start();
-        await within(Promise.all([ready, secondReady]));
-        let stopping;
-        try {
-            if (action === 'binding') await f.write({ ...f.row, cliSessionId: SECOND_CLI });
-            else stopping = f.publisher.stop();
-        } finally { release(); await poll; await stopping; }
-        assert.notEqual((await f.publisher.readLocal(LOCAL, { waitForPoll: false }))?.status, 'ok');
-        await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
-    });
-});
+
+
+
+
+
+
+
+
 
 test('fast local reads return a committed sample while background statistics collection is blocked', async t => {
     let blocked = false, entered, release;
@@ -854,28 +514,10 @@ test('fast local reads fail closed before the initial publication and proven unb
         assert.equal((await within(f.publisher.readLocal(LOCAL, { waitForPoll: false }))).status, 'unavailable');
     } finally { release(); await poll; }
     assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).snapshotRevision, 1);
-    assert.equal(await f.publisher.readLocal('local_99999999-9999-4999-8999-999999999999', { waitForPoll: false }), null);
+    assert.equal((await f.publisher.readLocal('local_99999999-9999-4999-8999-999999999999', { waitForPoll: false })).status, 'unavailable');
 });
 
-test('fast local reads do not treat a newly discovered pending publication as an unbound session', async t => {
-    const secondLocal = 'local_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-    const secondCli = '99999999-9999-4999-8999-999999999999';
-    let entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const wait = new Promise(resolve => { release = resolve; });
-    const f = await fixture(t, { store: { async getStats(id) {
-        if (id === secondCli) { entered(); await wait; }
-        return STATS;
-    } } });
-    await f.publisher.start();
-    await fs.writeFile(path.join(path.dirname(f.metadata), `${secondLocal}.json`), JSON.stringify({ ...f.row,
-        sessionId: secondLocal, cliSessionId: secondCli, bridgeSessionIds: ['session_second'] }));
-    const poll = f.publisher.start();
-    await ready;
-    try {
-        assert.equal((await within(f.publisher.readLocal(secondLocal, { waitForPoll: false }))).status, 'unavailable');
-    } finally { release(); await poll; }
-});
+
 
 test('default local reads still wait for fresh statistics and return the new publication', async t => {
     let blocked = false, entered, release;
@@ -1081,7 +723,7 @@ test('incomplete refresh cannot preserve a snapshot after its binding is disable
     await f.publisher.start();
     f.setStats({ status: 'incomplete', usageComplete: false });
     await f.write({ ...f.row, remoteControlUserEnabled: false });
-    assert.equal(await f.publisher.readLocal(LOCAL), null);
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable');
     await assert.rejects(fs.stat(f.destination), { code: 'ENOENT' });
 });
 
@@ -1103,7 +745,7 @@ test('mapping deletion removes own snapshots and makes local identity unbound', 
     const f = await fixture(t);
     await f.publisher.start();
     await fs.rm(f.metadata);
-    assert.equal(await f.publisher.readLocal(LOCAL), null);
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable');
     assert.equal(await fs.stat(f.destination).then(() => true, () => false), false);
 });
 
@@ -1129,28 +771,7 @@ test('stop invalidates pending writes and cleanup preserves a replacement owned 
     assert.equal(await fs.stat(pending.destination).then(() => true, () => false), false);
 });
 
-test('local reads recheck their binding after other background sessions finish collecting', async t => {
-    const SECOND_CLI = '99999999-9999-4999-8999-999999999999';
-    const SECOND_LOCAL = 'local_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-    let block = false, entered, release;
-    const ready = new Promise(resolve => { entered = resolve; });
-    const deferred = new Promise(resolve => { release = resolve; });
-    const f = await fixture(t, { store: { async getStats(id) {
-        if (id === SECOND_CLI && block) { entered(); await deferred; }
-        return STATS;
-    } } });
-    await fs.writeFile(path.join(path.dirname(f.metadata), `${SECOND_LOCAL}.json`), JSON.stringify({ ...f.row,
-        sessionId: SECOND_LOCAL, cliSessionId: SECOND_CLI, bridgeSessionIds: ['session_second'] }));
-    await f.publisher.start();
-    block = true;
-    const local = f.publisher.readLocal(LOCAL);
-    await ready;
-    await f.write({ ...f.row, cliSessionId: SECOND_CLI });
-    release();
-    const result = await local;
-    assert.equal(result.status, 'unavailable');
-    assert.equal(result.snapshotRevision, undefined);
-});
+
 
 test('stop removes its snapshots and temporary files while retaining existing ignore rules', async t => {
     const f = await fixture(t);
@@ -1224,7 +845,7 @@ test('returning bindings preserve monotonic revisions for the lifetime of the pu
     const before = await f.publisher.readLocal(LOCAL);
     assert.equal(before.snapshotRevision, 2);
     await fs.rm(f.metadata);
-    assert.equal(await f.publisher.readLocal(LOCAL), null);
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'unavailable');
     await f.write(f.row);
     f.setClock(111000);
     const restored = await f.publisher.readLocal(LOCAL);
@@ -1680,37 +1301,66 @@ test('workspace migration publishes fresh metrics without reading or copying the
     assert.deepEqual(await fs.readdir(worktree), []);
 });
 
-test('a rechecked Desktop binding resolves duplicate parent and child sources without a live registry', async t => {
-    const { createSessionStore } = require('../src/session-store.cjs');
-    let store, selected;
-    const f = await fixture(t, async ({ root, workspace }) => {
-        const claudeHome = path.join(root, 'claude');
-        const stale = path.join(claudeHome, 'projects', 'stale');
-        selected = path.join(claudeHome, 'projects', 'selected');
-        await fs.mkdir(stale, { recursive: true });
-        await fs.mkdir(selected, { recursive: true });
-        const lines = (...rows) => rows.map(row => JSON.stringify(row) + '\n').join('');
-        const answer = (id, output, extra = {}) => ({ type: 'assistant', sessionId: CLI, ...extra,
-            message: { id, role: 'assistant', model: 'test', usage: { input_tokens: 10,
-                cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: output } } });
-        const prefix = lines(answer('first', 5), { type: 'relocated', sessionId: CLI, relocatedCwd: workspace });
-        await fs.writeFile(path.join(stale, `${CLI}.jsonl`), prefix);
-        await fs.writeFile(path.join(selected, `${CLI}.jsonl`), prefix + lines(answer('second', 7)));
-        for (const [directory, output] of [[stale, 999], [selected, 13]]) {
-            const children = path.join(directory, CLI, 'subagents');
-            await fs.mkdir(children, { recursive: true });
-            await fs.writeFile(path.join(children, 'agent-a.jsonl'), lines(answer('child', output,
-                { agentId: 'a', isSidechain: true })));
-        }
-        store = createSessionStore({ claudeHome });
-        t.after(() => store.dispose());
-        return { store, resolveWorkspace: async () => null };
+
+
+test('unchanged metadata is read once per publisher while later changes and global conflicts stay fresh', async t => {
+    const f = await fixture(t);
+    const open = fs.open;
+    let reads = 0;
+    t.mock.method(fs, 'open', async (file, ...args) => {
+        if (file === f.metadata) reads++;
+        return open(file, ...args);
     });
-    assert.equal((await store.getStats(CLI)).status, 'not-found');
     await f.publisher.start();
-    assert.equal((await f.snapshot()).stats.totalTokens, 32);
-    const child = JSON.parse(await fs.readFile(path.join(f.directory, `${BRIDGE}.agent-a.json`), 'utf8'));
-    assert.equal(child.stats.totalTokens, 23);
-    await f.write({ ...f.row, cliSessionId: '99999999-9999-4999-8999-999999999999' });
-    assert.equal((await f.publisher.readLocal(LOCAL, { waitForPoll: false })).status, 'unavailable');
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'ok');
+    assert.equal(reads, 1, 'Every proof must check freshness without reopening unchanged metadata');
+    await f.write({ ...f.row, isArchived: true });
+    await f.publisher.start();
+    assert.equal(f.publisher.listRemoteBindings().length, 0);
+    assert.equal(reads, 2);
+    await f.write(f.row);
+    await f.publisher.start();
+    assert.equal((await f.publisher.readLocal(LOCAL)).status, 'ok');
+    const duplicate = path.join(path.dirname(f.metadata), '..', CLI, `${LOCAL}.json`);
+    await fs.mkdir(path.dirname(duplicate), { recursive: true });
+    await fs.copyFile(f.metadata, duplicate);
+    await f.publisher.start();
+    assert.equal(f.publisher.listRemoteBindings().length, 0, 'A new conflicting account/org must invalidate warm bindings');
+});
+
+
+
+test('publication performs three fresh parent proofs around filesystem writes without a redundant preflight', async t => {
+    let proofs = 0;
+    const f = await fixture(t, { resolveWorkspace: async () => { proofs++; return null; } });
+    await f.publisher.start();
+    assert.equal(proofs, 5, 'Discovery and sample confirmation plus three filesystem publication boundaries');
+    proofs = 0;
+    f.setClock(110001);
+    await f.publisher.start();
+    assert.equal(proofs, 5);
+    assert.equal((await f.snapshot()).generatedAt, 110001);
+});
+
+test('metadata disabled during destination inspection prevents the first temporary snapshot write', async t => {
+    const f = await fixture(t);
+    await f.publisher.start();
+    const open = fs.open, rename = fs.rename;
+    let changed = false, temporaryWrites = 0, commits = 0;
+    t.mock.method(fs, 'open', async (file, flags, ...args) => {
+        const handle = await open(file, flags, ...args);
+        if (file === f.destination && flags === 'r' && !changed) {
+            changed = true;
+            await f.write({ ...f.row, remoteControlUserEnabled: false });
+        }
+        if (path.dirname(file) === f.directory && flags === 'wx') temporaryWrites++;
+        return handle;
+    });
+    t.mock.method(fs, 'rename', (...args) => { commits++; return rename(...args); });
+    f.setClock(110001);
+    await f.publisher.start();
+    assert.equal(changed, true);
+    assert.equal(temporaryWrites, 0);
+    assert.equal(commits, 0);
+    assert.deepEqual(await fs.readdir(f.directory), []);
 });

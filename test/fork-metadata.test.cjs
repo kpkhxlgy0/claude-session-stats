@@ -170,8 +170,9 @@ test('does not use title, archive, availability or business timestamps as fork i
     const f = await fixture(t);
     const fork = await f.resolver.resolveFork(CHILD);
     await f.write({ ...f.child, title: 'private title', updatedAt: Date.now(), isArchived: true,
-        transcriptUnavailable: true, remoteControlUserEnabled: false });
-    await f.write({ ...f.parent, title: 'changed private title', updatedAt: Date.now(), isArchived: false });
+        transcriptUnavailable: true, remoteControlUserEnabled: false, pid: 123 });
+    await f.write({ ...f.parent, title: 'changed private title', updatedAt: Date.now(), isArchived: false,
+        remoteControlUserEnabled: false, pid: 456 });
     assert.equal(await fork.verify(), true);
     assert.equal((await f.resolver.resolveFork(CHILD)).parentSessionId, PARENT);
 });
@@ -247,20 +248,16 @@ test('rejects file changes during a bounded read instead of accepting a mixed sn
     assert.deepEqual(await createDesktopForkResolver({ claudeData: f.claudeData, fs: hookedFs }).resolveFork(CHILD), INCOMPLETE);
 });
 
-test('verify detects a child edit made after the child read while reading the parent', async t => {
+test('verify detects a child edit made after its fingerprint while checking the parent', async t => {
     const f = await fixture(t);
     let armed = false;
-    const hookedFs = { ...fs, async open(file, ...args) {
-        const handle = await fs.open(file, ...args);
-        if (file !== f.parentFile) return handle;
-        return { stat: () => handle.stat(), close: () => handle.close(), async read(...readArgs) {
-            const result = await handle.read(...readArgs);
-            if (armed) {
-                armed = false;
-                await f.write({ ...f.child, forkedAtMessageUuid: OTHER, title: 'changed after read' });
-            }
-            return result;
-        } };
+    const hookedFs = { ...fs, async lstat(file, ...args) {
+        const result = await fs.lstat(file, ...args);
+        if (file === f.parentFile && armed) {
+            armed = false;
+            await f.write({ ...f.child, forkedAtMessageUuid: OTHER, title: 'changed after fingerprint' });
+        }
+        return result;
     } };
     const fork = await createDesktopForkResolver({ claudeData: f.claudeData, fs: hookedFs }).resolveFork(CHILD);
     armed = true;
@@ -275,4 +272,207 @@ test('limits metadata directory traversal and never trusts a partial scan', asyn
         await fs.mkdir(path.join(root, account));
     }
     assert.deepEqual(await f.resolver.resolveFork(CHILD), INCOMPLETE);
+});
+
+test('many session lookups share fresh scans without reopening unchanged metadata', async t => {
+    const f = await fixture(t);
+    const sessions = [];
+    for (let index = 0; index < 35; index++) {
+        const id = `${index.toString(16).padStart(8, '0')}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
+        await f.write({ sessionId: `local_${id}`, cliSessionId: id,
+            ...(index < 7 ? { forkedFromSessionId: PARENT_LOCAL, forkedAtMessageUuid: CUTOFF } : {}) });
+        if (index < 10) sessions.push(id);
+    }
+    sessions.push(CHILD, PARENT);
+    let scans = 0, opens = 0, reads = 0;
+    const checks = new Map();
+    const counted = { ...fs, lstat: async (file, ...args) => {
+        if (file.endsWith('.json')) checks.set(file, (checks.get(file) ?? 0) + 1);
+        return fs.lstat(file, ...args);
+    }, opendir: async (directory, ...args) => {
+        if (path.basename(directory) === 'claude-code-sessions') scans++;
+        return fs.opendir(directory, ...args);
+    }, open: async (...args) => {
+        opens++;
+        const handle = await fs.open(...args);
+        return { stat: () => handle.stat(), close: () => handle.close(), read: (...values) => {
+            reads++;
+            return handle.read(...values);
+        } };
+    } };
+    const resolver = createDesktopForkResolver({ claudeData: f.claudeData, fs: counted });
+    const cold = await Promise.all(sessions.map(id => resolver.resolveFork(id)));
+    assert.equal(cold.filter(fork => fork?.parentSessionId === PARENT).length, 8);
+    const coldChecks = new Map(checks);
+    const first = { scans, opens, reads, lstats: [...checks.values()].reduce((sum, count) => sum + count, 0) };
+    for (let round = 0; round < 3; round++) {
+        const forks = await Promise.all(sessions.map(id => resolver.resolveFork(id)));
+        assert.deepEqual(await Promise.all(forks.filter(Boolean).map(fork => fork.verify())), Array(8).fill(true));
+    }
+    t.diagnostic(JSON.stringify({ metadataFiles: 37, sessions: 12, warmRounds: 3,
+        cold: first, total: { scans, opens, reads,
+            lstats: [...checks.values()].reduce((sum, count) => sum + count, 0) } }));
+    assert.equal(first.scans, 1, 'Callers queued before scan I/O share one fresh global uniqueness check');
+    assert.equal(first.opens, 37);
+    assert.equal(scans, 7, 'Each lookup/verify cohort still receives a fresh scan');
+    assert.equal(opens, 37, 'Warm fingerprints reuse parsed semantics without reopening metadata');
+    assert.equal(reads, 74);
+    for (const [file, count] of checks)
+        assert.equal(count - coldChecks.get(file), 12,
+            'Each of six warm scans must freshly check a file once before use and once at scan end');
+    await f.write({ ...f.child, forkedAtMessageUuid: OTHER });
+    const changed = await resolver.resolveFork(CHILD);
+    assert.equal(changed.cutoffMessageUuid, OTHER);
+    assert.equal(await cold[cold.length - 2].verify(), false);
+    assert.equal(opens, 38, 'A changed file is reread immediately, without a TTL');
+});
+
+test('metadata reads tolerate partial reads while allocating only the file size plus one', async t => {
+    const f = await fixture(t);
+    let largest = 0;
+    const partial = { ...fs, open: async (...args) => {
+        const handle = await fs.open(...args);
+        return { stat: () => handle.stat(), close: () => handle.close(),
+            read: (buffer, offset, length, position) => {
+                largest = Math.max(largest, buffer.length);
+                return handle.read(buffer, offset, Math.min(length, 17), position);
+            } };
+    } };
+    const fork = await createDesktopForkResolver({ claudeData: f.claudeData, fs: partial }).resolveFork(CHILD);
+    assert.equal(fork.parentSessionId, PARENT);
+    assert.ok(largest <= (await fs.stat(f.childFile)).size + 1);
+});
+
+test('an early EOF cannot accept a valid JSON prefix of a larger metadata record', async t => {
+    const f = await fixture(t);
+    const prefix = JSON.stringify(f.parent);
+    await fs.writeFile(f.parentFile, prefix + ' '.repeat(64));
+    const early = { ...fs, open: async (file, ...args) => {
+        const handle = await fs.open(file, ...args);
+        if (file !== f.parentFile) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(),
+            read: (buffer, offset, length, position) => position >= prefix.length
+                ? Promise.resolve({ bytesRead: 0, buffer })
+                : handle.read(buffer, offset, Math.min(length, prefix.length - position), position) };
+    } };
+    assert.deepEqual(await createDesktopForkResolver({ claudeData: f.claudeData, fs: early }).resolveFork(CHILD), INCOMPLETE);
+});
+
+test('a lookup queued after scan I/O starts receives a newer scan after a changed read fails', async t => {
+    const f = await fixture(t);
+    let entered, release, pause = true, scans = 0;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const resume = new Promise(resolve => { release = resolve; });
+    const guarded = { ...fs, opendir: async (directory, ...args) => {
+        if (path.basename(directory) === 'claude-code-sessions') scans++;
+        return fs.opendir(directory, ...args);
+    }, open: async (file, ...args) => {
+        const handle = await fs.open(file, ...args);
+        if (file !== f.childFile) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...values) => {
+            const result = await handle.read(...values);
+            if (pause) { pause = false; entered(); await resume; }
+            return result;
+        } };
+    } };
+    const resolver = createDesktopForkResolver({ claudeData: f.claudeData, fs: guarded });
+    const first = resolver.resolveFork(CHILD);
+    await waiting;
+    let second;
+    try {
+        await f.write({ ...f.child, forkedAtMessageUuid: OTHER });
+        second = resolver.resolveFork(CHILD);
+        await Promise.resolve();
+    } finally { release(); }
+    assert.deepEqual(await first, INCOMPLETE);
+    assert.equal((await second).cutoffMessageUuid, OTHER);
+    assert.equal(scans, 2);
+});
+
+test('warm metadata checks reject replacement of the containing directory identity', async t => {
+    const f = await fixture(t);
+    const fork = await f.resolver.resolveFork(CHILD);
+    const directory = path.dirname(f.childFile);
+    await fs.rename(directory, `${directory}-old`);
+    await f.write(f.child);
+    await f.write(f.parent);
+    assert.equal(await fork.verify(), false);
+    assert.equal((await f.resolver.resolveFork(CHILD)).parentSessionId, PARENT);
+});
+
+test('parsed metadata caches belong to each resolver instance', async t => {
+    const f = await fixture(t);
+    let opens = 0;
+    const counted = { ...fs, open: (...args) => { opens++; return fs.open(...args); } };
+    const first = createDesktopForkResolver({ claudeData: f.claudeData, fs: counted });
+    const second = createDesktopForkResolver({ claudeData: f.claudeData, fs: counted });
+    assert.equal((await first.resolveFork(CHILD)).parentSessionId, PARENT);
+    assert.equal((await first.resolveFork(CHILD)).parentSessionId, PARENT);
+    assert.equal(opens, 2);
+    assert.equal((await second.resolveFork(CHILD)).parentSessionId, PARENT);
+    assert.equal(opens, 4);
+});
+
+test('rejected scans cannot grow the parsed metadata cache without a bound', async t => {
+    const f = await fixture(t);
+    const root = path.join(f.claudeData, 'claude-code-sessions');
+    const account = path.join(root, ACCOUNT), org = path.join(account, ORG);
+    const groups = [0, 1].map(group => Array.from({ length: 4097 }, (_, index) => {
+        const id = `${(group * 4097 + index).toString(16).padStart(8, '0')}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
+        const name = `local_${id}.json`;
+        return { id, name, body: Buffer.from(JSON.stringify({ sessionId: `local_${id}`, cliSessionId: id })) };
+    }));
+    const files = new Map(groups.flat().map((row, index) => [path.join(org, row.name), { ...row, ino: index + 10 }]));
+    const info = row => ({ dev: 1, ino: row?.ino ?? 1, birthtimeMs: 1, mtimeMs: 1, ctimeMs: 1,
+        size: row?.body.length ?? 0, isFile: () => !!row, isDirectory: () => !row, isSymbolicLink: () => false });
+    let visible = groups[0], opens = 0;
+    const virtual = {
+        lstat: async file => info(files.get(file)),
+        async *opendir(directory) {
+            const rows = directory === root ? [{ name: ACCOUNT }] : directory === account ? [{ name: ORG }] : visible;
+            for (const row of rows) yield { name: row.name,
+                isFile: () => directory === org, isDirectory: () => directory !== org, isSymbolicLink: () => false };
+        },
+        open: async file => {
+            opens++;
+            const row = files.get(file);
+            return { stat: async () => info(row), close: async () => {},
+                read: async (buffer, offset, length, position) => ({ buffer,
+                    bytesRead: row.body.copy(buffer, offset, position, Math.min(position + length, row.body.length)) }) };
+        }
+    };
+    const resolver = createDesktopForkResolver({ claudeData: f.claudeData, fs: virtual });
+    assert.deepEqual(await resolver.resolveFork(groups[0][0].id), INCOMPLETE);
+    visible = groups[1];
+    assert.deepEqual(await resolver.resolveFork(groups[1][0].id), INCOMPLETE);
+    assert.equal(opens, 8192);
+    visible = [groups[0][0]];
+    assert.equal(await resolver.resolveFork(groups[0][0].id), null);
+    assert.equal(opens, 8193, 'Old entries must be evicted even when every preceding scan failed its record limit');
+});
+
+test('disposing during a read clears and permanently disables parsed metadata caching', async t => {
+    const f = await fixture(t);
+    let entered, release, pause = true, opens = 0;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const resume = new Promise(resolve => { release = resolve; });
+    const guarded = { ...fs, open: async (file, ...args) => {
+        opens++;
+        const handle = await fs.open(file, ...args);
+        if (file !== f.childFile) return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(), read: async (...values) => {
+            const result = await handle.read(...values);
+            if (pause) { pause = false; entered(); await resume; }
+            return result;
+        } };
+    } };
+    const resolver = createDesktopForkResolver({ claudeData: f.claudeData, fs: guarded });
+    assert.equal(typeof resolver.dispose, 'function');
+    assert.equal(resolver.resolveFork.dispose, resolver.dispose);
+    const first = resolver.resolveFork(CHILD);
+    await waiting;
+    try { resolver.dispose(); } finally { release(); }
+    assert.equal((await first).parentSessionId, PARENT);
+    assert.equal((await resolver.resolveFork(CHILD)).parentSessionId, PARENT);
+    assert.equal(opens, 4, 'In-flight reads after disposal cannot refill the cache');
 });

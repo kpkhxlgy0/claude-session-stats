@@ -420,8 +420,29 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
         finally { operation?.close(); }
     }
 
+    async function verifyAgentMembership(rawParentId, rawAgentId, context) {
+        const id = parentId(rawParentId), agent = agentId(rawAgentId);
+        if (!id || !agent) return false;
+        let operation;
+        try {
+            operation = operationScope(context);
+            await current(context);
+            const proof = await locate(id, operation.context);
+            if (!proof?.directory) return false;
+            const file = path.join(proof.directory, `agent-${agent}.jsonl`);
+            const before = await safeFile(file);
+            await confirm(proof);
+            await current(context);
+            await confirmAssistantTip(proof, operation.context);
+            await confirmFiles(proof);
+            operation.assert();
+            return version(before) === version(await safeFile(file));
+        } catch { return false; }
+        finally { operation?.close(); }
+    }
+
     function dispose() { disposed = true; sessions.clear(); }
-    return { getAgentStats, getAgentStatsBatch, listAgents, dispose };
+    return { getAgentStats, getAgentStatsBatch, listAgents, verifyAgentMembership, dispose };
 }
 
 module.exports = { createSubagentStore };

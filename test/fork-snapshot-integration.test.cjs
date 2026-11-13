@@ -63,11 +63,18 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         const api = { manifest: { id: 'com.kpk.session-stats' }, log: { info() {} },
             ipc: { handle(name, fn) { if (name === 'stats') handler = fn; } } };
         function startController() {
+            const publisherId = require('node:crypto').randomUUID();
             const store = createSessionStore({ claudeHome,
                 resolveFork: createDesktopForkResolver({ claudeData }).resolveFork });
-            publisher = createSnapshotPublisher({ claudeData, claudeHome, store, now: () => time,
+            publisher = createSnapshotPublisher({ claudeData, claudeHome, store, publisherId, now: () => time,
                 resolveWorkspace: createCliWorkspaceResolver({ claudeHome }), pollMs: 600000 });
-            metadataPublisher = createMetadataPublisher({ source: publisher, fetch: metadataApi.writerFetch,
+            publisher.setInterest('fork_viewer', [{ localSessionId: 'local_' + CHILD }]);
+            metadataPublisher = createMetadataPublisher({ source: {
+                listRemoteBindings: () => [{ bridgeSessionId: BRIDGE, organizationId: ORG, accountId: ACCOUNT }],
+                async readRemoteLocation() {
+                    return { bridgeSessionId: BRIDGE, organizationId: ORG, publisherId,
+                        generatedAt: time, directory: path.dirname(destination) };
+                } }, fetch: metadataApi.writerFetch,
                 now: () => time, pollMs: 600000 });
             controller = startMain(api, { claudeData, claudeHome, store, publisher, metadataPublisher,
                 ipcMain: { handle() {}, removeHandler() {} } });
@@ -80,8 +87,9 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
             let local;
             const deadline = Date.now() + 5000;
             do {
+                publisher.setInterest('fork_viewer', [{ localSessionId: 'local_' + CHILD }]);
                 await publisher.start();
-                local = await handler('local_' + CHILD);
+                local = await handler({ sessionId: 'local_' + CHILD, owner: 'fork_viewer' });
                 if (local.status === 'ok' && local.tps === expected) break;
                 await new Promise(resolve => setTimeout(resolve, 20));
             } while (Date.now() < deadline);
@@ -117,6 +125,7 @@ for (const mode of ['desktop-copy', 'sdk-rewritten']) {
         await controller.stop();
         assert.deepEqual(metadataApi.envelope(), beforeRestart, 'stop leaves the last cloud location to expire');
         startController();
+        publisher.setInterest('fork_viewer', [{ localSessionId: 'local_' + CHILD }]);
         await publisher.start();
         await metadataPublisher.start();
         assert.deepEqual(metadataApi.envelope(), beforeRestart, 'successor waits for the previous publisher to expire');
