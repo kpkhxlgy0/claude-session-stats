@@ -42,6 +42,45 @@ test('selects one strict complete-byte extension regardless of project name and 
     assert.equal(await source.verify(), true);
 });
 
+test('default budget proves a complete shared prefix beyond 192 MiB', async t => {
+    // Generate the large, identical JSONL tails in-place to keep the disk fixture small.
+    const paddingBytes = 192 * 1024 * 1024 + 4;
+    const padding = ['{}\r\n', '}\r\n{', '\r\n{}', '\n{}\r'];
+    const extend = info => Object.assign(info, { size: info.size + paddingBytes });
+    const virtualFs = { ...fs, lstat: async file => {
+        const info = await fs.lstat(file);
+        return info.isFile() ? extend(info) : info;
+    }, open: async (...args) => {
+        const handle = await fs.open(...args);
+        const { size } = await handle.stat();
+        return { stat: async () => extend(await handle.stat()), close: () => handle.close(),
+            async read(buffer, offset, length, position) {
+                const { bytesRead } = position < size
+                    ? await handle.read(buffer, offset, length, position) : { bytesRead: 0 };
+                if (bytesRead < length)
+                    buffer.fill(padding[(position + bytesRead - size) % 4], offset + bytesRead, offset + length);
+                return { bytesRead: length };
+            },
+        };
+    } };
+    const f = await fixture(t, { fs: virtualFs });
+    const shorter = await f.write('one', f.prefix);
+    const longest = await f.write('two', f.prefix + padding[0]);
+    const source = await f.resolver(ID, [shorter, longest], f.context);
+    assert.equal(source?.path, longest);
+    assert.equal(await source.verify(), true);
+});
+
+test('an explicit read budget can end inside the scan buffer after a proven relocation', async t => {
+    const f = await fixture(t);
+    const prefix = f.prefix + lines([{ padding: 'p'.repeat(128 * 1024) }]);
+    const extended = prefix + lines([{ padding: 'q'.repeat(700 * 1024) }]);
+    const shorter = await f.write('one', prefix);
+    const longer = await f.write('two', extended);
+    const resolver = createSessionSourceResolver({ maxBytes: Buffer.byteLength(prefix + extended) });
+    assert.equal((await resolver(ID, [shorter, longer], f.context))?.path, longer);
+});
+
 test('duplicate files without live verified workspace proof remain ambiguous', async t => {
     const f = await fixture(t);
     const shorter = await f.write('one', f.prefix);
@@ -227,17 +266,24 @@ test('equal-copy comparison rejects a same-size rewrite during transcript I/O', 
     assert.equal(changed, true);
 });
 
-test('workspace changes during prefix checking cannot establish reusable proof', async t => {
-    let f, changed = false;
+test('workspace changes during prefix checking cancel further reads', async t => {
+    let f, reads = 0;
     const racedFs = { ...fs, open: async (...args) => {
         const handle = await fs.open(...args);
-        if (!changed) { changed = true; f.setValid(false); }
-        return handle;
+        return { stat: () => handle.stat(), close: () => handle.close(),
+            async read(...readArgs) {
+                const result = await handle.read(...readArgs);
+                reads++;
+                f.setValid(false);
+                return result;
+            },
+        };
     } };
     f = await fixture(t, { fs: racedFs });
     const shorter = await f.write('one', f.prefix);
     const longest = await f.write('two', f.prefix + lines([{ type: 'assistant', sessionId: ID }]));
     assert.equal(await f.resolver(ID, [shorter, longest], f.context), null);
+    assert.equal(reads, 1);
 });
 
 test('old missing and UNC relocation targets are ignored without filesystem probing', async t => {

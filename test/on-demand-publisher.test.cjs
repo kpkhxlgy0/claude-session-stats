@@ -35,7 +35,28 @@ test('a delayed parent discovery cannot overwrite a newer selected-child workspa
 test('idle startup and repeated ticks perform no source reads or snapshot writes',async t=>{const f=await fixture(t);await f.publisher.start();await wait(35);assert.deepEqual(f.calls,[]);await assert.rejects(fs.stat(path.join(f.claudeHome,'.session-stats')),{code:'ENOENT'});});
 test('an owner requests only its exact parent and selected child without discovering history or siblings',async t=>{const f=await fixture(t);assert.equal(f.publisher.setInterest('windowA',[{localSessionId:LOCAL},{localSessionId:LOCAL,agentId:'selected'}]),true);await f.publisher.start();assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA'})).status,'ok');assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA',agentId:'selected'})).status,'ok');assert.ok(f.calls.every(call=>call[1]===CLI));assert.ok(f.calls.some(call=>call[0]==='child'&&call[2]==='selected'));f.publisher.releaseInterest('windowA');const count=f.calls.length;await wait(35);assert.equal(f.calls.length,count);});
 test('one window release cannot cancel another window and an expired lease stops reads',async t=>{const f=await fixture(t);f.publisher.setInterest('windowA',[{localSessionId:LOCAL}]);f.publisher.setInterest('windowB',[{localSessionId:LOCAL}]);await f.publisher.start();f.publisher.releaseInterest('windowA');assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowB'})).status,'ok');assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA'})).status,'unavailable');f.setTime(108001);await f.publisher.start();const count=f.calls.length;await wait(25);assert.equal(f.calls.length,count);assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowB'})).status,'unavailable');});
-test('release during source I/O invalidates a late sample before any snapshot publication',async t=>{let entered,release;const ready=new Promise(r=>entered=r),blocked=new Promise(r=>release=r);const f=await fixture(t,{async getStats(id){entered();await blocked;return {...STATS,threadId:id};}});f.publisher.setInterest('windowA',[{localSessionId:LOCAL}]);const starting=f.publisher.start();await ready;f.publisher.releaseInterest('windowA');release();await starting;assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA'})).status,'unavailable');assert.equal(await fs.readdir(path.join(f.claudeHome,'.session-stats')).catch(()=>[]).then(rows=>rows.length),0);});
+test('release during source I/O invalidates a late sample before any snapshot publication', async t => {
+    let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    const f = await fixture(t, { async getStats(id, context) {
+        entered(context);
+        await blocked;
+        return { ...STATS, threadId: id };
+    } });
+    f.publisher.setInterest('windowA', [{ localSessionId: LOCAL }]);
+    const starting = f.publisher.start();
+    const context = await ready;
+    try {
+        assert.equal(context.isCurrent(), true);
+        f.publisher.releaseInterest('windowA');
+        assert.equal(context.isCurrent(), false);
+    } finally { release(); }
+    await starting;
+    assert.equal((await f.publisher.readLocal(LOCAL, { owner: 'windowA' })).status, 'unavailable');
+    const files = await fs.readdir(path.join(f.claudeHome, '.session-stats')).catch(() => []);
+    assert.equal(files.length, 0);
+});
 
 test('a fresh exact binding can recover after one failed final confirmation',async t=>{let f,change=false;f=await fixture(t,{async getStats(id,context){assert.equal(await context.verify(),true);if(change){change=false;const file=path.join(f.metadata,`${LOCAL}.json`);const row=JSON.parse(await fs.readFile(file,'utf8'));await fs.writeFile(file,JSON.stringify({...row,remoteControlUserEnabled:false}));}return {...STATS,threadId:id};}});f.publisher.setInterest('windowA',[{localSessionId:LOCAL}]);await f.publisher.start();change=true;await f.publisher.start();const file=path.join(f.metadata,`${LOCAL}.json`),row=JSON.parse(await fs.readFile(file,'utf8'));await fs.writeFile(file,JSON.stringify({...row,remoteControlUserEnabled:true}));assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA'})).status,'ok');});
 test('an existing local-only sample cannot survive a CLI mapping change during its next read',async t=>{let f,change=false;f=await fixture(t,{async getStats(id){if(change){const file=path.join(f.metadata,`${LOCAL}.json`),row=JSON.parse(await fs.readFile(file,'utf8'));await fs.writeFile(file,JSON.stringify({...row,cliSessionId:ACCOUNT}));}return {...STATS,threadId:id};}});const file=path.join(f.metadata,`${LOCAL}.json`),row=JSON.parse(await fs.readFile(file,'utf8'));await fs.writeFile(file,JSON.stringify({...row,bridgeSessionIds:[]}));f.publisher.setInterest('windowA',[{localSessionId:LOCAL}]);assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA'})).status,'ok');change=true;assert.equal((await f.publisher.readLocal(LOCAL,{owner:'windowA'})).status,'unavailable');});

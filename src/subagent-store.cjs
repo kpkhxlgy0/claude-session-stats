@@ -50,10 +50,12 @@ function createSubagentStore({ claudeHome, createMetrics, locateSource })
     {
         let active = true;
         const workspaceRoot = context?.workspaceRoot, verify = context?.verify;
+        const isCurrent = context?.isCurrent;
         const resolveRelocation = context?.resolveRelocation;
         const resolveAssistantTip = context?.resolveAssistantTip;
         const valid = () => active && !disposed && Boolean(root) && (!context
             || context.workspaceRoot === workspaceRoot && context.verify === verify
+                && context.isCurrent === isCurrent && (isCurrent === undefined || isCurrent() === true)
                 && context.resolveRelocation === resolveRelocation && context.resolveAssistantTip === resolveAssistantTip);
         // Nested source checks keep validating files and relocation evidence. The expensive
         // caller binding proof brackets this one operation instead of each nested check.

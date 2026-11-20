@@ -66,10 +66,12 @@ function createSessionStore({ claudeHome, createMetrics, resolveFork } = {})
     {
         let active = true;
         const workspaceRoot = context?.workspaceRoot, verify = context?.verify;
+        const isCurrent = context?.isCurrent;
         const resolveRelocation = context?.resolveRelocation;
         const resolveAssistantTip = context?.resolveAssistantTip;
         const valid = () => active && !disposed && (!context
             || context.workspaceRoot === workspaceRoot && context.verify === verify
+                && context.isCurrent === isCurrent && (isCurrent === undefined || isCurrent() === true)
                 && context.resolveRelocation === resolveRelocation && context.resolveAssistantTip === resolveAssistantTip);
         const assert = () => { if (!valid()) throw new Error('Session operation changed'); };
         return {

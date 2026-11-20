@@ -393,7 +393,7 @@ function createSnapshotPublisher({ claudeData, store, resolveWorkspace, now = Da
     function sourceContext(binding, runEpoch) {
         const valid = () => !stopped && runEpoch === epoch && (!bindingGuards.has(binding) || bindingGuards.get(binding)());
         return {
-            workspaceRoot: binding.workspaceRoot, verify: () => current(binding, runEpoch),
+            workspaceRoot: binding.workspaceRoot, isCurrent: valid, verify: () => current(binding, runEpoch),
             resolveRelocation: async cwd => {
                 if (!valid()) return null;
                 const proof = await resolveSnapshotRelocation(parentBinding(binding), cwd, { resolveWorkspace });

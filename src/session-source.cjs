@@ -3,7 +3,7 @@ const nativeFs = require('node:fs/promises');
 const path = require('node:path');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const ChunkBytes = 64 * 1024;
+const ChunkBytes = 1024 * 1024;
 const MaxLineBytes = 8 * 1024 * 1024;
 const MaxTipUuids = 65536;
 function identity(info) { return `${info.dev}:${info.ino}:${info.birthtimeMs}`; }
@@ -12,7 +12,7 @@ function samePath(left, right) {
     return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
-function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 1024,
+function createSessionSourceResolver({ fs = nativeFs, maxBytes = Infinity,
     maxCandidates = 8, maxCacheEntries = 32, maxRelocations = 4 } = {}) {
     const cache = new Map();
 
@@ -48,11 +48,13 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
 
     async function build(sessionId, files, context, workspaceIdentity) {
         const sources = [], handles = [];
-        let budget = 0;
+        let remainingBytes;
         async function read(handle, buffer, length, position) {
+            if (!(length > 0 && length <= remainingBytes)) throw new Error('Session source read limit');
+            if (await context.verify() !== true) throw new Error('Session source workspace changed');
             const { bytesRead } = await handle.read(buffer, 0, length, position);
-            if ((budget += bytesRead) > maxBytes) throw new Error('Session source read limit');
             if (bytesRead !== length) throw new Error('Session source changed');
+            remainingBytes -= bytesRead;
             return buffer.subarray(0, bytesRead);
         }
         try {
@@ -66,21 +68,27 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     throw new Error('Session source changed');
                 sources.push({ file, handle, size: before.size, stamp: version(before) });
             }
-            if (sources.reduce((sum, source) => sum + source.size, 0) > maxBytes)
-                throw new Error('Session source size limit');
+            const totalSize = sources.reduce((sum, source) => sum + source.size, 0);
+            if (totalSize > maxBytes) throw new Error('Session source size limit');
             sources.sort((a, b) => b.size - a.size);
             const longest = sources[0];
+            // Read one record boundary and both copies of each peer's prefix,
+            // then scan at most the captured size of the longest transcript.
+            const readLimit = longest.size + 2 * (totalSize - longest.size) + sources.length - 1;
+            if (!Number.isSafeInteger(readLimit)) throw new Error('Session source size limit');
+            remainingBytes = Math.min(maxBytes, readLimit);
             // Files are already path-sorted: equal maxima select one deterministic
             // path only after every byte has been proven identical below.
-            const left = Buffer.alloc(ChunkBytes), right = Buffer.alloc(ChunkBytes);
+            const chunkBytes = Math.min(ChunkBytes, longest.size);
+            const peerBuffer = Buffer.alloc(chunkBytes), longestBuffer = Buffer.alloc(chunkBytes);
             for (const source of sources.slice(1)) {
                 const end = Buffer.alloc(1);
                 if ((await read(source.handle, end, 1, source.size - 1))[0] !== 10)
                     throw new Error('Incomplete source prefix');
-                for (let offset = 0; offset < source.size; offset += ChunkBytes) {
-                    const length = Math.min(ChunkBytes, source.size - offset);
-                    const expected = await read(source.handle, left, length, offset);
-                    const actual = await read(longest.handle, right, length, offset);
+                for (let offset = 0; offset < source.size; offset += chunkBytes) {
+                    const length = Math.min(chunkBytes, source.size - offset);
+                    const expected = await read(source.handle, peerBuffer, length, offset);
+                    const actual = await read(longest.handle, longestBuffer, length, offset);
                     if (!expected.equals(actual)) throw new Error('Divergent session sources');
                 }
             }
@@ -89,9 +97,9 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
             const trackAssistantTip = typeof context.resolveAssistantTip === 'function';
             let tipOverflow = false;
             const checkedRelocations = new Set();
-            const buffer = Buffer.alloc(ChunkBytes);
-            for (let offset = 0; offset < longest.size && !matched; offset += ChunkBytes) {
-                const chunk = await read(longest.handle, buffer, Math.min(ChunkBytes, longest.size - offset), offset);
+            for (let offset = 0; offset < longest.size && !matched;) {
+                const length = Math.min(chunkBytes, longest.size - offset, remainingBytes);
+                const chunk = await read(longest.handle, longestBuffer, length, offset);
                 let start = 0;
                 while (start < chunk.length) {
                     const newline = chunk.indexOf(10, start);
@@ -131,6 +139,7 @@ function createSessionSourceResolver({ fs = nativeFs, maxBytes = 192 * 1024 * 10
                     }
                     start = newline + 1;
                 }
+                offset += length;
             }
             if (!matched) {
                 if (pending.length || tipOverflow || !lastAssistantUuid || !trackAssistantTip) return null;

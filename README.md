@@ -19,7 +19,7 @@
 在 Claude++ 的 Tweak Store 中搜索 **Session Stats** 并安装。Store 固定到审核过的完整提交 SHA。
 
 源码：[kpkhxlgy0/claude-session-stats](https://github.com/kpkhxlgy0/claude-session-stats)。
-当前版本：[v0.11.0](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.11.0)。
+当前版本：[v0.11.1](https://github.com/kpkhxlgy0/claude-session-stats/releases/tag/v0.11.1)。此版修复大日志在工作树和项目目录中各有一份时统计栏持续显示 `—` 的问题。
 
 自 v0.11.0 起，仅计算当前可见主会话与选中的子代理；切走、隐藏或关闭面板后释放需求，停止后续日志读取和统计刷新。
 Remote Control 使用独立 viewer 的八秒短租约请求精确目标，**运行端和接收端都需升级到 Session Stats 0.11.0 或更新版本**。
